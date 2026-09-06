@@ -103,3 +103,45 @@ def test_download_inexistente_da_not_found(stub):
     with pytest.raises(grpc.RpcError) as exc_info:
         list(stub.Download(dfsha_pb2.DownloadRequest(path="/no-existe")))
     assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
+
+from dfsha.client.dfsha_client import DFShaClient
+from dfsha.server.exceptions import PathExistsError, PathNotFoundError
+
+
+@pytest.fixture
+def client(running_server):
+    port, _ = running_server
+    c = DFShaClient(host="localhost", port=port)
+    yield c
+    c.close()
+
+
+def test_client_make_dir_y_list_dir(client):
+    client.make_dir("/documentos")
+    entries = client.list_dir("/")
+    assert [e.name for e in entries] == ["documentos"]
+
+
+def test_client_make_dir_duplicado_traduce_a_domain_error(client):
+    client.make_dir("/documentos")
+    with pytest.raises(PathExistsError):
+        client.make_dir("/documentos")
+
+
+def test_client_list_dir_inexistente_traduce_a_domain_error(client):
+    with pytest.raises(PathNotFoundError):
+        client.list_dir("/no-existe")
+
+
+def test_client_upload_download_roundtrip(client, tmp_path):
+    origen = tmp_path / "origen.bin"
+    origen.write_bytes(b"contenido de prueba" * 10000)
+
+    bytes_subidos = client.upload(origen, "/subido.bin")
+    assert bytes_subidos == origen.stat().st_size
+
+    destino = tmp_path / "destino.bin"
+    bytes_bajados = client.download("/subido.bin", destino)
+    assert bytes_bajados == bytes_subidos
+    assert destino.read_bytes() == origen.read_bytes()
