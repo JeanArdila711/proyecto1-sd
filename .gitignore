@@ -4,3 +4,5 @@ __pycache__/
 dfsha/generated/
 dfsha-data/
 *.part-*
+.claude/
+docs/superpowers/
