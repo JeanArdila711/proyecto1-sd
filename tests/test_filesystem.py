@@ -110,3 +110,47 @@ def test_remove_file_sobre_directorio(tmp_path):
 def test_remove_file_no_existe(tmp_path):
     with pytest.raises(PathNotFoundError):
         filesystem.remove_file(tmp_path, "/no-existe")
+
+
+def test_write_and_read_roundtrip(tmp_path):
+    contenido = b"contenido de prueba" * 1000
+    written = filesystem.write_file_chunks(tmp_path, "/archivo.bin", [contenido])
+    assert written == len(contenido)
+
+    leido = b"".join(filesystem.read_file_chunks(tmp_path, "/archivo.bin", chunk_size=17))
+    assert leido == contenido
+
+
+def test_write_file_chunks_crea_directorios_padre(tmp_path):
+    filesystem.write_file_chunks(tmp_path, "/a/b/archivo.txt", [b"hola"])
+    assert (tmp_path / "a" / "b" / "archivo.txt").read_bytes() == b"hola"
+
+
+def test_write_file_chunks_no_deja_temporales(tmp_path):
+    filesystem.write_file_chunks(tmp_path, "/archivo.txt", [b"hola"])
+    assert list(tmp_path.glob("archivo.txt.part-*")) == []
+
+
+def test_write_file_chunks_atomico_ante_fallo(tmp_path):
+    filesystem.write_file_chunks(tmp_path, "/existente.txt", [b"viejo"])
+
+    def chunks_que_fallan():
+        yield b"nuevo-parcial"
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        filesystem.write_file_chunks(tmp_path, "/existente.txt", chunks_que_fallan())
+
+    assert (tmp_path / "existente.txt").read_bytes() == b"viejo"
+    assert list(tmp_path.glob("existente.txt.part-*")) == []
+
+
+def test_read_file_chunks_no_existe(tmp_path):
+    with pytest.raises(PathNotFoundError):
+        list(filesystem.read_file_chunks(tmp_path, "/no-existe", chunk_size=1024))
+
+
+def test_read_file_chunks_sobre_directorio(tmp_path):
+    filesystem.make_dir(tmp_path, "/carpeta")
+    with pytest.raises(NotAFileError):
+        list(filesystem.read_file_chunks(tmp_path, "/carpeta", chunk_size=1024))

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, Iterator
 
 from dfsha.server.exceptions import (
     InvalidPathError,
@@ -69,3 +72,34 @@ def remove_file(root: Path, virtual_path: str) -> None:
     if not target.is_file():
         raise NotAFileError(f"no es un archivo: {virtual_path}")
     target.unlink()
+
+
+def write_file_chunks(root: Path, virtual_path: str, chunks: Iterable[bytes]) -> int:
+    target = resolve_path(root, virtual_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.parent / f"{target.name}.part-{uuid.uuid4().hex}"
+    bytes_written = 0
+    try:
+        with tmp_path.open("wb") as fh:
+            for chunk in chunks:
+                fh.write(chunk)
+                bytes_written += len(chunk)
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return bytes_written
+
+
+def read_file_chunks(root: Path, virtual_path: str, chunk_size: int) -> Iterator[bytes]:
+    target = resolve_path(root, virtual_path)
+    if not target.exists():
+        raise PathNotFoundError(f"no existe: {virtual_path}")
+    if not target.is_file():
+        raise NotAFileError(f"no es un archivo: {virtual_path}")
+    with target.open("rb") as fh:
+        while True:
+            data = fh.read(chunk_size)
+            if not data:
+                break
+            yield data
