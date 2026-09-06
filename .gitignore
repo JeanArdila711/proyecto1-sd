@@ -6,3 +6,4 @@ dfsha-data/
 *.part-*
 .claude/
 docs/superpowers/
+CLAUDE.md
