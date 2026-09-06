@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package dfsha;
+
+service DFShaService {
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc MakeDir(MakeDirRequest) returns (MakeDirResponse);
+  rpc RemoveDir(RemoveDirRequest) returns (RemoveDirResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  rpc Upload(stream UploadChunk) returns (UploadResponse);
+  rpc Download(DownloadRequest) returns (stream DownloadChunk);
+}
+
+message ListDirRequest {
+  string path = 1;
+}
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+  int64 size_bytes = 3;
+}
+
+message ListDirResponse {
+  repeated DirEntry entries = 1;
+}
+
+message MakeDirRequest  { string path = 1; }
+message MakeDirResponse {}
+
+message RemoveDirRequest  { string path = 1; }
+message RemoveDirResponse {}
+
+message RemoveRequest  { string path = 1; }
+message RemoveResponse {}
+
+message UploadChunk {
+  oneof payload {
+    string path = 1;
+    bytes data = 2;
+  }
+}
+
+message UploadResponse {
+  int64 bytes_written = 1;
+}
+
+message DownloadRequest { string path = 1; }
+
+message DownloadChunk { bytes data = 1; }
