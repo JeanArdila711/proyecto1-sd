@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import uuid
 from pathlib import Path
 
 import grpc
@@ -67,6 +69,9 @@ class DFShaClient:
             raise _translate(exc) from exc
 
     def upload(self, local_path: Path, remote_path: str) -> int:
+        if not local_path.is_file():
+            raise NotAFileError(f"no existe o no es un archivo: {local_path}")
+
         def request_iterator():
             yield dfsha_pb2.UploadChunk(path=remote_path)
             with local_path.open("rb") as fh:
@@ -83,12 +88,15 @@ class DFShaClient:
         return response.bytes_written
 
     def download(self, remote_path: str, local_path: Path) -> int:
+        tmp_path = local_path.parent / f"{local_path.name}.part-{uuid.uuid4().hex}"
         bytes_written = 0
         try:
-            with local_path.open("wb") as fh:
+            with tmp_path.open("wb") as fh:
                 for chunk in self._stub.Download(dfsha_pb2.DownloadRequest(path=remote_path)):
                     fh.write(chunk.data)
                     bytes_written += len(chunk.data)
+            os.replace(tmp_path, local_path)
         except grpc.RpcError as exc:
+            tmp_path.unlink(missing_ok=True)
             raise _translate(exc) from exc
         return bytes_written

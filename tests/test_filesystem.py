@@ -145,6 +145,17 @@ def test_write_file_chunks_atomico_ante_fallo(tmp_path):
     assert list(tmp_path.glob("existente.txt.part-*")) == []
 
 
+def test_write_file_chunks_sobre_directorio_existente(tmp_path):
+    filesystem.make_dir(tmp_path, "/carpeta")
+    with pytest.raises(NotAFileError):
+        filesystem.write_file_chunks(tmp_path, "/carpeta", [b"datos"])
+
+
+def test_write_file_chunks_no_permite_escribir_sobre_la_raiz(tmp_path):
+    with pytest.raises(InvalidPathError):
+        filesystem.write_file_chunks(tmp_path, "/", [b"datos"])
+
+
 def test_read_file_chunks_no_existe(tmp_path):
     with pytest.raises(PathNotFoundError):
         list(filesystem.read_file_chunks(tmp_path, "/no-existe", chunk_size=1024))

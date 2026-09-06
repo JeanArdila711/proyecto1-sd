@@ -76,6 +76,10 @@ def remove_file(root: Path, virtual_path: str) -> None:
 
 def write_file_chunks(root: Path, virtual_path: str, chunks: Iterable[bytes]) -> int:
     target = resolve_path(root, virtual_path)
+    if target == resolve_path(root, "/"):
+        raise InvalidPathError(f"ruta de destino inválida: {virtual_path!r}")
+    if target.is_dir():
+        raise NotAFileError(f"no es un archivo: {virtual_path}")
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.parent / f"{target.name}.part-{uuid.uuid4().hex}"
     bytes_written = 0

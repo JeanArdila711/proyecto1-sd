@@ -103,3 +103,11 @@ def test_comando_no_reconocido():
     client = FakeClient()
     _, output = handle_command(client, "/", "volar")
     assert "no reconocido" in output
+
+
+def test_receive_a_ruta_local_invalida_no_revienta_el_shell():
+    client = FakeClient()
+    client.files["/archivo.txt"] = b"contenido"
+    ruta_invalida = "/no/existe/destino.txt"
+    _, output = handle_command(client, "/", f"receive archivo.txt {ruta_invalida}")
+    assert "receive:" in output

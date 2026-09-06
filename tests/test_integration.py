@@ -106,7 +106,7 @@ def test_download_inexistente_da_not_found(stub):
 
 
 from dfsha.client.dfsha_client import DFShaClient
-from dfsha.server.exceptions import PathExistsError, PathNotFoundError
+from dfsha.server.exceptions import NotAFileError, PathExistsError, PathNotFoundError
 
 
 @pytest.fixture
@@ -145,3 +145,34 @@ def test_client_upload_download_roundtrip(client, tmp_path):
     bytes_bajados = client.download("/subido.bin", destino)
     assert bytes_bajados == bytes_subidos
     assert destino.read_bytes() == origen.read_bytes()
+
+
+def test_client_download_fallido_no_destruye_archivo_local(client, tmp_path):
+    local_path = tmp_path / "no_me_borres.txt"
+    local_path.write_text("contenido original")
+
+    with pytest.raises(PathNotFoundError):
+        client.download("/no-existe", local_path)
+
+    assert local_path.read_text() == "contenido original"
+    assert list(tmp_path.glob("no_me_borres.txt.part-*")) == []
+
+
+def test_client_upload_archivo_local_inexistente(client, tmp_path):
+    with pytest.raises(NotAFileError):
+        client.upload(tmp_path / "no-existe.txt", "/destino.txt")
+
+
+def test_upload_sobre_directorio_da_invalid_argument(stub):
+    stub.MakeDir(dfsha_pb2.MakeDirRequest(path="/carpeta"))
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.Upload(_upload_chunks("/carpeta", b"datos"))
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_shell_ls_formatea_entradas_reales(client):
+    from dfsha.client.shell import handle_command
+
+    handle_command(client, "/", "mkdir docs")
+    _, output = handle_command(client, "/", "ls")
+    assert output == f"d {0:>10}  docs"

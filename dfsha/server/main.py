@@ -27,6 +27,8 @@ def main() -> None:
     args = parser.parse_args()
 
     server, bound_port = serve(Path(args.root), args.host, args.port)
+    if bound_port == 0:
+        raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")
     print(f"DFSha server escuchando en {args.host}:{bound_port}, raíz={args.root}")
     server.wait_for_termination()
 

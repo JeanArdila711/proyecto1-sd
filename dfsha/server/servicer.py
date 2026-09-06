@@ -79,7 +79,7 @@ class DFShaServicer(dfsha_pb2_grpc.DFShaServiceServicer):
 
         try:
             bytes_written = filesystem.write_file_chunks(self._root, path, chunks())
-        except InvalidPathError as exc:
+        except (InvalidPathError, NotAFileError) as exc:
             _abort_on_domain_error(context, exc)
         return dfsha_pb2.UploadResponse(bytes_written=bytes_written)
 

@@ -89,7 +89,7 @@ def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
 
         return current_dir, f"comando no reconocido: {cmd}"
 
-    except DFShaError as exc:
+    except (DFShaError, OSError) as exc:
         return current_dir, f"{cmd}: {exc}"
 
 
