@@ -68,3 +68,24 @@ class DFShaServicer(dfsha_pb2_grpc.DFShaServiceServicer):
         except (PathNotFoundError, NotAFileError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
         return dfsha_pb2.RemoveResponse()
+
+    def Upload(self, request_iterator, context):
+        first = next(request_iterator)
+        path = first.path
+
+        def chunks():
+            for msg in request_iterator:
+                yield msg.data
+
+        try:
+            bytes_written = filesystem.write_file_chunks(self._root, path, chunks())
+        except InvalidPathError as exc:
+            _abort_on_domain_error(context, exc)
+        return dfsha_pb2.UploadResponse(bytes_written=bytes_written)
+
+    def Download(self, request, context):
+        try:
+            for chunk in filesystem.read_file_chunks(self._root, request.path, CHUNK_SIZE_BYTES):
+                yield dfsha_pb2.DownloadChunk(data=chunk)
+        except (PathNotFoundError, NotAFileError, InvalidPathError) as exc:
+            _abort_on_domain_error(context, exc)

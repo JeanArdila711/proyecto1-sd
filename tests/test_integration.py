@@ -69,3 +69,37 @@ def test_path_traversal_da_permission_denied(stub):
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.ListDir(dfsha_pb2.ListDirRequest(path="/../../etc"))
     assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+
+import hashlib
+
+
+def _upload_chunks(path: str, data: bytes, chunk_size: int = 4096):
+    yield dfsha_pb2.UploadChunk(path=path)
+    for i in range(0, len(data), chunk_size):
+        yield dfsha_pb2.UploadChunk(data=data[i : i + chunk_size])
+
+
+def test_upload_y_download_roundtrip(stub):
+    contenido = b"x" * (5 * 1024 * 1024 + 123)  # fuerza varios chunks de 1 MiB
+    response = stub.Upload(_upload_chunks("/grande.bin", contenido))
+    assert response.bytes_written == len(contenido)
+
+    recibido = b"".join(
+        chunk.data for chunk in stub.Download(dfsha_pb2.DownloadRequest(path="/grande.bin"))
+    )
+    assert hashlib.sha256(recibido).hexdigest() == hashlib.sha256(contenido).hexdigest()
+
+
+def test_upload_luego_aparece_en_list_dir(stub):
+    stub.Upload(_upload_chunks("/nota.txt", b"hola mundo"))
+    response = stub.ListDir(dfsha_pb2.ListDirRequest(path="/"))
+    entry = next(e for e in response.entries if e.name == "nota.txt")
+    assert entry.is_dir is False
+    assert entry.size_bytes == len(b"hola mundo")
+
+
+def test_download_inexistente_da_not_found(stub):
+    with pytest.raises(grpc.RpcError) as exc_info:
+        list(stub.Download(dfsha_pb2.DownloadRequest(path="/no-existe")))
+    assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
