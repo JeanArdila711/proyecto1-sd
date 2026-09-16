@@ -134,23 +134,48 @@ class DistributedDFShaClient:
         try:
             with tmp_path.open("wb") as fh:
                 for block in list_response.blocks:
-                    stub = self._datanode_stub(block.datanode_address)
-                    request = data_node_pb2.ReadBlockRequest(block_id=block.block_id)
-                    for chunk in stub.ReadBlock(request):
-                        fh.write(chunk.data)
-                        bytes_written += len(chunk.data)
+                    bytes_written += self._read_block_with_failover(block, fh)
             os.replace(tmp_path, local_path)
         except grpc.RpcError as exc:
             tmp_path.unlink(missing_ok=True)
             raise _translate(exc) from exc
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
         return bytes_written
+
+    def _read_block_with_failover(self, block, fh) -> int:
+        """Prueba cada réplica en orden. Una réplica caída (UNAVAILABLE) o podrida
+        (DATA_LOSS) hace caer a la siguiente; solo falla si fallan todas."""
+        start = fh.tell()
+        last_error: grpc.RpcError | None = None
+        for address in block.datanode_addresses:
+            try:
+                request = data_node_pb2.ReadBlockRequest(block_id=block.block_id)
+                for chunk in self._datanode_stub(address).ReadBlock(request):
+                    fh.write(chunk.data)
+                return fh.tell() - start
+            except grpc.RpcError as exc:
+                # la réplica pudo haber fallado a mitad de bloque, con bytes ya
+                # escritos: sin descartarlos el archivo final queda corrupto en silencio
+                fh.seek(start)
+                fh.truncate()
+                last_error = exc
+        if last_error is None:
+            raise PathNotFoundError(f"el bloque {block.block_id} no tiene réplicas registradas")
+        raise last_error
 
     def _write_block(self, block, fh) -> tuple[str, int]:
         remaining = block.size_bytes
 
         def chunks():
             nonlocal remaining
-            yield data_node_pb2.WriteBlockChunk(block_id=block.block_id)
+            yield data_node_pb2.WriteBlockChunk(
+                header=data_node_pb2.WriteBlockHeader(
+                    block_id=block.block_id,
+                    downstream=block.datanode_addresses[1:],
+                )
+            )
             while remaining > 0:
                 data = fh.read(min(CHUNK_SIZE_BYTES, remaining))
                 if not data:
@@ -158,6 +183,8 @@ class DistributedDFShaClient:
                 remaining -= len(data)
                 yield data_node_pb2.WriteBlockChunk(data=data)
 
-        stub = self._datanode_stub(block.datanode_address)
+        # el cliente sube una sola copia, al primero del pipeline; los DataNodes
+        # se encargan de encadenar las réplicas restantes
+        stub = self._datanode_stub(block.datanode_addresses[0])
         response = stub.WriteBlock(chunks())
         return response.checksum, response.bytes_written

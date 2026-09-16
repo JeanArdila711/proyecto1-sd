@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 
 import grpc
@@ -14,6 +15,8 @@ from dfsha.common.exceptions import (
 )
 from dfsha.control_node.tree import ControlTree
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
+
+DEFAULT_REPLICATION_FACTOR = 3
 
 _ERROR_STATUS_MAP = {
     PathNotFoundError: grpc.StatusCode.NOT_FOUND,
@@ -31,12 +34,38 @@ def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> Non
 
 
 class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
-    def __init__(self, datanode_address: str, block_size_bytes: int) -> None:
+    def __init__(
+        self,
+        datanode_addresses: list[str],
+        block_size_bytes: int,
+        replication_factor: int = DEFAULT_REPLICATION_FACTOR,
+    ) -> None:
+        if not datanode_addresses:
+            raise ValueError("hace falta al menos un DataNode")
+        if replication_factor < 1:
+            raise ValueError(f"el factor de replicación debe ser >= 1, no {replication_factor}")
         self._tree = ControlTree()
-        self._datanode_address = datanode_address
+        self._datanode_addresses = list(datanode_addresses)
         self._block_size_bytes = block_size_bytes
-        self._datanode_channel = grpc.insecure_channel(datanode_address)
-        self._datanode_stub = data_node_pb2_grpc.DataNodeServiceStub(self._datanode_channel)
+        # con menos DataNodes que el factor pedido, se replica en todos los que haya
+        self._replication_factor = min(replication_factor, len(self._datanode_addresses))
+        self._next_offset = 0
+        self._offset_lock = threading.Lock()
+        self._channels: dict[str, grpc.Channel] = {}
+
+    def _datanode_stub(self, address: str):
+        if address not in self._channels:
+            self._channels[address] = grpc.insecure_channel(address)
+        return data_node_pb2_grpc.DataNodeServiceStub(self._channels[address])
+
+    def _pick_replicas(self) -> list[str]:
+        """Round-robin: cada bloque arranca un nodo más adelante que el anterior, así
+        los bloques de un archivo se reparten en vez de apilarse en los mismos 3."""
+        total = len(self._datanode_addresses)
+        with self._offset_lock:
+            start = self._next_offset
+            self._next_offset = (start + 1) % total
+        return [self._datanode_addresses[(start + i) % total] for i in range(self._replication_factor)]
 
     def ListDir(self, request, context):
         try:
@@ -72,13 +101,16 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             _abort_on_domain_error(context, exc)
             return control_node_pb2.RemoveResponse()
         for block in blocks:
-            try:
-                self._datanode_stub.DeleteBlock(data_node_pb2.DeleteBlockRequest(block_id=block.block_id))
-            except grpc.RpcError:
-                # best-effort: la metadata ya se borró, un bloque físico que falle
-                # en limpiarse no debe tapar ni romper el Remove (mismo criterio
-                # que AbortUpload)
-                pass
+            for address in block.datanode_addresses:
+                try:
+                    self._datanode_stub(address).DeleteBlock(
+                        data_node_pb2.DeleteBlockRequest(block_id=block.block_id)
+                    )
+                except grpc.RpcError:
+                    # best-effort: la metadata ya se borró, un bloque físico que falle
+                    # en limpiarse no debe tapar ni romper el Remove (mismo criterio
+                    # que AbortUpload)
+                    pass
         return control_node_pb2.RemoveResponse()
 
     def BeginUpload(self, request, context):
@@ -87,21 +119,21 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             return control_node_pb2.BeginUploadResponse()
 
         num_blocks = -(-request.size_bytes // self._block_size_bytes)  # división hacia arriba
-        block_ids = [uuid.uuid4().hex for _ in range(num_blocks)]
+        placements = [(uuid.uuid4().hex, self._pick_replicas()) for _ in range(num_blocks)]
         try:
-            self._tree.begin_upload(request.path, block_ids, self._datanode_address)
+            self._tree.begin_upload(request.path, placements)
         except (PathExistsError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.BeginUploadResponse()
 
         remaining = request.size_bytes
         locations = []
-        for block_id in block_ids:
+        for block_id, addresses in placements:
             this_block_size = min(self._block_size_bytes, remaining)
             locations.append(
                 control_node_pb2.BlockLocation(
                     block_id=block_id,
-                    datanode_address=self._datanode_address,
+                    datanode_addresses=addresses,
                     size_bytes=this_block_size,
                 )
             )
@@ -139,7 +171,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             blocks=[
                 control_node_pb2.BlockInfo(
                     block_id=b.block_id,
-                    datanode_address=b.datanode_address,
+                    datanode_addresses=b.datanode_addresses,
                     checksum=b.checksum,
                     size_bytes=b.size_bytes,
                 )

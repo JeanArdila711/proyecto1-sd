@@ -8,9 +8,15 @@ service DataNodeService {
   rpc DeleteBlock(DeleteBlockRequest) returns (DeleteBlockResponse);
 }
 
+message WriteBlockHeader {
+  string block_id = 1;
+  // DataNodes que siguen en el pipeline; vacío = este es el último eslabón
+  repeated string downstream = 2;
+}
+
 message WriteBlockChunk {
   oneof payload {
-    string block_id = 1;
+    WriteBlockHeader header = 1;
     bytes data = 2;
   }
 }

@@ -16,7 +16,9 @@ from dfsha.common.exceptions import (
 @dataclass
 class BlockRecord:
     block_id: str
-    datanode_address: str
+    # en orden de pipeline: [0] es a quien escribe el cliente y el primero a quien
+    # le intenta leer; el resto son las réplicas encadenadas
+    datanode_addresses: list[str]
     checksum: str = ""
     size_bytes: int = 0
     confirmed: bool = False
@@ -141,7 +143,9 @@ class ControlTree:
             del parent.children[name]
             return node.blocks
 
-    def begin_upload(self, virtual_path: str, block_ids: list[str], datanode_address: str) -> None:
+    def begin_upload(self, virtual_path: str, placements: list[tuple[str, list[str]]]) -> None:
+        """placements: (block_id, direcciones de las réplicas en orden de pipeline).
+        La política de selección vive en el servicer; el árbol solo la guarda."""
         with self._lock:
             parts = self._parts(virtual_path)
             if not parts:
@@ -150,7 +154,10 @@ class ControlTree:
             name = parts[-1]
             if name in parent.children:
                 raise PathExistsError(f"ya existe: {virtual_path}")
-            blocks = [BlockRecord(block_id=bid, datanode_address=datanode_address) for bid in block_ids]
+            blocks = [
+                BlockRecord(block_id=bid, datanode_addresses=list(addresses))
+                for bid, addresses in placements
+            ]
             parent.children[name] = FileNode(state="pending", blocks=blocks)
 
     def confirm_block(self, virtual_path: str, block_id: str, checksum: str, size_bytes: int) -> None:

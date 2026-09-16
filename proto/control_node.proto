@@ -40,7 +40,7 @@ message BeginUploadRequest {
 
 message BlockLocation {
   string block_id = 1;
-  string datanode_address = 2;
+  repeated string datanode_addresses = 2;
   int64 size_bytes = 3;
 }
 
@@ -64,7 +64,7 @@ message ListBlocksRequest { string path = 1; }
 
 message BlockInfo {
   string block_id = 1;
-  string datanode_address = 2;
+  repeated string datanode_addresses = 2;
   string checksum = 3;
   int64 size_bytes = 4;
 }

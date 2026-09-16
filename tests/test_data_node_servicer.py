@@ -22,7 +22,7 @@ def datanode_stub(tmp_path):
 
 def _write(stub, block_id: str, data: bytes):
     def chunks():
-        yield data_node_pb2.WriteBlockChunk(block_id=block_id)
+        yield data_node_pb2.WriteBlockChunk(header=data_node_pb2.WriteBlockHeader(block_id=block_id))
         yield data_node_pb2.WriteBlockChunk(data=data)
 
     return stub.WriteBlock(chunks())

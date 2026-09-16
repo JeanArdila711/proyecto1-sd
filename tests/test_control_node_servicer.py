@@ -12,7 +12,7 @@ def cluster(tmp_path):
     dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
     datanode_address = f"localhost:{dn_port}"
 
-    cn_server, cn_port = serve_control_node(datanode_address, "localhost", 0, block_size_bytes=5)
+    cn_server, cn_port = serve_control_node([datanode_address], "localhost", 0, block_size_bytes=5)
     channel = grpc.insecure_channel(f"localhost:{cn_port}")
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
 
@@ -41,7 +41,7 @@ def test_begin_upload_reserves_blocks_by_configured_size(cluster):
 
     # block_size_bytes=5 en el fixture -> ceil(12/5) = 3 bloques: 5, 5, 2
     assert [b.size_bytes for b in response.blocks] == [5, 5, 2]
-    assert all(b.datanode_address == datanode_address for b in response.blocks)
+    assert all(list(b.datanode_addresses) == [datanode_address] for b in response.blocks)
 
 
 def test_full_upload_flow_makes_file_visible(cluster):
@@ -73,7 +73,7 @@ def test_remove_file_deletes_blocks_from_datanode(cluster):
     block = begin.blocks[0]
 
     def chunks():
-        yield data_node_pb2.WriteBlockChunk(block_id=block.block_id)
+        yield data_node_pb2.WriteBlockChunk(header=data_node_pb2.WriteBlockHeader(block_id=block.block_id))
         yield data_node_pb2.WriteBlockChunk(data=b"abc")
 
     write_response = dn_stub_for_check.WriteBlock(chunks())

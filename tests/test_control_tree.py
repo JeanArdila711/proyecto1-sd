@@ -67,7 +67,7 @@ def test_remove_dir_not_empty_raises():
 
 def test_remove_dir_on_file_raises():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:1")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:1"])])
 
     with pytest.raises(NotADirectoryError):
         tree.remove_dir("/archivo.txt")
@@ -89,7 +89,7 @@ def test_remove_file_on_dir_raises():
 
 def test_remove_file_on_pending_upload_raises_not_found():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"])])
 
     with pytest.raises(PathNotFoundError):
         tree.remove_file("/archivo.txt")
@@ -97,22 +97,22 @@ def test_remove_file_on_pending_upload_raises_not_found():
 
 def test_begin_upload_creates_pending_entry_not_visible_in_ls():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1", "b2"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"]), ("b2", ["localhost:50061"])])
 
     assert tree.list_dir("/") == []  # pendiente, no aparece todavía
 
 
 def test_begin_upload_existing_path_raises():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"])])
 
     with pytest.raises(PathExistsError):
-        tree.begin_upload("/archivo.txt", ["b2"], "localhost:50061")
+        tree.begin_upload("/archivo.txt", [("b2", ["localhost:50061"])])
 
 
 def test_confirm_block_unknown_block_raises():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"])])
 
     with pytest.raises(PathNotFoundError):
         tree.confirm_block("/archivo.txt", "block-que-no-existe", "checksum", 10)
@@ -120,7 +120,7 @@ def test_confirm_block_unknown_block_raises():
 
 def test_complete_upload_without_all_confirmed_raises():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1", "b2"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"]), ("b2", ["localhost:50061"])])
     tree.confirm_block("/archivo.txt", "b1", "checksum1", 5)
 
     with pytest.raises(InvalidPathError):
@@ -129,7 +129,7 @@ def test_complete_upload_without_all_confirmed_raises():
 
 def test_complete_upload_with_all_confirmed_makes_it_visible():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1", "b2"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"]), ("b2", ["localhost:50061"])])
     tree.confirm_block("/archivo.txt", "b1", "checksum1", 5)
     tree.confirm_block("/archivo.txt", "b2", "checksum2", 3)
 
@@ -143,7 +143,7 @@ def test_complete_upload_with_all_confirmed_makes_it_visible():
 
 def test_list_blocks_on_pending_raises():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"])])
 
     with pytest.raises(PathNotFoundError):
         tree.list_blocks("/archivo.txt")
@@ -151,7 +151,7 @@ def test_list_blocks_on_pending_raises():
 
 def test_list_blocks_on_committed_returns_ordered_blocks():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1", "b2"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"]), ("b2", ["localhost:50061"])])
     tree.confirm_block("/archivo.txt", "b1", "checksum1", 5)
     tree.confirm_block("/archivo.txt", "b2", "checksum2", 3)
     tree.complete_upload("/archivo.txt")
@@ -164,7 +164,7 @@ def test_list_blocks_on_committed_returns_ordered_blocks():
 
 def test_abort_upload_removes_pending_entry():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"])])
 
     tree.abort_upload("/archivo.txt")
 
@@ -176,7 +176,7 @@ def test_abort_upload_removes_pending_entry():
 
 def test_abort_upload_on_committed_raises():
     tree = ControlTree()
-    tree.begin_upload("/archivo.txt", ["b1"], "localhost:50061")
+    tree.begin_upload("/archivo.txt", [("b1", ["localhost:50061"])])
     tree.confirm_block("/archivo.txt", "b1", "c", 1)
     tree.complete_upload("/archivo.txt")
 

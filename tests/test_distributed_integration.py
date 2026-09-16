@@ -14,7 +14,7 @@ def cluster(tmp_path):
     dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
     datanode_address = f"localhost:{dn_port}"
 
-    cn_server, cn_port = serve_control_node(datanode_address, "localhost", 0, block_size_bytes=5)
+    cn_server, cn_port = serve_control_node([datanode_address], "localhost", 0, block_size_bytes=5)
     client = DistributedDFShaClient(f"localhost:{cn_port}")
 
     yield client, datanode_address, dn_root
