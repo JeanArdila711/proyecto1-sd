@@ -8,3 +8,4 @@ dfsha-data/
 docs/superpowers/
 CLAUDE.md
 .worktrees/
+.DS_Store
