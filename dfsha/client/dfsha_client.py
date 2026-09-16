@@ -7,7 +7,7 @@ from pathlib import Path
 import grpc
 
 from dfsha.generated import dfsha_pb2, dfsha_pb2_grpc
-from dfsha.server.exceptions import (
+from dfsha.common.exceptions import (
     DFShaError,
     InvalidPathError,
     NotAFileError,

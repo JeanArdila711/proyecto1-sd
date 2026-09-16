@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from dfsha.server import filesystem
-from dfsha.server.exceptions import InvalidPathError
+from dfsha.common.exceptions import InvalidPathError
 
 
 def test_resolve_path_dentro_de_la_raiz(tmp_path):
@@ -26,7 +26,7 @@ def test_resolve_path_bloquea_traversal_interno(tmp_path):
         filesystem.resolve_path(tmp_path, "/docs/../../etc/passwd")
 
 
-from dfsha.server.exceptions import (
+from dfsha.common.exceptions import (
     NotADirectoryError,
     NotAFileError,
     NotEmptyError,

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package dfsha.data_node;
+
+service DataNodeService {
+  rpc WriteBlock(stream WriteBlockChunk) returns (WriteBlockResponse);
+  rpc ReadBlock(ReadBlockRequest) returns (stream ReadBlockChunk);
+  rpc DeleteBlock(DeleteBlockRequest) returns (DeleteBlockResponse);
+}
+
+message WriteBlockChunk {
+  oneof payload {
+    string block_id = 1;
+    bytes data = 2;
+  }
+}
+
+message WriteBlockResponse {
+  string checksum = 1;
+  int64 bytes_written = 2;
+}
+
+message ReadBlockRequest { string block_id = 1; }
+message ReadBlockChunk { bytes data = 1; }
+
+message DeleteBlockRequest { string block_id = 1; }
+message DeleteBlockResponse {}

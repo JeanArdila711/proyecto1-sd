@@ -106,7 +106,7 @@ def test_download_inexistente_da_not_found(stub):
 
 
 from dfsha.client.dfsha_client import DFShaClient
-from dfsha.server.exceptions import NotAFileError, PathExistsError, PathNotFoundError
+from dfsha.common.exceptions import NotAFileError, PathExistsError, PathNotFoundError
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@ from __future__ import annotations
 import posixpath
 from pathlib import Path
 
-from dfsha.server.exceptions import DFShaError
+from dfsha.common.exceptions import DFShaError
 
 _HELP_TEXT = """Comandos disponibles:
   ls [ruta]                  lista un directorio (por defecto, el actual)

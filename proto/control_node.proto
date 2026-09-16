@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package dfsha.control_node;
+
+service ControlNodeService {
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc MakeDir(MakeDirRequest) returns (MakeDirResponse);
+  rpc RemoveDir(RemoveDirRequest) returns (RemoveDirResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
+  rpc ConfirmBlock(ConfirmBlockRequest) returns (ConfirmBlockResponse);
+  rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
+  rpc AbortUpload(AbortUploadRequest) returns (AbortUploadResponse);
+  rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+}
+
+message ListDirRequest { string path = 1; }
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+  int64 size_bytes = 3;
+}
+
+message ListDirResponse { repeated DirEntry entries = 1; }
+
+message MakeDirRequest  { string path = 1; }
+message MakeDirResponse {}
+
+message RemoveDirRequest  { string path = 1; }
+message RemoveDirResponse {}
+
+message RemoveRequest  { string path = 1; }
+message RemoveResponse {}
+
+message BeginUploadRequest {
+  string path = 1;
+  int64 size_bytes = 2;
+}
+
+message BlockLocation {
+  string block_id = 1;
+  string datanode_address = 2;
+  int64 size_bytes = 3;
+}
+
+message BeginUploadResponse { repeated BlockLocation blocks = 1; }
+
+message ConfirmBlockRequest {
+  string path = 1;
+  string block_id = 2;
+  string checksum = 3;
+  int64 size_bytes = 4;
+}
+message ConfirmBlockResponse {}
+
+message CompleteUploadRequest { string path = 1; }
+message CompleteUploadResponse {}
+
+message AbortUploadRequest { string path = 1; }
+message AbortUploadResponse {}
+
+message ListBlocksRequest { string path = 1; }
+
+message BlockInfo {
+  string block_id = 1;
+  string datanode_address = 2;
+  string checksum = 3;
+  int64 size_bytes = 4;
+}
+
+message ListBlocksResponse { repeated BlockInfo blocks = 1; }

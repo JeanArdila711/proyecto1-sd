@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from dfsha.client.shell import handle_command, resolve_relative
-from dfsha.server.exceptions import PathNotFoundError
+from dfsha.common.exceptions import PathNotFoundError
 
 
 class FakeClient:

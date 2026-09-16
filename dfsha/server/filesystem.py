@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from dfsha.server.exceptions import (
+from dfsha.common.exceptions import (
     InvalidPathError,
     NotADirectoryError,
     NotAFileError,
