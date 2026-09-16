@@ -6,17 +6,24 @@ from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.client.shell import run_repl
 
 
-def build_client(control_node_address: str) -> DistributedDFShaClient:
-    return DistributedDFShaClient(control_node_address)
+def build_client(control_node_addresses: list[str]) -> DistributedDFShaClient:
+    return DistributedDFShaClient(control_node_addresses)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Shell interactiva DFSha (Hito 2, distribuido)")
-    parser.add_argument("--control-node-host", default="localhost")
-    parser.add_argument("--control-node-port", type=int, default=50051)
+    parser.add_argument(
+        "--control-nodes",
+        default="localhost:50051",
+        help="host:port de los ControlNodes del clúster, separados por comas; "
+        "el cliente sigue al líder automáticamente",
+    )
     args = parser.parse_args()
 
-    client = build_client(f"{args.control_node_host}:{args.control_node_port}")
+    addresses = [a.strip() for a in args.control_nodes.split(",") if a.strip()]
+    if not addresses:
+        raise SystemExit("--control-nodes no puede quedar vacío")
+    client = build_client(addresses)
     try:
         run_repl(client)
     finally:

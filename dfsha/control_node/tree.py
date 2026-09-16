@@ -49,6 +49,17 @@ class ControlTree:
         # si algún día hay contención, pasar a locks por subárbol
         self._lock = threading.Lock()
 
+    # Raft guarda snapshots del árbol con pickle, y un Lock no se puede serializar:
+    # se descarta al guardar y se crea uno nuevo al restaurar.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def _parts(self, virtual_path: str) -> list[str]:
         if ".." in virtual_path.split("/"):
             raise InvalidPathError(f"la ruta contiene '..': {virtual_path!r}")
@@ -143,9 +154,15 @@ class ControlTree:
             del parent.children[name]
             return node.blocks
 
-    def begin_upload(self, virtual_path: str, placements: list[tuple[str, list[str]]]) -> None:
+    def begin_upload(
+        self, virtual_path: str, placements: list[tuple[str, list[str]]]
+    ) -> list[tuple[str, list[str]]]:
         """placements: (block_id, direcciones de las réplicas en orden de pipeline).
-        La política de selección vive en el servicer; el árbol solo la guarda."""
+        La política de selección vive en el servicer; el árbol solo la guarda.
+
+        Devuelve los placements que guardó: si un reintento con el mismo op_id llega
+        con placements nuevos, la respuesta tiene que armarse con ESTOS, que son los
+        que quedaron confirmados, no con los del reintento."""
         with self._lock:
             parts = self._parts(virtual_path)
             if not parts:
@@ -159,6 +176,7 @@ class ControlTree:
                 for bid, addresses in placements
             ]
             parent.children[name] = FileNode(state="pending", blocks=blocks)
+            return [(b.block_id, list(b.datanode_addresses)) for b in blocks]
 
     def confirm_block(self, virtual_path: str, block_id: str, checksum: str, size_bytes: int) -> None:
         with self._lock:

@@ -1,31 +1,34 @@
+import uuid
+
 import grpc
 import pytest
 
-from dfsha.control_node.main import serve as serve_control_node
 from dfsha.data_node.main import serve as serve_data_node
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
 
+def _op():
+    return uuid.uuid4().hex
+
+
 @pytest.fixture
-def cluster(tmp_path):
+def cluster(tmp_path, start_control_node):
     dn_root = tmp_path / "datanode"
     dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
     datanode_address = f"localhost:{dn_port}"
 
-    cn_server, cn_port = serve_control_node([datanode_address], "localhost", 0, block_size_bytes=5)
-    channel = grpc.insecure_channel(f"localhost:{cn_port}")
+    channel = grpc.insecure_channel(start_control_node([datanode_address], block_size_bytes=5))
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
 
     yield stub, datanode_address
 
     channel.close()
-    cn_server.stop(grace=None)
     dn_server.stop(grace=None)
 
 
 def test_mkdir_then_ls(cluster):
     stub, _ = cluster
-    stub.MakeDir(control_node_pb2.MakeDirRequest(path="/documentos"))
+    stub.MakeDir(control_node_pb2.MakeDirRequest(path="/documentos", op_id=_op()))
 
     response = stub.ListDir(control_node_pb2.ListDirRequest(path="/"))
 
@@ -36,7 +39,7 @@ def test_mkdir_then_ls(cluster):
 def test_begin_upload_reserves_blocks_by_configured_size(cluster):
     stub, datanode_address = cluster
     response = stub.BeginUpload(
-        control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=12)
+        control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=12, op_id=_op())
     )
 
     # block_size_bytes=5 en el fixture -> ceil(12/5) = 3 bloques: 5, 5, 2
@@ -46,15 +49,16 @@ def test_begin_upload_reserves_blocks_by_configured_size(cluster):
 
 def test_full_upload_flow_makes_file_visible(cluster):
     stub, datanode_address = cluster
-    begin = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=3))
+    begin = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=3, op_id=_op()))
     block = begin.blocks[0]
 
     stub.ConfirmBlock(
         control_node_pb2.ConfirmBlockRequest(
+            op_id=_op(),
             path="/archivo.txt", block_id=block.block_id, checksum="abc", size_bytes=3
         )
     )
-    stub.CompleteUpload(control_node_pb2.CompleteUploadRequest(path="/archivo.txt"))
+    stub.CompleteUpload(control_node_pb2.CompleteUploadRequest(path="/archivo.txt", op_id=_op()))
 
     entries = stub.ListDir(control_node_pb2.ListDirRequest(path="/")).entries
     assert [e.name for e in entries] == ["archivo.txt"]
@@ -69,7 +73,7 @@ def test_remove_file_deletes_blocks_from_datanode(cluster):
     dn_channel = grpc.insecure_channel(datanode_address)
     dn_stub_for_check = data_node_pb2_grpc.DataNodeServiceStub(dn_channel)
 
-    begin = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=3))
+    begin = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=3, op_id=_op()))
     block = begin.blocks[0]
 
     def chunks():
@@ -79,18 +83,36 @@ def test_remove_file_deletes_blocks_from_datanode(cluster):
     write_response = dn_stub_for_check.WriteBlock(chunks())
     stub.ConfirmBlock(
         control_node_pb2.ConfirmBlockRequest(
+            op_id=_op(),
             path="/archivo.txt",
             block_id=block.block_id,
             checksum=write_response.checksum,
             size_bytes=write_response.bytes_written,
         )
     )
-    stub.CompleteUpload(control_node_pb2.CompleteUploadRequest(path="/archivo.txt"))
+    stub.CompleteUpload(control_node_pb2.CompleteUploadRequest(path="/archivo.txt", op_id=_op()))
 
-    stub.Remove(control_node_pb2.RemoveRequest(path="/archivo.txt"))
+    stub.Remove(control_node_pb2.RemoveRequest(path="/archivo.txt", op_id=_op()))
 
     with pytest.raises(grpc.RpcError) as exc_info:
         list(dn_stub_for_check.ReadBlock(data_node_pb2.ReadBlockRequest(block_id=block.block_id)))
     assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
 
     dn_channel.close()
+
+
+def test_begin_upload_retry_with_same_op_id_returns_original_blocks(cluster):
+    """Reintento de un BeginUpload ya confirmado (respuesta perdida en un failover):
+    el servicer propone block_ids nuevos, pero tiene que responder con los que
+    quedaron guardados, o el cliente escribiría bloques que nadie conoce."""
+    stub, _ = cluster
+    request = control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=12, op_id=_op())
+
+    first = stub.BeginUpload(request)
+    retry = stub.BeginUpload(request)
+
+    assert [b.block_id for b in retry.blocks] == [b.block_id for b in first.blocks]
+    assert [list(b.datanode_addresses) for b in retry.blocks] == [
+        list(b.datanode_addresses) for b in first.blocks
+    ]
+    assert [b.size_bytes for b in retry.blocks] == [5, 5, 2]

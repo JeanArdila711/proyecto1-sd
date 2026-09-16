@@ -3,24 +3,21 @@ import pytest
 
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import BlockCorruptedError
-from dfsha.control_node.main import serve as serve_control_node
 from dfsha.data_node.main import serve as serve_data_node
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
 
 @pytest.fixture
-def cluster(tmp_path):
+def cluster(tmp_path, start_control_node):
     dn_root = tmp_path / "datanode"
     dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
     datanode_address = f"localhost:{dn_port}"
 
-    cn_server, cn_port = serve_control_node([datanode_address], "localhost", 0, block_size_bytes=5)
-    client = DistributedDFShaClient(f"localhost:{cn_port}")
+    client = DistributedDFShaClient([start_control_node([datanode_address], block_size_bytes=5)])
 
     yield client, datanode_address, dn_root
 
     client.close()
-    cn_server.stop(grace=None)
     dn_server.stop(grace=None)
 
 
@@ -91,8 +88,7 @@ def test_remove_cleans_up_blocks_on_datanode(cluster, tmp_path):
     client.upload(local, "/archivo.txt")
 
     # capturar los block_ids antes de borrar
-    cn_stub = control_node_pb2_grpc.ControlNodeServiceStub(client._control_channel)
-    blocks = cn_stub.ListBlocks(control_node_pb2.ListBlocksRequest(path="/archivo.txt")).blocks
+    blocks = client._call("ListBlocks", control_node_pb2.ListBlocksRequest(path="/archivo.txt")).blocks
 
     client.remove("/archivo.txt")
 

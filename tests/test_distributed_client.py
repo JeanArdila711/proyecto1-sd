@@ -4,23 +4,20 @@ import pytest
 
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import BlockCorruptedError, NotAFileError, PathExistsError, PathNotFoundError
-from dfsha.control_node.main import serve as serve_control_node
 from dfsha.data_node.main import serve as serve_data_node
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, start_control_node):
     dn_root = tmp_path / "datanode"
     dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
     datanode_address = f"localhost:{dn_port}"
 
-    cn_server, cn_port = serve_control_node([datanode_address], "localhost", 0, block_size_bytes=5)
-    c = DistributedDFShaClient(f"localhost:{cn_port}")
+    c = DistributedDFShaClient([start_control_node([datanode_address], block_size_bytes=5)])
 
     yield c
 
     c.close()
-    cn_server.stop(grace=None)
     dn_server.stop(grace=None)
 
 

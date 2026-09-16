@@ -24,18 +24,24 @@ message DirEntry {
 
 message ListDirResponse { repeated DirEntry entries = 1; }
 
-message MakeDirRequest  { string path = 1; }
+// op_id: identificador de la operación lógica, generado UNA vez por el cliente y
+// reutilizado sin cambios en cada reintento. El ControlNode deduplica por op_id,
+// así un reintento tras un failover de líder no aplica la operación dos veces.
+// Obligatorio en todas las requests que mutan; vacío => INVALID_ARGUMENT.
+
+message MakeDirRequest  { string path = 1; string op_id = 2; }
 message MakeDirResponse {}
 
-message RemoveDirRequest  { string path = 1; }
+message RemoveDirRequest  { string path = 1; string op_id = 2; }
 message RemoveDirResponse {}
 
-message RemoveRequest  { string path = 1; }
+message RemoveRequest  { string path = 1; string op_id = 2; }
 message RemoveResponse {}
 
 message BeginUploadRequest {
   string path = 1;
   int64 size_bytes = 2;
+  string op_id = 3;
 }
 
 message BlockLocation {
@@ -51,13 +57,14 @@ message ConfirmBlockRequest {
   string block_id = 2;
   string checksum = 3;
   int64 size_bytes = 4;
+  string op_id = 5;
 }
 message ConfirmBlockResponse {}
 
-message CompleteUploadRequest { string path = 1; }
+message CompleteUploadRequest { string path = 1; string op_id = 2; }
 message CompleteUploadResponse {}
 
-message AbortUploadRequest { string path = 1; }
+message AbortUploadRequest { string path = 1; string op_id = 2; }
 message AbortUploadResponse {}
 
 message ListBlocksRequest { string path = 1; }

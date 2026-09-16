@@ -5,14 +5,13 @@ import pytest
 
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import DFShaError
-from dfsha.control_node.main import serve as serve_control_node
 from dfsha.control_node.servicer import ControlNodeServicer
 from dfsha.data_node.main import serve as serve_data_node
 from dfsha.generated import control_node_pb2, data_node_pb2
 
 
 @pytest.fixture
-def make_cluster(tmp_path):
+def make_cluster(tmp_path, start_control_node):
     """Levanta N DataNodes + un ControlNode. Devuelve el cliente y, por cada
     DataNode, su dirección, su servidor y su raíz en disco."""
     servers = []
@@ -26,15 +25,12 @@ def make_cluster(tmp_path):
             servers.append(server)
             datanodes.append({"address": f"localhost:{port}", "server": server, "root": root})
 
-        cn_server, cn_port = serve_control_node(
+        cn_address = start_control_node(
             [dn["address"] for dn in datanodes],
-            "localhost",
-            0,
             block_size_bytes=block_size_bytes,
             replication_factor=replication_factor,
         )
-        servers.append(cn_server)
-        client = DistributedDFShaClient(f"localhost:{cn_port}")
+        client = DistributedDFShaClient([cn_address])
         clients.append(client)
         return client, datanodes
 
@@ -54,7 +50,7 @@ def _block_files(root):
 
 
 def _blocks_of(client, path):
-    return list(client._control_stub.ListBlocks(control_node_pb2.ListBlocksRequest(path=path)).blocks)
+    return list(client._call("ListBlocks", control_node_pb2.ListBlocksRequest(path=path)).blocks)
 
 
 def _upload(client, tmp_path, remote, content):
@@ -213,6 +209,6 @@ def test_pipeline_with_block_larger_than_forwarding_queue(make_cluster, tmp_path
 
 def test_servicer_rejects_invalid_configuration():
     with pytest.raises(ValueError):
-        ControlNodeServicer([], block_size_bytes=5)
+        ControlNodeServicer(None, None, [], block_size_bytes=5)
     with pytest.raises(ValueError):
-        ControlNodeServicer(["localhost:1"], block_size_bytes=5, replication_factor=0)
+        ControlNodeServicer(None, None, ["localhost:1"], block_size_bytes=5, replication_factor=0)
