@@ -54,7 +54,7 @@ El ControlNode deja de ser punto único de falla: **clúster de 3 ControlNodes c
 - **`op_id` implementado**, tal como estaba diseñado: el cliente lo genera una vez por operación lógica y lo reutiliza en cada reintento; el ControlNode deduplica por `op_id` (en el estado replicado, así que un nuevo líder también recuerda qué ya aplicó). Es obligatorio en las 7 requests que mutan: vacío → `INVALID_ARGUMENT`.
 - **Cliente con failover** (`DistributedDFShaClient._call`): recibe la lista de ControlNodes, arranca por el último líder conocido y rota ante `UNAVAILABLE`/`DEADLINE_EXCEEDED`, con timeout por intento y un presupuesto total de reintentos. La shell se arranca con `--control-nodes a,b,c`.
 - Arranque de cada ControlNode: `--node-id i --raft-cluster <los 3 host:port de Raft> --data-dir <propio>`. La lista es idéntica en los 3 nodos.
-- 141 tests en total (16 nuevos: `tests/test_replicated_tree.py`, `tests/test_raft_cluster.py` y uno en `test_control_node_servicer.py`). Los tests que ya existían corren contra un clúster Raft de 1 nodo con timeouts cortos (`conftest.py::start_control_node`): hay un solo camino de código, sin modo "sin Raft". La suite pasó de 0.5 s a ~10 s.
+- 141 tests al cerrar el sub-proyecto 3 (16 nuevos: `tests/test_replicated_tree.py`, `tests/test_raft_cluster.py` y uno en `test_control_node_servicer.py`); 150 tras las correcciones posteriores. Los tests que ya existían corren contra un clúster Raft de 1 nodo con timeouts cortos (`conftest.py::start_control_node`): hay un solo camino de código, sin modo "sin Raft". La suite pasó de 0.5 s a ~10 s.
 - Verificado con procesos reales y timeouts por defecto: tras `kill -9` al líder, el cliente vuelve a responder en ~2 s y `send`/`receive` siguen funcionando; con `kill -9` a los 3 y relevantándolos, todo se recupera desde el journal.
 
 ## Qué falta en Hito 2
@@ -66,9 +66,24 @@ Hito 2 completo (según el enunciado) es un clúster de 3 ControlNodes con Raft 
 | 1 | ControlNode + DataNode + cliente particionado (single-node) | ✅ Hecho |
 | 2 | Replicación de bloques, factor 3 (pipeline DataNode1→2→3) | ✅ Hecho |
 | 3 | Clúster de 3 ControlNodes con Raft (consenso, elección de líder) | ✅ Hecho |
-| 4 | Contenerización (Docker) | ⬜ Sin arrancar |
+| 4 | Contenerización (Docker) | ✅ Hecho |
 
-Falta el sub-proyecto 4 (Docker). La topología ya es la definitiva (3 DataNodes + 3 ControlNodes), así que el compose no debería rehacerse. Tener en cuenta al contenerizar: cada ControlNode necesita un volumen propio para `--data-dir` (sin volumen, reiniciar el contenedor es perder su journal) y `--raft-cluster` tiene que usar direcciones resolubles desde los otros contenedores, no `localhost`.
+### Hito 2, sub-proyecto 4 — completo
+
+- **Una sola imagen** (`Dockerfile`, `python:3.12-slim`, usuario sin root) para todos los roles: DataNode, ControlNode, shell y tests. Los stubs gRPC se generan dentro de la imagen.
+- **`docker-compose.yml`** con los 3 DataNodes, los 3 ControlNodes (arrancan cuando los DataNodes están `healthy`), y dos servicios con perfil: `shell` y `tests`.
+- **Raft con nombres de servicio** (`--raft-cluster cn0:6000,cn1:6000,cn2:6000`). pysyncobj escucha en la misma dirección que anuncia, así que `localhost` no funciona entre contenedores.
+- **Un volumen por nodo**: el journal de Raft y los bloques sobreviven a `docker compose down` (sin `-v`).
+- **La shell corre dentro de la red de Docker**, con `./intercambio` montado. Motivo: el ControlNode entrega las direcciones de los DataNodes como `dn1:50061`, que desde el host no resuelven. Es el problema de la *advertised address* de HDFS; al desplegar en máquinas distintas (AWS) hay que configurar direcciones resolubles por los clientes.
+- **Verificado:** los tests (150) pasan dentro de la imagen; con los 6 contenedores, subida y bajada idénticas, caída de un DataNode con `docker compose kill`, caída del líder (nuevo líder elegido), `down` + `up` conserva el árbol, y con `DFSHA_REPLICATION=2` cada DataNode guarda solo una parte de los bloques.
+
+### Correcciones posteriores al sub-proyecto 3
+
+- **Subidas pendientes con lease.** Un cliente que moría a mitad de subida (Ctrl+C, proceso matado) dejaba la entrada `pending` para siempre: el nombre no aparecía en `ls`, `rm` decía "no existe" y `send` decía "ya existe", también tras reiniciar el clúster. Ahora `BeginUpload` fija una caducidad (`--upload-lease-s`, 600 s por defecto) que cada `ConfirmBlock` renueva; vencida, otro `BeginUpload` puede reemplazar la entrada y el servicer borra los bloques de la subida abandonada. La hora la fija el líder y viaja en los argumentos del comando replicado: `apply()` sigue sin leer el reloj. Entradas del journal anteriores al cambio no tienen lease y se comportan como antes.
+- **La shell acepta comillas** para rutas con espacios. Se separa con `shlex` **sin** carácter de escape: `shlex.split` normal destruye las rutas de Windows (`..\datos\a.pdf` → `..datosa.pdf`).
+- **`.gitignore`** ahora ignora las carpetas `dn*/` y `cn*/` que crean los comandos del README, `intercambio/` y el archivo `nul` que aparece al correr `comando 2>nul` desde bash en Windows.
+
+Con esto, **el Hito 2 queda completo en código**. Ojo con el alcance según el enunciado: ahí el Hito 2 es *"arquitectura distribuida + especificación de comunicaciones"*, y la replicación, la alta disponibilidad y la consistencia son del Hito 3. Buena parte del Hito 3 ya está adelantada; lo que falta del Hito 2 es **el documento de especificación de los 5 enlaces** (Cliente↔ControlNode, Cliente↔DataNode, ControlNode↔ControlNode, ControlNode↔DataNode, DataNode↔DataNode).
 
 **Decisiones ya tomadas para lo que falta** (para no volver a discutirlas):
 
@@ -121,7 +136,9 @@ dfsha/
   common/            Excepciones de dominio, compartidas por todo
   generated/         Código gRPC generado (no se versiona, se regenera con scripts/generate_proto.py)
 proto/               Definiciones .proto (dfsha, control_node, data_node)
-tests/               141 tests, un archivo por componente
+tests/               150 tests, un archivo por componente
+Dockerfile           imagen única para todos los roles
+docker-compose.yml   clúster completo + shell + tests
 ```
 
 ## Cómo correr y probar
