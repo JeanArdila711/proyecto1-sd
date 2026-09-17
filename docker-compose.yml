@@ -1,19 +1,9 @@
-# DFSha — Hito 2, sub-proyecto 4: el clúster completo en contenedores.
+# DFSha — clúster completo en contenedores. Guía de uso: docs/GUIA.md
+# Parámetros (tamaño de bloque, factor de replicación, lease): archivo .env
 #
-#   docker compose up -d --build            3 DataNodes + 3 ControlNodes
-#   docker compose run --rm shell           shell distribuida DENTRO de la red de Docker
-#   docker compose kill dn1                 tumbar un nodo (SIGKILL, como un kill -9)
-#   docker compose start dn1                revivirlo con sus mismos datos
-#   docker compose down                     apagar (los volúmenes se conservan)
-#   docker compose down -v                  apagar y BORRAR todos los datos
-#   docker compose run --rm tests           la suite completa dentro de la imagen
-#   (la imagen se construye con el primer `up --build`; los `run` la reutilizan)
-#
-# Variables (opcionales):  DFSHA_BLOCK_MB (128)  ·  DFSHA_REPLICATION (3)  ·  DFSHA_UPLOAD_LEASE_S (600)
-#
-# Por qué la shell corre dentro de la red: el ControlNode le entrega al cliente las
-# direcciones de los DataNodes tal como las conoce (dn1:50061). Esos nombres solo
-# resuelven dentro de esta red; un cliente en el host no podría conectarse.
+# Por qué la shell y el inspector corren dentro de la red: el ControlNode entrega las
+# direcciones de los DataNodes tal como las conoce (dn1:50061), y esos nombres solo
+# resuelven dentro de esta red.
 
 # Una sola imagen para todo. La construye solo dn1: si cada servicio tuviera `build`,
 # Compose construiría la misma imagen 8 veces en paralelo y chocarían entre sí.
@@ -125,6 +115,17 @@ services:
     working_dir: /intercambio
     command: [python, -m, dfsha.client.distributed_shell_main, --control-nodes, "cn0:50051,cn1:50051,cn2:50051"]
     volumes: [./intercambio:/intercambio]
+
+  # docker compose run --rm inspect estado|lider|arbol|mapa|huerfanos|bloques <ruta>
+  inspect:
+    <<: *dfsha
+    profiles: [herramientas]
+    entrypoint: [python, scripts/inspect_cluster.py]
+    command: [estado]
+    volumes:        # solo para `huerfanos`, que lee las carpetas de bloques
+      - dn1-data:/dn1:ro
+      - dn2-data:/dn2:ro
+      - dn3-data:/dn3:ro
 
   tests:
     <<: *dfsha

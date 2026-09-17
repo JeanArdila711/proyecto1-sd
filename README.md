@@ -30,7 +30,7 @@ cambios. Sobre eso, Hito 2 agrega la arquitectura distribuida:
   reintentos son seguros porque cada operación lleva un `op_id`.
 - **Hito 2 / sub-proyecto 4** — contenerización: una imagen para todos los roles y
   un `docker-compose.yml` con los 3 DataNodes, los 3 ControlNodes, la shell y los
-  tests. Ver "Correr con Docker".
+  tests. Ver [docs/GUIA.md](docs/GUIA.md).
 
 Todo el transporte va sobre gRPC.
 
@@ -50,56 +50,14 @@ python scripts/generate_proto.py
 
 ## Correr con Docker (recomendado)
 
-Requiere Docker Desktop (o Docker Engine + Compose v2). No hace falta Python local.
-
 ```bash
-docker compose up -d --build        # 3 DataNodes + 3 ControlNodes
-docker compose ps                   # los 6 tienen que decir (healthy)
-docker compose run --rm shell       # shell distribuida, dentro de la red de Docker
+docker compose up -d --build            # 3 DataNodes + 3 ControlNodes
+docker compose run --rm shell           # shell distribuida
+docker compose run --rm inspect mapa    # dónde quedó cada bloque
+docker compose down                     # apagar
 ```
 
-La carpeta `./intercambio` del host se ve como `/intercambio` dentro de la shell:
-
-```
-dfsha:/$ mkdir /docs
-dfsha:/$ send "/intercambio/mi tesis.pdf" /docs/tesis.pdf
-dfsha:/$ receive /docs/tesis.pdf /intercambio/bajada.pdf
-```
-
-Variables opcionales (en PowerShell: `$env:DFSHA_BLOCK_MB="1"`):
-
-| Variable | Default | Para qué |
-|---|---|---|
-| `DFSHA_BLOCK_MB` | 128 | Tamaño de bloque. Con 1, un archivo de pocos MB se ve partido en varios bloques |
-| `DFSHA_REPLICATION` | 3 | Factor de replicación. Con 3 DataNodes y factor 3 cada nodo guarda todo; con 2 se ve el reparto |
-| `DFSHA_UPLOAD_LEASE_S` | 600 | Segundos que una subida puede pasar sin confirmar un bloque antes de liberar su nombre |
-
-Tumbar y revivir nodos (`kill` manda SIGKILL, equivale a `kill -9`):
-
-```bash
-docker compose kill dn1        # un DataNode
-docker compose kill cn0        # un ControlNode (si era el líder, se elige otro en ~2 s)
-docker compose start dn1       # vuelve con sus mismos datos
-docker compose logs -f cn0     # salida de un nodo
-docker compose down            # apaga; los volúmenes (journal y bloques) se conservan
-docker compose down -v         # apaga y borra todos los datos
-docker compose run --rm tests  # la suite completa dentro de la imagen
-```
-
-**Por qué la shell corre dentro de la red y no en el host:** el ControlNode le entrega al
-cliente las direcciones de los DataNodes tal como las tiene configuradas (`dn1:50061`), y
-esos nombres solo resuelven dentro de la red `dfsha`. Un cliente en el host no podría
-conectarse a los DataNodes aunque se publicaran los puertos.
-
-Decisiones del compose que no conviene cambiar sin entenderlas:
-
-- `--raft-cluster` usa nombres de servicio (`cn0:6000`), nunca `localhost`: pysyncobj escucha
-  en la misma dirección que anuncia a los otros nodos.
-- Cada ControlNode tiene su volumen para `--data-dir`: sin él, recrear el contenedor pierde el
-  journal de Raft. Cada DataNode tiene el suyo para los bloques.
-- Solo `dn1` tiene `build`: si todos los servicios construyeran la misma imagen, Compose las
-  construiría en paralelo y chocarían.
-- Sin política de reinicio a propósito: un nodo que se tumba para una prueba se queda caído.
+Guía completa (shell, inspector, pruebas de fallo, configuración): **[docs/GUIA.md](docs/GUIA.md)**.
 
 ## Correr el servidor
 
@@ -169,11 +127,6 @@ deja de atender: Raft necesita mayoría.
 **Nota importante:** el puerto por defecto del ControlNode (50051) es el
 mismo que el default del servidor de Hito 1 — si vas a correr ambos hitos
 a la vez, usá `--port` para separarlos.
-
-**En Windows, sin Docker:** los puertos 50051–50063 caen dentro del rango de puertos
-efímeros (49152–65535) y cualquier programa puede ocuparlos al azar (pasó con Chrome).
-Si un nodo falla con `Failed to bind`, usá puertos por debajo de 32768. El bloque `for`
-de arriba es bash; en PowerShell hay que lanzar cada nodo en su propia terminal.
 
 ## Tests
 

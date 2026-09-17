@@ -1,6 +1,6 @@
 # DFSha — Especificación de comunicaciones (Hito 2)
 
-> **Estado:** BORRADOR para revisión del equipo. Describe lo que está implementado en la rama `hito2-docker-y-fixes`.
+> **Estado:** BORRADOR para revisión del equipo. Describe lo implementado en `main`.
 > **Qué cubre:** los cinco enlaces que pide el enunciado — Cliente↔ControlNode, Cliente↔DataNode, ControlNode↔ControlNode, ControlNode↔DataNode, DataNode↔DataNode —, con protocolo, contrato, semántica de fallos y justificación de cada decisión.
 > **Contratos fuente:** `proto/control_node.proto`, `proto/data_node.proto`. Consenso: `pysyncobj==0.3.17`.
 
