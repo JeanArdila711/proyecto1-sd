@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from dfsha.client.shell import handle_command, resolve_relative
+from dfsha.client.shell import handle_command, resolve_relative, split_command
 from dfsha.common.exceptions import PathNotFoundError
 
 
@@ -111,3 +111,24 @@ def test_receive_a_ruta_local_invalida_no_revienta_el_shell():
     ruta_invalida = "/no/existe/destino.txt"
     _, output = handle_command(client, "/", f"receive archivo.txt {ruta_invalida}")
     assert "receive:" in output
+
+
+def test_split_command_respeta_comillas_y_barras_de_windows():
+    partes = split_command(r'send "C:\Users\yo\8 SEMESTRE\tesis.pdf" ..\datos\otro.pdf')
+    assert partes == ["send", r"C:\Users\yo\8 SEMESTRE\tesis.pdf", r"..\datos\otro.pdf"]
+
+
+def test_send_con_espacios_en_la_ruta_local(tmp_path):
+    client = FakeClient()
+    carpeta = tmp_path / "8 SEMESTRE"
+    carpeta.mkdir()
+    origen = carpeta / "mi tesis.txt"
+    origen.write_text("hola")
+    _, output = handle_command(client, "/", f'send "{origen}" "tesis final.txt"')
+    assert "enviados" in output
+    assert client.files["/tesis final.txt"] == b"hola"
+
+
+def test_comilla_sin_cerrar_no_revienta_el_shell():
+    _, output = handle_command(FakeClient(), "/", 'send "abierta destino')
+    assert "error de sintaxis" in output

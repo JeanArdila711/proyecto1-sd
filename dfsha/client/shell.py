@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import posixpath
+import shlex
 from pathlib import Path
 
 from dfsha.common.exceptions import DFShaError
@@ -15,7 +16,9 @@ _HELP_TEXT = """Comandos disponibles:
   send <local> <remota>       sube un archivo local al DFS
   receive <remota> <local>    descarga un archivo del DFS
   help                        muestra esta ayuda
-  exit / quit                 termina la sesión"""
+  exit / quit                 termina la sesión
+
+Las rutas con espacios van entre comillas: send "C:\\mis docs\\a.pdf" a.pdf"""
 
 
 def resolve_relative(current_dir: str, target: str) -> str:
@@ -24,8 +27,23 @@ def resolve_relative(current_dir: str, target: str) -> str:
     return "/" if normalized == "." else normalized
 
 
+def split_command(line: str) -> list[str]:
+    """Separa por espacios respetando comillas, para rutas como "C:\\8 SEMESTRE\\x.pdf".
+
+    Sin escape: shlex.split trataría la barra invertida de las rutas de Windows como
+    escape y convertiría ..\\datos\\a.pdf en ..datosa.pdf."""
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    lexer.commenters = ""
+    return list(lexer)
+
+
 def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
-    parts = line.strip().split()
+    try:
+        parts = split_command(line)
+    except ValueError as exc:
+        return current_dir, f"error de sintaxis: {exc}"
     if not parts:
         return current_dir, ""
     cmd, *args = parts
