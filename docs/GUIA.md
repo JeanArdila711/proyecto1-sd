@@ -50,19 +50,15 @@ Las rutas con espacios van entre comillas: `send "/intercambio/mi tesis.pdf" /do
 ## 3. Ver el sistema por dentro
 
 ```bash
-docker compose run --rm inspect estado
+docker compose run --rm inspect estado                     # quién es el líder y qué nodos están vivos
+docker compose run --rm inspect lider                      # solo el nombre del líder: cn0, cn1 o cn2
+docker compose run --rm inspect arbol                      # todos los directorios y archivos
+docker compose run --rm inspect mapa                       # en qué DataNode está cada bloque
+docker compose run --rm inspect bloques /docs/tesis.pdf    # réplicas de un archivo, verificando su SHA-256
+docker compose run --rm inspect huerfanos                  # bloques en disco que ningún archivo usa
 ```
 
-| Comando | Muestra |
-|---|---|
-| `inspect estado` | Quién es el líder y qué nodos están vivos |
-| `inspect lider` | Solo el nombre del líder (`cn0`, `cn1` o `cn2`) |
-| `inspect arbol` | Todos los directorios y archivos |
-| `inspect mapa` | En qué DataNode está cada bloque de cada archivo |
-| `inspect bloques /docs/tesis.pdf` | Los bloques de un archivo y el estado de cada réplica, verificando su SHA-256 |
-| `inspect huerfanos` | Bloques en disco que ningún archivo usa |
-
-Ejemplo de `inspect mapa` con bloques de 1 MB y factor 2:
+Ejemplo del mapa con bloques de 1 MB y factor 2:
 
 ```
   archivo / bloque                  dn1         dn2         dn3
@@ -80,22 +76,58 @@ Ejemplo de `inspect mapa` con bloques de 1 MB y factor 2:
 
 ## 4. Probar fallos
 
-| Prueba | Comandos | Resultado esperado |
-|---|---|---|
-| **Cae un DataNode** | `docker compose kill dn1` → `receive` en la shell | El archivo baja completo desde otra réplica |
-| **Cae el líder** | `docker compose run --rm inspect lider` → `docker compose kill cn1` (el que salió) → `inspect estado` | Otro ControlNode es líder en ~2 s y la shell sigue funcionando |
-| **Caen 2 ControlNodes** | `kill` a dos de `cn0`, `cn1`, `cn2` → `ls` en la shell | No responde: Raft necesita mayoría (2 de 3) |
-| **Bloque corrupto** | ver abajo → `inspect bloques /docs/tesis.pdf` → `receive` | La réplica aparece `CORRUPTO` y el archivo baja bien desde otra |
-| **Réplica caída al subir** | `docker compose kill dn3` → `send` de un archivo de varios bloques | La subida falla: toda escritura exige todas sus réplicas |
-| **Apagar todo** | `docker compose down` → `docker compose up -d` → `inspect arbol` | Los archivos siguen ahí |
-| **Cliente muere a mitad de subida** | poner `DFSHA_UPLOAD_LEASE_S=15` en `.env` → `send` de un archivo grande y cerrar la terminal a mitad → esperar 15 s → repetir el `send` | El segundo `send` funciona y los bloques abandonados se borran |
+Deja la shell abierta en otra terminal (`docker compose run --rm shell`) para los pasos que dicen *en la shell*.
 
-Revivir un nodo con sus mismos datos: `docker compose start dn1`.
+**Cae un DataNode** — el archivo baja completo desde otra réplica:
 
-Corromper un byte de un bloque en `dn2`:
+```bash
+docker compose kill dn1
+# en la shell: receive /docs/tesis.pdf /intercambio/copia.pdf
+docker compose start dn1
+```
+
+**Cae el líder** — otro ControlNode es líder en ~2 s y la shell sigue funcionando:
+
+```bash
+docker compose run --rm inspect lider      # por ejemplo: cn1
+docker compose kill cn1                    # el nombre que salió
+docker compose run --rm inspect estado
+# en la shell: ls /docs
+docker compose start cn1
+```
+
+**Caen 2 ControlNodes** — no responde, porque Raft necesita mayoría (2 de 3):
+
+```bash
+docker compose kill cn0 cn1
+# en la shell: ls /docs   → falla tras unos segundos
+docker compose start cn0 cn1
+```
+
+**Réplica caída al subir** — la subida de un archivo de varios bloques falla, porque toda escritura exige todas sus réplicas:
+
+```bash
+docker compose kill dn3
+# en la shell: send /intercambio/tesis.pdf /docs/otro.pdf
+docker compose start dn3
+```
+
+**Apagar todo** — los archivos siguen ahí:
+
+```bash
+docker compose down
+docker compose up -d
+docker compose run --rm inspect arbol
+```
+
+**Cliente que muere a mitad de subida** — pon `DFSHA_UPLOAD_LEASE_S=15` en `.env` y `docker compose up -d`. En la shell empieza un `send` de un archivo grande y cierra esa terminal a mitad. Espera 15 s, abre otra shell y repite el mismo `send`: funciona, y los bloques abandonados se borran.
+
+**Bloque corrupto** — la réplica aparece `CORRUPTO` y el archivo baja bien desde otra:
 
 ```bash
 docker compose exec dn2 sh -c 'f=$(ls /data | grep -v sha256 | head -1); printf "\377" | dd of=/data/$f bs=1 seek=100 count=1 conv=notrunc 2>/dev/null; echo corrompido $f'
+docker compose run --rm inspect bloques /docs/tesis.pdf
+# en la shell: receive /docs/tesis.pdf /intercambio/copia2.pdf
 ```
 
 ---
