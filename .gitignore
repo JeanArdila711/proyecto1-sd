@@ -9,3 +9,14 @@ docs/superpowers/
 CLAUDE.md
 .worktrees/
 .DS_Store
+
+# Datos que crean los comandos del README al correr el clúster en la raíz del repo
+/dn[0-9]*/
+/cn[0-9]*/
+dfsha-datanode-data/
+# Artefacto de Windows: "comando 2>nul" ejecutado en bash crea un archivo llamado nul
+nul
+# Cachés y editores
+.pytest_cache/
+.vscode/
+.idea/
