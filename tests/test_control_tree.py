@@ -189,3 +189,52 @@ def test_abort_upload_on_root_raises_invalid_path():
 
     with pytest.raises(InvalidPathError):
         tree.abort_upload("/")
+
+
+# ── lease de subidas pendientes ─────────────────────────────────────────────
+
+
+def test_pending_upload_with_live_lease_still_blocks_the_name():
+    tree = ControlTree()
+    tree.begin_upload("/archivo.txt", [("b1", ["dn1"])], now=100.0, lease_s=60.0)
+    with pytest.raises(PathExistsError):
+        tree.begin_upload("/archivo.txt", [("b2", ["dn1"])], now=159.0, lease_s=60.0)
+
+
+def test_expired_pending_upload_is_replaced_and_its_blocks_returned():
+    tree = ControlTree()
+    tree.begin_upload("/archivo.txt", [("b1", ["dn1", "dn2"])], now=100.0, lease_s=60.0)
+
+    placements, stale = tree.begin_upload("/archivo.txt", [("b2", ["dn1"])], now=160.0, lease_s=60.0)
+
+    assert placements == [("b2", ["dn1"])]
+    assert [(b.block_id, b.datanode_addresses) for b in stale] == [("b1", ["dn1", "dn2"])]
+    tree.confirm_block("/archivo.txt", "b2", "sum", 1, now=161.0, lease_s=60.0)
+    tree.complete_upload("/archivo.txt")
+    assert [b.block_id for b in tree.list_blocks("/archivo.txt")] == ["b2"]
+
+
+def test_confirm_block_renews_the_lease():
+    tree = ControlTree()
+    tree.begin_upload("/archivo.txt", [("b1", ["dn1"]), ("b2", ["dn1"])], now=100.0, lease_s=60.0)
+    tree.confirm_block("/archivo.txt", "b1", "sum", 1, now=150.0, lease_s=60.0)  # vence a los 210
+
+    with pytest.raises(PathExistsError):
+        tree.begin_upload("/archivo.txt", [("b3", ["dn1"])], now=200.0, lease_s=60.0)
+
+
+def test_committed_file_is_never_replaced_even_if_its_lease_expired():
+    tree = ControlTree()
+    tree.begin_upload("/archivo.txt", [("b1", ["dn1"])], now=100.0, lease_s=1.0)
+    tree.confirm_block("/archivo.txt", "b1", "sum", 1)
+    tree.complete_upload("/archivo.txt")
+    with pytest.raises(PathExistsError):
+        tree.begin_upload("/archivo.txt", [("b2", ["dn1"])], now=10_000.0, lease_s=1.0)
+
+
+def test_pending_upload_without_lease_never_expires():
+    # entradas del journal escritas antes de existir el lease: sin now ni lease_s
+    tree = ControlTree()
+    tree.begin_upload("/archivo.txt", [("b1", ["dn1"])])
+    with pytest.raises(PathExistsError):
+        tree.begin_upload("/archivo.txt", [("b2", ["dn1"])], now=10_000.0, lease_s=1.0)

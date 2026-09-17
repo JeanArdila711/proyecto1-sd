@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 
 import grpc
@@ -24,6 +25,11 @@ DEFAULT_REPLICATION_FACTOR = 3
 # que ser menor que el timeout por intento del cliente, para que el servidor alcance
 # a responder UNAVAILABLE antes de que el cliente corte por deadline.
 DEFAULT_COMMIT_TIMEOUT_S = 3.0
+
+# Cuánto puede estar una subida sin confirmar un bloque antes de que su nombre quede
+# libre para otro BeginUpload. Tiene que cubrir la escritura de UN bloque completo
+# (128 MB por un enlace lento) más un failover de líder; se renueva con cada ConfirmBlock.
+DEFAULT_UPLOAD_LEASE_S = 600.0
 
 _ERROR_STATUS_MAP = {
     PathNotFoundError: grpc.StatusCode.NOT_FOUND,
@@ -49,6 +55,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         block_size_bytes: int,
         replication_factor: int = DEFAULT_REPLICATION_FACTOR,
         commit_timeout_s: float = DEFAULT_COMMIT_TIMEOUT_S,
+        upload_lease_s: float = DEFAULT_UPLOAD_LEASE_S,
     ) -> None:
         if not datanode_addresses:
             raise ValueError("hace falta al menos un DataNode")
@@ -58,6 +65,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         # nunca guardar replicated.tree: un snapshot restaurado lo reemplaza entero
         self._replicated = replicated
         self._commit_timeout_s = commit_timeout_s
+        self._upload_lease_s = upload_lease_s
         self._datanode_addresses = list(datanode_addresses)
         self._block_size_bytes = block_size_bytes
         # con menos DataNodes que el factor pedido, se replica en todos los que haya
@@ -162,6 +170,10 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         # Efecto secundario fuera de la máquina de estados, solo en el líder y
         # después del commit. Dentro de apply() correría en los 3 nodos y de nuevo
         # en cada replay del journal.
+        self._delete_blocks(blocks)
+        return control_node_pb2.RemoveResponse()
+
+    def _delete_blocks(self, blocks) -> None:
         for block in blocks:
             for address in block.datanode_addresses:
                 try:
@@ -170,10 +182,8 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     )
                 except grpc.RpcError:
                     # best-effort: la metadata ya se borró, un bloque físico que falle
-                    # en limpiarse no debe tapar ni romper el Remove (mismo criterio
-                    # que AbortUpload)
+                    # en limpiarse no debe tapar ni romper la operación
                     pass
-        return control_node_pb2.RemoveResponse()
 
     def BeginUpload(self, request, context):
         if request.size_bytes <= 0:
@@ -186,10 +196,20 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             # La respuesta se arma con lo que DEVUELVE el commit, no con `proposed`: si
             # este op_id ya se había confirmado (reintento tras un failover), el
             # resultado guardado trae los block_id originales.
-            placements = self._commit(context, request.op_id, "begin_upload", request.path, proposed)
+            placements, stale_blocks = self._commit(
+                context,
+                request.op_id,
+                "begin_upload",
+                request.path,
+                proposed,
+                time.time(),  # lo decide el líder y viaja en el log: apply() no lee el reloj
+                self._upload_lease_s,
+            )
         except (PathExistsError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.BeginUploadResponse()
+        # bloques de una subida abandonada cuyo nombre se acaba de reutilizar
+        self._delete_blocks(stale_blocks)
 
         remaining = request.size_bytes
         locations = []
@@ -215,6 +235,8 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 request.block_id,
                 request.checksum,
                 request.size_bytes,
+                time.time(),
+                self._upload_lease_s,
             )
         except PathNotFoundError as exc:
             _abort_on_domain_error(context, exc)

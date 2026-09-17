@@ -116,3 +116,44 @@ def test_begin_upload_retry_with_same_op_id_returns_original_blocks(cluster):
         list(b.datanode_addresses) for b in first.blocks
     ]
     assert [b.size_bytes for b in retry.blocks] == [5, 5, 2]
+
+
+
+def test_abandoned_upload_frees_the_name_after_lease_and_deletes_its_blocks(tmp_path, start_control_node):
+    """Bug real: un cliente que muere a mitad de subida dejaba el nombre bloqueado para
+    siempre (invisible en ls, rm decía 'no existe', send decía 'ya existe') y sus bloques
+    huérfanos en disco."""
+    import time
+
+    dn_server, dn_port = serve_data_node(tmp_path / "dn", "localhost", 0)
+    datanode = f"localhost:{dn_port}"
+    channel = grpc.insecure_channel(start_control_node([datanode], block_size_bytes=5, upload_lease_s=0.5))
+    stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
+    dn_stub = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(datanode))
+    try:
+        # el cliente reserva 2 bloques, escribe y confirma el primero... y se muere
+        begin = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/tesis.bin", size_bytes=10, op_id=_op()))
+        abandoned = begin.blocks[0]
+        written = dn_stub.WriteBlock(iter([
+            data_node_pb2.WriteBlockChunk(header=data_node_pb2.WriteBlockHeader(block_id=abandoned.block_id)),
+            data_node_pb2.WriteBlockChunk(data=b"12345"),
+        ]))
+        stub.ConfirmBlock(control_node_pb2.ConfirmBlockRequest(
+            path="/tesis.bin", block_id=abandoned.block_id, checksum=written.checksum, size_bytes=5, op_id=_op()))
+
+        # con el lease vivo, el nombre sigue ocupado
+        with pytest.raises(grpc.RpcError) as busy:
+            stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/tesis.bin", size_bytes=3, op_id=_op()))
+        assert busy.value.code() == grpc.StatusCode.ALREADY_EXISTS
+
+        time.sleep(0.8)
+
+        # vencido: otro cliente puede usar el nombre, y el bloque abandonado se borra
+        retry = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/tesis.bin", size_bytes=3, op_id=_op()))
+        assert len(retry.blocks) == 1
+        with pytest.raises(grpc.RpcError) as gone:
+            list(dn_stub.ReadBlock(data_node_pb2.ReadBlockRequest(block_id=abandoned.block_id)))
+        assert gone.value.code() == grpc.StatusCode.NOT_FOUND
+    finally:
+        channel.close()
+        dn_server.stop(grace=None)

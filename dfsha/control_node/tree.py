@@ -28,6 +28,16 @@ class BlockRecord:
 class FileNode:
     state: str = "pending"  # "pending" | "committed"
     blocks: list[BlockRecord] = field(default_factory=list)
+    # Lease de la subida pendiente: pasada esta hora (reloj del líder), otro BeginUpload
+    # puede reemplazarla. Sin esto, un cliente que muere a mitad de subida deja el nombre
+    # bloqueado para siempre. 0.0 = sin caducidad (entradas creadas antes de existir el lease).
+    lease_expires_at: float = 0.0
+
+
+def _lease_expired(node, now: float | None) -> bool:
+    # getattr: un FileNode restaurado de un snapshot viejo no tiene el atributo
+    expires_at = getattr(node, "lease_expires_at", 0.0)
+    return now is not None and 0.0 < expires_at <= now
 
 
 @dataclass
@@ -155,30 +165,53 @@ class ControlTree:
             return node.blocks
 
     def begin_upload(
-        self, virtual_path: str, placements: list[tuple[str, list[str]]]
-    ) -> list[tuple[str, list[str]]]:
+        self,
+        virtual_path: str,
+        placements: list[tuple[str, list[str]]],
+        now: float | None = None,
+        lease_s: float | None = None,
+    ) -> tuple[list[tuple[str, list[str]]], list[BlockRecord]]:
         """placements: (block_id, direcciones de las réplicas en orden de pipeline).
         La política de selección vive en el servicer; el árbol solo la guarda.
 
-        Devuelve los placements que guardó: si un reintento con el mismo op_id llega
-        con placements nuevos, la respuesta tiene que armarse con ESTOS, que son los
-        que quedaron confirmados, no con los del reintento."""
+        now y lease_s los fija el líder y viajan en el comando replicado: dentro de
+        apply() no se puede leer el reloj, cada nodo calcularía una hora distinta.
+        Sin ellos (entradas viejas del journal) no hay lease, como antes.
+
+        Devuelve (placements guardados, bloques de una subida pendiente vencida que se
+        reemplazó). Los placements: si un reintento con el mismo op_id llega con
+        placements nuevos, la respuesta tiene que armarse con ESTOS. Los bloques
+        reemplazados los borra el servicer después del commit."""
         with self._lock:
             parts = self._parts(virtual_path)
             if not parts:
                 raise InvalidPathError("ruta de destino inválida")
             parent = self._walk_to_parent(parts[:-1], create=True)
             name = parts[-1]
-            if name in parent.children:
-                raise PathExistsError(f"ya existe: {virtual_path}")
+            stale_blocks: list[BlockRecord] = []
+            existing = parent.children.get(name)
+            if existing is not None:
+                if isinstance(existing, FileNode) and existing.state == "pending" and _lease_expired(existing, now):
+                    stale_blocks = existing.blocks
+                else:
+                    raise PathExistsError(f"ya existe: {virtual_path}")
             blocks = [
                 BlockRecord(block_id=bid, datanode_addresses=list(addresses))
                 for bid, addresses in placements
             ]
-            parent.children[name] = FileNode(state="pending", blocks=blocks)
-            return [(b.block_id, list(b.datanode_addresses)) for b in blocks]
+            expires_at = now + lease_s if now is not None and lease_s else 0.0
+            parent.children[name] = FileNode(state="pending", blocks=blocks, lease_expires_at=expires_at)
+            return [(b.block_id, list(b.datanode_addresses)) for b in blocks], stale_blocks
 
-    def confirm_block(self, virtual_path: str, block_id: str, checksum: str, size_bytes: int) -> None:
+    def confirm_block(
+        self,
+        virtual_path: str,
+        block_id: str,
+        checksum: str,
+        size_bytes: int,
+        now: float | None = None,
+        lease_s: float | None = None,
+    ) -> None:
         with self._lock:
             node = self._get_pending_file(virtual_path)
             for block in node.blocks:
@@ -186,6 +219,9 @@ class ControlTree:
                     block.checksum = checksum
                     block.size_bytes = size_bytes
                     block.confirmed = True
+                    if now is not None and lease_s:
+                        # cada bloque confirmado prueba que el cliente sigue vivo: renueva
+                        node.lease_expires_at = now + lease_s
                     return
             raise PathNotFoundError(f"bloque {block_id} no reservado para {virtual_path}")
 

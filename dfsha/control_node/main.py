@@ -11,6 +11,7 @@ from dfsha.control_node.replicated_tree import ReplicatedTree
 from dfsha.control_node.servicer import (
     DEFAULT_COMMIT_TIMEOUT_S,
     DEFAULT_REPLICATION_FACTOR,
+    DEFAULT_UPLOAD_LEASE_S,
     ControlNodeServicer,
 )
 from dfsha.generated import control_node_pb2_grpc
@@ -44,6 +45,7 @@ def serve(
     replication_factor: int = DEFAULT_REPLICATION_FACTOR,
     raft_conf_overrides: dict | None = None,
     commit_timeout_s: float = DEFAULT_COMMIT_TIMEOUT_S,
+    upload_lease_s: float = DEFAULT_UPLOAD_LEASE_S,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft y su servidor gRPC.
 
@@ -63,6 +65,7 @@ def serve(
         block_size_bytes,
         replication_factor,
         commit_timeout_s,
+        upload_lease_s,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
     bound_port = server.add_insecure_port(f"{host}:{port}")
@@ -102,6 +105,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--block-size-mb", type=int, default=128)
     parser.add_argument("--replication-factor", type=int, default=DEFAULT_REPLICATION_FACTOR)
+    parser.add_argument(
+        "--upload-lease-s",
+        type=float,
+        default=DEFAULT_UPLOAD_LEASE_S,
+        help="segundos que una subida puede estar sin confirmar un bloque antes de que su "
+        "nombre quede libre (cubre a un cliente que murió a mitad de subida)",
+    )
     args = parser.parse_args()
 
     cluster = _split_addresses(args.raft_cluster)
@@ -124,6 +134,7 @@ def main() -> None:
         data_dir=Path(args.data_dir),
         block_size_bytes=args.block_size_mb * 1024 * 1024,
         replication_factor=args.replication_factor,
+        upload_lease_s=args.upload_lease_s,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")

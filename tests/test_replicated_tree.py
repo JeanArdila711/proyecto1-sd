@@ -57,11 +57,11 @@ def test_same_op_id_is_not_applied_twice():
 def test_retried_begin_upload_returns_original_placements():
     repl = ReplicatedTree()
     original = [("a" * 32, ["dn1", "dn2", "dn3"])]
-    _, stored = _apply(repl, "op1", "begin_upload", "/f.bin", original)
+    _, (stored, _) = _apply(repl, "op1", "begin_upload", "/f.bin", original)
 
     # tras un failover, el nuevo líder propone OTROS block_ids para el mismo op_id
     retry = [("b" * 32, ["dn2", "dn3", "dn1"])]
-    _, returned = _apply(repl, "op1", "begin_upload", "/f.bin", retry)
+    _, (returned, _) = _apply(repl, "op1", "begin_upload", "/f.bin", retry)
 
     assert returned == stored == original
     # y el árbol guardó los originales: son los que se pueden confirmar
