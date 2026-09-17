@@ -163,6 +163,7 @@ docker compose run --rm tests
 
 ## Ver también
 
+- `docs/arquitectura-y-flujos.excalidraw` — arquitectura y cada flujo paso a paso (abrir en [excalidraw.com](https://excalidraw.com) o con la extensión de VS Code)
 - `docs/especificacion-comunicaciones.md` — protocolos y contratos entre los componentes
 - `ESTADO_PROYECTO.md` — qué está hecho, decisiones y detalles de implementación
 - `docker compose logs -f cn0` — salida de un nodo
