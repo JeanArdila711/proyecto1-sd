@@ -1,0 +1,13 @@
+.git
+.venv
+.pytest_cache
+**/__pycache__
+*.pyc
+dfsha/generated/
+dfsha-data/
+intercambio/
+dn[0-9]*/
+cn[0-9]*/
+.claude/
+docs/
+*.md

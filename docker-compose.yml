@@ -1,0 +1,144 @@
+# DFSha — Hito 2, sub-proyecto 4: el clúster completo en contenedores.
+#
+#   docker compose up -d --build            3 DataNodes + 3 ControlNodes
+#   docker compose run --rm shell           shell distribuida DENTRO de la red de Docker
+#   docker compose kill dn1                 tumbar un nodo (SIGKILL, como un kill -9)
+#   docker compose start dn1                revivirlo con sus mismos datos
+#   docker compose down                     apagar (los volúmenes se conservan)
+#   docker compose down -v                  apagar y BORRAR todos los datos
+#   docker compose run --rm tests           la suite completa dentro de la imagen
+#   (la imagen se construye con el primer `up --build`; los `run` la reutilizan)
+#
+# Variables (opcionales):  DFSHA_BLOCK_MB (128)  ·  DFSHA_REPLICATION (3)  ·  DFSHA_UPLOAD_LEASE_S (600)
+#
+# Por qué la shell corre dentro de la red: el ControlNode le entrega al cliente las
+# direcciones de los DataNodes tal como las conoce (dn1:50061). Esos nombres solo
+# resuelven dentro de esta red; un cliente en el host no podría conectarse.
+
+# Una sola imagen para todo. La construye solo dn1: si cada servicio tuviera `build`,
+# Compose construiría la misma imagen 8 veces en paralelo y chocarían entre sí.
+x-dfsha: &dfsha
+  image: dfsha:local
+  pull_policy: never    # es local: nunca buscarla en Docker Hub
+  networks: [dfsha]
+  init: true            # PID 1 que reenvía señales: el nodo se apaga limpio con docker compose stop
+
+x-datanode: &datanode
+  <<: *dfsha
+  healthcheck:
+    test: ["CMD", "python", "-c", "import grpc; grpc.channel_ready_future(grpc.insecure_channel('localhost:50061')).result(timeout=3)"]
+    interval: 3s
+    timeout: 5s
+    retries: 20
+
+x-controlnode: &controlnode
+  <<: *dfsha
+  depends_on:
+    dn1: { condition: service_healthy }
+    dn2: { condition: service_healthy }
+    dn3: { condition: service_healthy }
+  healthcheck:
+    test: ["CMD", "python", "-c", "import grpc; grpc.channel_ready_future(grpc.insecure_channel('localhost:50051')).result(timeout=3)"]
+    interval: 3s
+    timeout: 5s
+    retries: 20
+
+# Mismos puertos internos en todos los nodos: cada contenedor tiene su propia IP.
+# --raft-cluster usa nombres de servicio, nunca localhost: pysyncobj escucha en la
+# misma dirección que anuncia a los demás nodos. La lista es idéntica en los 3.
+
+services:
+  dn1:
+    <<: *datanode
+    build: .
+    pull_policy: build
+    hostname: dn1
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061"]
+    volumes: [dn1-data:/data]
+  dn2:
+    <<: *datanode
+    hostname: dn2
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061"]
+    volumes: [dn2-data:/data]
+  dn3:
+    <<: *datanode
+    hostname: dn3
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061"]
+    volumes: [dn3-data:/data]
+
+  cn0:
+    <<: *controlnode
+    hostname: cn0
+    command:
+      - python
+      - -m
+      - dfsha.control_node.main
+      - --node-id=0
+      - --port=50051
+      - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
+      - --data-dir=/raft
+      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --block-size-mb=${DFSHA_BLOCK_MB:-128}
+      - --replication-factor=${DFSHA_REPLICATION:-3}
+      - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
+    volumes: [cn0-raft:/raft]
+  cn1:
+    <<: *controlnode
+    hostname: cn1
+    command:
+      - python
+      - -m
+      - dfsha.control_node.main
+      - --node-id=1
+      - --port=50051
+      - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
+      - --data-dir=/raft
+      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --block-size-mb=${DFSHA_BLOCK_MB:-128}
+      - --replication-factor=${DFSHA_REPLICATION:-3}
+      - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
+    volumes: [cn1-raft:/raft]
+  cn2:
+    <<: *controlnode
+    hostname: cn2
+    command:
+      - python
+      - -m
+      - dfsha.control_node.main
+      - --node-id=2
+      - --port=50051
+      - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
+      - --data-dir=/raft
+      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --block-size-mb=${DFSHA_BLOCK_MB:-128}
+      - --replication-factor=${DFSHA_REPLICATION:-3}
+      - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
+    volumes: [cn2-raft:/raft]
+
+  # Shell interactiva. ./intercambio del host aparece como /intercambio dentro:
+  #   dfsha:/$ send /intercambio/tesis.pdf /docs/tesis.pdf
+  shell:
+    <<: *dfsha
+    profiles: [cliente]
+    stdin_open: true
+    tty: true
+    working_dir: /intercambio
+    command: [python, -m, dfsha.client.distributed_shell_main, --control-nodes, "cn0:50051,cn1:50051,cn2:50051"]
+    volumes: [./intercambio:/intercambio]
+
+  tests:
+    <<: *dfsha
+    profiles: [tests]
+    command: [python, -m, pytest, tests/, -q, -p, no:cacheprovider]
+
+networks:
+  dfsha:
+    name: dfsha
+
+volumes:
+  dn1-data:
+  dn2-data:
+  dn3-data:
+  cn0-raft:
+  cn1-raft:
+  cn2-raft:

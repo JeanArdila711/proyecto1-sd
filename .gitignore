@@ -20,3 +20,5 @@ nul
 .pytest_cache/
 .vscode/
 .idea/
+# Carpeta compartida con la shell de Docker (docker compose run shell)
+intercambio/
