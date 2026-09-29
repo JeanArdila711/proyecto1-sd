@@ -1,0 +1,182 @@
+{
+  "abort_upload_op_id": "legacy-snapshot-abort",
+  "follow_up_contract": {
+    "B1": {
+      "legacy_outcome": "abort_upload -> None",
+      "recovery": "__setstate__ inicializa {} cuando falta en el snapshot",
+      "state": "ControlTree._locks"
+    },
+    "B3": {
+      "legacy_outcome": "applied_ops conserva resultados existentes",
+      "recovery": "defaults simples por atributo de clase; begin_upload conserva argumentos legacy",
+      "state": "FileNode.version y FileNode.block_size"
+    },
+    "C2": {
+      "legacy_outcome": "replay no convierte firmas legacy en TypeError",
+      "recovery": "__setstate__ inicializa {} cuando falta en el snapshot",
+      "state": "ControlTree._users"
+    },
+    "C3": {
+      "legacy_outcome": "applied_ops conserva abort_upload -> None",
+      "recovery": "defaults simples admin, 0o755 y 0o644 para objetos legacy",
+      "state": "DirNode/FileNode owner, group y mode"
+    }
+  },
+  "generator": "scripts/spikes/generate_legacy_raft_fixture.py",
+  "legacy_operations": [
+    {
+      "args": [
+        "/snapshot"
+      ],
+      "method": "make_dir",
+      "op_id": "legacy-snapshot-mkdir"
+    },
+    {
+      "args": [
+        "/snapshot/file.bin",
+        [
+          [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            [
+              "legacy-dn:50061"
+            ]
+          ]
+        ]
+      ],
+      "method": "begin_upload",
+      "op_id": "legacy-snapshot-begin"
+    },
+    {
+      "args": [
+        "/snapshot/file.bin",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "snapshot-checksum",
+        8
+      ],
+      "method": "confirm_block",
+      "op_id": "legacy-snapshot-confirm"
+    },
+    {
+      "args": [
+        "/snapshot/file.bin"
+      ],
+      "method": "complete_upload",
+      "op_id": "legacy-snapshot-complete"
+    },
+    {
+      "args": [
+        "/snapshot/aborted.bin",
+        [
+          [
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            [
+              "legacy-dn:50061"
+            ]
+          ]
+        ]
+      ],
+      "method": "begin_upload",
+      "op_id": "legacy-snapshot-begin-abort"
+    },
+    {
+      "args": [
+        "/snapshot/aborted.bin"
+      ],
+      "method": "abort_upload",
+      "op_id": "legacy-snapshot-abort"
+    },
+    {
+      "args": [
+        "/journal"
+      ],
+      "method": "make_dir",
+      "op_id": "legacy-journal-mkdir"
+    },
+    {
+      "args": [
+        "/journal/replayed.bin",
+        [
+          [
+            "cccccccccccccccccccccccccccccccc",
+            [
+              "legacy-dn:50061"
+            ]
+          ]
+        ]
+      ],
+      "method": "begin_upload",
+      "op_id": "legacy-journal-begin"
+    },
+    {
+      "args": [
+        "/journal/replayed.bin",
+        "cccccccccccccccccccccccccccccccc",
+        "journal-checksum",
+        7
+      ],
+      "method": "confirm_block",
+      "op_id": "legacy-journal-confirm"
+    },
+    {
+      "args": [
+        "/journal/replayed.bin"
+      ],
+      "method": "complete_upload",
+      "op_id": "legacy-journal-complete"
+    },
+    {
+      "args": [
+        "/journal/aborted.bin",
+        [
+          [
+            "dddddddddddddddddddddddddddddddd",
+            [
+              "legacy-dn:50061"
+            ]
+          ]
+        ]
+      ],
+      "method": "begin_upload",
+      "op_id": "legacy-journal-begin-abort"
+    },
+    {
+      "args": [
+        "/journal/aborted.bin"
+      ],
+      "method": "abort_upload",
+      "op_id": "legacy-journal-abort"
+    },
+    {
+      "args": [
+        "/journal/replayed.bin"
+      ],
+      "method": "remove_file",
+      "op_id": "legacy-journal-remove"
+    },
+    {
+      "args": [
+        "/journal"
+      ],
+      "method": "remove_dir",
+      "op_id": "legacy-journal-rmdir"
+    }
+  ],
+  "nodes": [
+    "cn0",
+    "cn1",
+    "cn2"
+  ],
+  "sha256": {
+    "cn0/raft.dump": "46918d4e9ef83df020563cd24550b60e407442a0d0d14c87c1963e2eef7cddda",
+    "cn0/raft.journal": "461643e5702d05649b51fe03bcd54ff64d66cfab0df3873fca90bd1df9802990",
+    "cn0/raft.journal.meta": "20ea177954c2210da0438c47e3d48fe25699e288a307a82b2ef8a004eafbdddc",
+    "cn1/raft.dump": "5d889842e95bd78f15841911d3c6dc1793447c42a714e332a1729b18ebe4426b",
+    "cn1/raft.journal": "461643e5702d05649b51fe03bcd54ff64d66cfab0df3873fca90bd1df9802990",
+    "cn1/raft.journal.meta": "20ea177954c2210da0438c47e3d48fe25699e288a307a82b2ef8a004eafbdddc",
+    "cn2/raft.dump": "5d889842e95bd78f15841911d3c6dc1793447c42a714e332a1729b18ebe4426b",
+    "cn2/raft.journal": "461643e5702d05649b51fe03bcd54ff64d66cfab0df3873fca90bd1df9802990",
+    "cn2/raft.journal.meta": "20ea177954c2210da0438c47e3d48fe25699e288a307a82b2ef8a004eafbdddc"
+  },
+  "source_commit": "9985c6d",
+  "source_commit_full": "9985c6d5f1bb71a79f146ce467742a9edd211530"
+}

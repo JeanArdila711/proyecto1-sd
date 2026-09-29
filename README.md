@@ -134,6 +134,20 @@ a la vez, usá `--port` para separarlos.
 python -m pytest tests/ -v
 ```
 
+### Verificar el spike de Raft cifrado y fixtures legacy
+
+El spike S2 usa tres nodos Raft con puertos efímeros, verifica elección, réplica,
+reinicio desde `raft.dump` + `raft.journal` y aislamiento de un nodo con password
+distinta. No modifica el clúster de desarrollo:
+
+```bash
+python scripts/spikes/raft_password_spike.py --workdir "$(mktemp -d)"
+python -m pytest tests/test_raft_upgrade.py -q
+```
+
+Los binarios legacy versionados y su procedimiento de regeneración están en
+[`tests/fixtures/README.md`](tests/fixtures/README.md).
+
 ## Fuera de alcance por ahora
 
 RF3 (acceso granular a archivos: `open`/`close`/`read`/`write`/`lock`),

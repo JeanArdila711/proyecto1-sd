@@ -113,6 +113,13 @@ Cosas que costó descubrir y que no vale la pena redescubrir:
 - **Durabilidad del journal:** `pysyncobj` escribe el journal por `mmap` sin `fsync` por entrada. Sobrevive a que se caiga el *proceso* (`kill -9`: lo escrito ya está en el page cache del SO), pero no garantiza durabilidad ante un corte de luz o caída del SO de un nodo — ahí depende de que la mayoría del clúster siga viva. Tenerlo presente al escribir el informe: no afirmar más que eso.
 - **Config de `pysyncobj`:** exige `raftMinTimeout > 3 × appendEntriesPeriod` y `connectionTimeout >= raftMaxTimeout`, validado con `assert` (con `python -O` esas validaciones desaparecen en silencio). Los tests usan timeouts cortos (`conftest.py::FAST_RAFT_CONF`); con valores más agresivos que esos, las elecciones se vuelven inestables bajo carga.
 
+### Hito 3, S2 — Spike Raft cifrado y upgrade de estado legacy
+
+- `scripts/spikes/raft_password_spike.py` verifica con `SyncObjConf(password=...)` un clúster de tres nodos: líder único, réplica, reinicio desde `raft.dump` + `raft.journal` y aislamiento de un tercer nodo con password distinta. Usa puertos efímeros y no toca el clúster de desarrollo.
+- `tests/fixtures/raft_legacy_9985c6d/` versiona los tres directorios persistidos reales generados con `HEAD=9985c6d`; el manifiesto fija los hashes, las firmas legacy y el outcome histórico `abort_upload -> None`.
+- `tests/test_raft_upgrade.py` restaura los binarios en tres nodos con direcciones nuevas, reproduce el journal, exige convergencia y rechaza outcomes que contengan `TypeError`. Deja `assert_legacy_upgrade(..., extension_checks=...)` para B1 (`_locks`), B3 (`version`/`block_size`), C2 (`_users`) y C3 (permisos).
+- Revisión 1: antes de ejecutar comandos nuevos, el upgrade compara en cada réplica una proyección canónica del árbol y `applied_ops`: conserva `/snapshot/file.bin` con sus bloques y metadata, no expone los uploads abortados y deja el journal en su estado final idéntico en los tres nodos.
+
 ## Convenciones del repo
 
 - **Autor de todo commit:** `Jean Ardila <jardilaa@eafit.edu.co>` — es el identificador que reconoce GitHub para este repo, no usar un correo personal.

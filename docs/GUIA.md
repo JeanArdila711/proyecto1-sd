@@ -159,6 +159,20 @@ docker compose down -v     # apaga y borra los datos
 docker compose run --rm tests
 ```
 
+### Spike S2: Raft con password y upgrade legacy
+
+Fuera de Docker, el spike usa solo puertos efímeros y un directorio temporal;
+comprueba un clúster Raft de tres nodos, reinicio desde snapshot+journal y que
+un nodo con password distinta no afecta a la mayoría:
+
+```bash
+python scripts/spikes/raft_password_spike.py --workdir "$(mktemp -d)"
+python -m pytest tests/test_raft_upgrade.py -q
+```
+
+Los `raft.dump`/`raft.journal` reales de `9985c6d`, sus hashes y la reproducción
+controlada están en `tests/fixtures/README.md`.
+
 ---
 
 ## Ver también
