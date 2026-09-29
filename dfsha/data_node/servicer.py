@@ -7,7 +7,13 @@ from pathlib import Path
 
 import grpc
 
-from dfsha.common.exceptions import BlockCorruptedError, BlockNotFoundError
+from dfsha.common.exceptions import (
+    AccessDeniedError,
+    AuthError,
+    BlockCorruptedError,
+    BlockNotFoundError,
+    ConflictError,
+)
 from dfsha.data_node import block_store
 from dfsha.generated import data_node_pb2, data_node_pb2_grpc
 
@@ -22,6 +28,9 @@ QUEUE_DEPTH_CHUNKS = 4
 _ERROR_STATUS_MAP = {
     BlockNotFoundError: grpc.StatusCode.NOT_FOUND,
     BlockCorruptedError: grpc.StatusCode.DATA_LOSS,
+    ConflictError: grpc.StatusCode.ABORTED,
+    AccessDeniedError: grpc.StatusCode.PERMISSION_DENIED,
+    AuthError: grpc.StatusCode.UNAUTHENTICATED,
 }
 
 
@@ -33,6 +42,7 @@ def _discard_local(root: Path, block_id: str) -> None:
 
 def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> None:
     status_code = _ERROR_STATUS_MAP.get(type(exc), grpc.StatusCode.UNKNOWN)
+    context.set_trailing_metadata((("dfsha-error", type(exc).__name__),))
     context.abort(status_code, str(exc))
 
 
@@ -62,6 +72,13 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
 
         block_id = first.header.block_id
         downstream = list(first.header.downstream)
+        try:
+            # Validar antes de crear el forwarding evita dejar un worker esperando
+            # si el identificador que terminaría en disco no es aceptable.
+            block_store.validate_block_id(block_id)
+        except BlockNotFoundError as exc:
+            _abort_on_domain_error(context, exc)
+            return data_node_pb2.WriteBlockResponse()
 
         if not downstream:
             checksum, bytes_written = block_store.write_block(

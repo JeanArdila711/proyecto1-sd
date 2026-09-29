@@ -20,7 +20,7 @@ def serve(root: Path, host: str, port: int) -> tuple[grpc.Server, int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DataNode DFSha (Hito 2, sin replicación)")
+    parser = argparse.ArgumentParser(description="DataNode DFSha (Hito 2, replicación por pipeline)")
     parser.add_argument("--root", default="./dfsha-datanode-data")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=50061)

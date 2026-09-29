@@ -9,6 +9,9 @@ from pysyncobj import SyncObj, SyncObjException
 
 from dfsha.common import exceptions
 from dfsha.common.exceptions import (
+    AccessDeniedError,
+    AuthError,
+    ConflictError,
     InvalidPathError,
     NotADirectoryError,
     NotAFileError,
@@ -38,11 +41,15 @@ _ERROR_STATUS_MAP = {
     InvalidPathError: grpc.StatusCode.PERMISSION_DENIED,
     NotAFileError: grpc.StatusCode.INVALID_ARGUMENT,
     NotADirectoryError: grpc.StatusCode.INVALID_ARGUMENT,
+    ConflictError: grpc.StatusCode.ABORTED,
+    AccessDeniedError: grpc.StatusCode.PERMISSION_DENIED,
+    AuthError: grpc.StatusCode.UNAUTHENTICATED,
 }
 
 
 def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> None:
     status_code = _ERROR_STATUS_MAP.get(type(exc), grpc.StatusCode.UNKNOWN)
+    context.set_trailing_metadata((("dfsha-error", type(exc).__name__),))
     context.abort(status_code, str(exc))
 
 
@@ -150,7 +157,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
     def MakeDir(self, request, context):
         try:
             self._commit(context, request.op_id, "make_dir", request.path)
-        except (PathExistsError, InvalidPathError) as exc:
+        except (PathExistsError, PathNotFoundError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.MakeDirResponse()
 
@@ -164,7 +171,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
     def Remove(self, request, context):
         try:
             blocks = self._commit(context, request.op_id, "remove_file", request.path)
-        except (PathNotFoundError, NotAFileError, InvalidPathError) as exc:
+        except (PathNotFoundError, NotAFileError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.RemoveResponse()
         # Efecto secundario fuera de la máquina de estados, solo en el líder y
@@ -205,7 +212,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 time.time(),  # lo decide el líder y viaja en el log: apply() no lee el reloj
                 self._upload_lease_s,
             )
-        except (PathExistsError, InvalidPathError) as exc:
+        except (PathExistsError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.BeginUploadResponse()
         # bloques de una subida abandonada cuyo nombre se acaba de reutilizar
@@ -238,7 +245,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 time.time(),
                 self._upload_lease_s,
             )
-        except PathNotFoundError as exc:
+        except (PathNotFoundError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.ConfirmBlockResponse()
 
@@ -252,7 +259,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
     def AbortUpload(self, request, context):
         try:
             self._commit(context, request.op_id, "abort_upload", request.path)
-        except PathNotFoundError as exc:
+        except (PathNotFoundError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.AbortUploadResponse()
 
@@ -260,7 +267,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         self._read_barrier(context)
         try:
             blocks = self._replicated.tree.list_blocks(request.path)
-        except PathNotFoundError as exc:
+        except (PathNotFoundError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.ListBlocksResponse()
         return control_node_pb2.ListBlocksResponse(

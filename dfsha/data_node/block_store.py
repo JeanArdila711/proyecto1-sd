@@ -12,9 +12,14 @@ from dfsha.common.exceptions import BlockCorruptedError, BlockNotFoundError
 _VALID_BLOCK_ID = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
-def _block_path(root: Path, block_id: str) -> Path:
+def validate_block_id(block_id: str) -> None:
+    """Rechaza identificadores de red antes de que lleguen al filesystem."""
     if not _VALID_BLOCK_ID.match(block_id):
         raise BlockNotFoundError(f"block_id inválido: {block_id!r}")
+
+
+def _block_path(root: Path, block_id: str) -> Path:
+    validate_block_id(block_id)
     return root / block_id
 
 

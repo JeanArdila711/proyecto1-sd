@@ -7,6 +7,9 @@ import grpc
 from dfsha.generated import dfsha_pb2, dfsha_pb2_grpc
 from dfsha.server import filesystem
 from dfsha.common.exceptions import (
+    AccessDeniedError,
+    AuthError,
+    ConflictError,
     InvalidPathError,
     NotAFileError,
     NotADirectoryError,
@@ -24,11 +27,15 @@ _ERROR_STATUS_MAP = {
     InvalidPathError: grpc.StatusCode.PERMISSION_DENIED,
     NotAFileError: grpc.StatusCode.INVALID_ARGUMENT,
     NotADirectoryError: grpc.StatusCode.INVALID_ARGUMENT,
+    ConflictError: grpc.StatusCode.ABORTED,
+    AccessDeniedError: grpc.StatusCode.PERMISSION_DENIED,
+    AuthError: grpc.StatusCode.UNAUTHENTICATED,
 }
 
 
 def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> None:
     status_code = _ERROR_STATUS_MAP.get(type(exc), grpc.StatusCode.UNKNOWN)
+    context.set_trailing_metadata((("dfsha-error", type(exc).__name__),))
     context.abort(status_code, str(exc))
 
 
@@ -51,7 +58,7 @@ class DFShaServicer(dfsha_pb2_grpc.DFShaServiceServicer):
     def MakeDir(self, request, context):
         try:
             filesystem.make_dir(self._root, request.path)
-        except (PathExistsError, InvalidPathError) as exc:
+        except (PathExistsError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
         return dfsha_pb2.MakeDirResponse()
 
@@ -79,7 +86,7 @@ class DFShaServicer(dfsha_pb2_grpc.DFShaServiceServicer):
 
         try:
             bytes_written = filesystem.write_file_chunks(self._root, path, chunks())
-        except (InvalidPathError, NotAFileError) as exc:
+        except (InvalidPathError, NotAFileError, NotADirectoryError) as exc:
             _abort_on_domain_error(context, exc)
         return dfsha_pb2.UploadResponse(bytes_written=bytes_written)
 

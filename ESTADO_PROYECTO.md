@@ -148,3 +148,21 @@ Ver `README.md` para los comandos exactos de instalación y de arranque de cada 
 ```bash
 python -m pytest tests/ -v
 ```
+
+## Hito 3 — P0: errores con tipo exacto
+
+- Los servicers de Hito 1, ControlNode y DataNode adjuntan `dfsha-error` en la metadata final de cada excepción de dominio; la matriz completa vive en `docs/especificacion-comunicaciones.md`.
+- El cliente distribuido acepta únicamente nombres de una lista explícita de excepciones de dominio y conserva un fallback seguro por `StatusCode` si la metadata falta o es inválida.
+- La lectura solo intenta otra réplica para `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` de bloque identificado por metadata. `WriteBlock` valida el identificador antes de iniciar forwarding.
+- Verificado con 196 pruebas en verde (`python -m pytest tests/ -q`).
+
+### Correcciones de revisión, iteración 1 (P0)
+
+- `filesystem._require_directory_parent` valida cada ancestro para que `MakeDir` y `Upload` anidados bajo un archivo traduzcan a `NotADirectoryError`, sin exponer `UNKNOWN`.
+- `_translate` conserva el fallback seguro si `dfsha-error` aparece duplicado, incluso con valores iguales o conflictivos.
+- Verificado con 200 pruebas en verde (`python -m pytest tests/ -q`).
+
+### Correcciones de revisión, iteración 3 (P0)
+
+- `NOT_FOUND` sin `dfsha-error` o con un tipo desconocido no activa failover: se relanza el error y no se consulta la siguiente réplica.
+- Verificado con 202 pruebas en verde (`python -m pytest tests/ -q`).

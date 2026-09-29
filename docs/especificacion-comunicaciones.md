@@ -282,3 +282,44 @@ sequenceDiagram
 | ⑤ DataNode ↔ DataNode | `insecure_channel` | mTLS |
 
 Ya implementado a favor de la seguridad: validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco, y verificación de integridad SHA-256 en cada lectura.
+
+## 11. Matriz de errores de dominio
+
+Todas las filas de esta matriz representan una excepción de dominio. Antes de cerrar el RPC, el servidor adjunta `dfsha-error=<nombre de clase>` como *trailing metadata*. El cliente distribuido solo reconstruye los nombres de una lista permitida; si falta la metadata o no es confiable, usa el mapa seguro por `StatusCode`.
+
+Los errores de forma del protocolo que no nacen de una excepción de dominio (por ejemplo, `op_id` vacío, stream vacío o primer mensaje sin header) conservan su `INVALID_ARGUMENT` sin `dfsha-error`.
+
+### Hito 1 — `DFShaService`
+
+| RPC | Excepción de dominio → `StatusCode` |
+|---|---|
+| `ListDir` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `MakeDir` | `PathExistsError` → `ALREADY_EXISTS`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `RemoveDir` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `NotEmptyError` → `FAILED_PRECONDITION`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `Remove` | `PathNotFoundError` → `NOT_FOUND`; `NotAFileError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `Upload` | `InvalidPathError` → `PERMISSION_DENIED`; `NotAFileError` → `INVALID_ARGUMENT`; `NotADirectoryError` → `INVALID_ARGUMENT` |
+| `Download` | `PathNotFoundError` → `NOT_FOUND`; `NotAFileError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+
+### ControlNode — `ControlNodeService`
+
+| RPC | Excepción de dominio → `StatusCode` |
+|---|---|
+| `ListDir` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `MakeDir` | `PathExistsError` → `ALREADY_EXISTS`; `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `RemoveDir` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `NotEmptyError` → `FAILED_PRECONDITION`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `Remove` | `PathNotFoundError` → `NOT_FOUND`; `NotAFileError` → `INVALID_ARGUMENT`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `BeginUpload` | `PathExistsError` → `ALREADY_EXISTS`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` (ruta o tamaño no positivo) |
+| `ConfirmBlock` | `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `CompleteUpload` | `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `AbortUpload` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `ListBlocks` | `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` |
+
+### DataNode — `DataNodeService`
+
+| RPC | Excepción de dominio → `StatusCode` |
+|---|---|
+| `WriteBlock` | `BlockNotFoundError` → `NOT_FOUND` cuando `block_id` no cumple el formato; se valida antes de iniciar el forwarding |
+| `ReadBlock` | `BlockNotFoundError` → `NOT_FOUND`; `BlockCorruptedError` → `DATA_LOSS` |
+| `DeleteBlock` | `BlockNotFoundError` → `NOT_FOUND` |
+
+`ConflictError` → `ABORTED`, `AccessDeniedError` → `PERMISSION_DENIED` y `AuthError` → `UNAUTHENTICATED` quedan registrados en los tres traductores de dominio para los RPC de locks, permisos y autenticación que los introduzcan en Hito 3. En lectura de bloques, el cliente solo prueba la siguiente réplica ante `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` cuya metadata sea exactamente `BlockNotFoundError`; cualquier error permanente falla de inmediato.

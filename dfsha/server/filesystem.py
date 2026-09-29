@@ -25,6 +25,13 @@ def resolve_path(root: Path, virtual_path: str) -> Path:
     return candidate
 
 
+def _require_directory_parent(target: Path, virtual_path: str) -> None:
+    """Evita convertir un error del filesystem en UNKNOWN del RPC."""
+    for ancestor in target.parents:
+        if ancestor.exists() and not ancestor.is_dir():
+            raise NotADirectoryError(f"no es un directorio: {virtual_path}")
+
+
 @dataclass(frozen=True)
 class DirEntryData:
     name: str
@@ -48,6 +55,7 @@ def list_dir(root: Path, virtual_path: str) -> list[DirEntryData]:
 
 def make_dir(root: Path, virtual_path: str) -> None:
     target = resolve_path(root, virtual_path)
+    _require_directory_parent(target, virtual_path)
     if target.exists():
         raise PathExistsError(f"ya existe: {virtual_path}")
     target.mkdir(parents=True)
@@ -78,6 +86,7 @@ def write_file_chunks(root: Path, virtual_path: str, chunks: Iterable[bytes]) ->
     target = resolve_path(root, virtual_path)
     if target == resolve_path(root, "/"):
         raise InvalidPathError(f"ruta de destino inválida: {virtual_path!r}")
+    _require_directory_parent(target, virtual_path)
     if target.is_dir():
         raise NotAFileError(f"no es un archivo: {virtual_path}")
     target.parent.mkdir(parents=True, exist_ok=True)

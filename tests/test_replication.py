@@ -98,7 +98,8 @@ def test_download_fails_over_when_first_replica_is_corrupted(make_cluster, tmp_p
 
 
 class _MidStreamError(grpc.RpcError):
-    pass
+    def code(self):
+        return grpc.StatusCode.UNAVAILABLE
 
 
 def test_download_discards_partial_bytes_when_replica_dies_mid_block(make_cluster, tmp_path, monkeypatch):

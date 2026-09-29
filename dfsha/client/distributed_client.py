@@ -8,9 +8,14 @@ from pathlib import Path
 import grpc
 
 from dfsha.common.exceptions import (
+    AccessDeniedError,
+    AuthError,
     BlockCorruptedError,
+    BlockNotFoundError,
+    ConflictError,
     DFShaError,
     InvalidPathError,
+    NotADirectoryError,
     NotAFileError,
     NotEmptyError,
     PathExistsError,
@@ -34,11 +39,9 @@ _RETRY_BACKOFF_S = 0.2
 # una mutación es seguro solo porque la request lleva op_id.
 _RETRYABLE_CODES = frozenset({grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED})
 
-# El código NOT_FOUND lo puede mandar tanto el ControlNode (ruta que no
-# existe) como el DataNode (bloque que no existe) — con un solo mapa no se
-# distinguen los dos casos, se pierde el subtipo exacto pero el mensaje de
-# texto de la excepción sigue siendo el correcto. Mismo trade-off aceptado
-# que INVALID_ARGUMENT en el cliente de Hito 1.
+# El fallback se conserva para servidores anteriores o metadata inválida. No distingue
+# PERMISSION_DENIED de una ruta inválida y un permiso denegado; para eso se exige
+# dfsha-error de una clase incluida explícitamente en ALLOWED_DOMAIN_ERROR_TYPES.
 _STATUS_ERROR_MAP = {
     grpc.StatusCode.NOT_FOUND: PathNotFoundError,
     grpc.StatusCode.ALREADY_EXISTS: PathExistsError,
@@ -46,12 +49,66 @@ _STATUS_ERROR_MAP = {
     grpc.StatusCode.PERMISSION_DENIED: InvalidPathError,
     grpc.StatusCode.INVALID_ARGUMENT: NotAFileError,
     grpc.StatusCode.DATA_LOSS: BlockCorruptedError,
+    grpc.StatusCode.ABORTED: ConflictError,
+    grpc.StatusCode.UNAUTHENTICATED: AuthError,
 }
+
+ALLOWED_DOMAIN_ERROR_TYPES = (
+    InvalidPathError,
+    PathNotFoundError,
+    PathExistsError,
+    NotEmptyError,
+    NotAFileError,
+    NotADirectoryError,
+    BlockNotFoundError,
+    BlockCorruptedError,
+    ConflictError,
+    AccessDeniedError,
+    AuthError,
+)
+_ALLOWED_DOMAIN_ERROR_BY_NAME = {error_type.__name__: error_type for error_type in ALLOWED_DOMAIN_ERROR_TYPES}
+_READ_FAILOVER_CODES = frozenset(
+    {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.DATA_LOSS,
+    }
+)
+
+
+def _metadata_error_type(rpc_error: grpc.RpcError) -> type[DFShaError] | None:
+    """Acepta exactamente una clase de dominio conocida de la metadata gRPC."""
+    try:
+        metadata = rpc_error.trailing_metadata() or ()
+    except AttributeError:
+        return None
+    names = [
+        value
+        for entry in metadata
+        if isinstance(entry, tuple)
+        and len(entry) == 2
+        and entry[0] == "dfsha-error"
+        and isinstance((value := entry[1]), str)
+    ]
+    if len(names) != 1:
+        return None
+    return _ALLOWED_DOMAIN_ERROR_BY_NAME.get(names[0])
 
 
 def _translate(rpc_error: grpc.RpcError) -> DFShaError:
-    exc_cls = _STATUS_ERROR_MAP.get(rpc_error.code(), DFShaError)
-    return exc_cls(rpc_error.details())
+    error_type = _metadata_error_type(rpc_error)
+    if error_type is None:
+        error_type = _STATUS_ERROR_MAP.get(rpc_error.code(), DFShaError)
+    return error_type(rpc_error.details())
+
+
+def _is_recoverable_read_error(rpc_error: grpc.RpcError) -> bool:
+    if rpc_error.code() in _READ_FAILOVER_CODES:
+        return True
+    return (
+        rpc_error.code() == grpc.StatusCode.NOT_FOUND
+        and _metadata_error_type(rpc_error) is BlockNotFoundError
+    )
 
 
 def _new_op_id() -> str:
@@ -195,8 +252,7 @@ class DistributedDFShaClient:
         return bytes_written
 
     def _read_block_with_failover(self, block, fh) -> int:
-        """Prueba cada réplica en orden. Una réplica caída (UNAVAILABLE) o podrida
-        (DATA_LOSS) hace caer a la siguiente; solo falla si fallan todas."""
+        """Prueba otra réplica solo cuando una falla recuperable invalida este bloque."""
         start = fh.tell()
         last_error: grpc.RpcError | None = None
         for address in block.datanode_addresses:
@@ -210,6 +266,8 @@ class DistributedDFShaClient:
                 # escritos: sin descartarlos el archivo final queda corrupto en silencio
                 fh.seek(start)
                 fh.truncate()
+                if not _is_recoverable_read_error(exc):
+                    raise
                 last_error = exc
         if last_error is None:
             raise PathNotFoundError(f"el bloque {block.block_id} no tiene réplicas registradas")

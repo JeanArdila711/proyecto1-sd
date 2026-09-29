@@ -35,3 +35,15 @@ class BlockNotFoundError(DFShaError):
 
 class BlockCorruptedError(DFShaError):
     """El checksum guardado no coincide con el contenido leído."""
+
+
+class ConflictError(DFShaError):
+    """La operación choca con un lock o una versión concurrente."""
+
+
+class AccessDeniedError(DFShaError):
+    """El usuario autenticado no puede ejecutar la operación."""
+
+
+class AuthError(DFShaError):
+    """La llamada no tiene credenciales válidas."""
