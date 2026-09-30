@@ -33,6 +33,57 @@ class FileNode:
     # puede reemplazarla. Sin esto, un cliente que muere a mitad de subida deja el nombre
     # bloqueado para siempre. 0.0 = sin caducidad (entradas creadas antes de existir el lease).
     lease_expires_at: float = 0.0
+    # B3. Defaults simples: un FileNode de un snapshot viejo los toma del atributo de
+    # clase. version sube con cada commit_write (CAS optimista); block_size 0 = archivo
+    # subido antes de B3, se infiere del primer bloque (ver _block_size_of).
+    version: int = 0
+    block_size: int = 0
+
+
+@dataclass
+class WriteSlotRecord:
+    index: int
+    new_block_id: str
+    new_addresses: list[str]
+    new_size: int
+
+
+@dataclass
+class WriteReservation:
+    """Una escritura copy-on-write en curso: sus bloques nuevos todavía no son visibles."""
+
+    write_id: str
+    path: str  # canónica
+    base_version: int
+    lock_id: str
+    block_size: int
+    slots: list[WriteSlotRecord]
+    lease_expires_at: float
+
+
+def plan_write_slots(sizes: list[int], block_size: int, offset: int, length: int) -> list[tuple[int, int]]:
+    """(índice, tamaño nuevo) de cada bloque que toca escribir `length` bytes desde `offset`.
+
+    Una sola función para las dos puntas: el líder la usa para proponer bloques nuevos
+    y begin_write para validar la propuesta, así nunca discrepan. D-P4: se sobrescribe
+    o se extiende, nunca se inserta; todos los bloques menos el último quedan llenos."""
+    size = sum(sizes)
+    if length <= 0:
+        raise InvalidPathError(f"el largo a escribir debe ser mayor a 0, no {length}")
+    if offset < 0 or offset > size:
+        raise InvalidPathError(f"offset {offset} fuera del archivo ({size} bytes); no hay huecos")
+    new_size = max(size, offset + length)
+    first = offset // block_size
+    last = (offset + length - 1) // block_size
+    return [(index, min(block_size, new_size - index * block_size)) for index in range(first, last + 1)]
+
+
+def _block_size_of(node: FileNode, default: int) -> int:
+    stored = getattr(node, "block_size", 0)
+    if stored:
+        return stored
+    # archivo previo a B3: con más de un bloque, el primero está lleno (invariante D-P4)
+    return node.blocks[0].size_bytes if len(node.blocks) > 1 else default
 
 
 def _lease_expired(node, now: float | None) -> bool:
@@ -69,6 +120,8 @@ class ControlTree:
         self._lock = threading.Lock()
         # Estado replicado: snapshots anteriores a B1 lo recuperan en __setstate__.
         self._locks: dict[str, LockState] = {}
+        # Reservas de escritura COW por write_id (B3); también se recuperan en __setstate__.
+        self._writes: dict[str, WriteReservation] = {}
 
     # Raft guarda snapshots del árbol con pickle, y un Lock no se puede serializar:
     # se descarta al guardar y se crea uno nuevo al restaurar.
@@ -80,9 +133,11 @@ class ControlTree:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._lock = threading.Lock()
-        # Snapshot pre-Hito 3: falta el atributo fuera de dataclass.
+        # Snapshot pre-Hito 3: faltan los atributos fuera de dataclass.
         if not hasattr(self, "_locks"):
             self._locks = {}
+        if not hasattr(self, "_writes"):
+            self._writes = {}
 
     def _parts(self, virtual_path: str) -> list[str]:
         if ".." in virtual_path.split("/"):
@@ -279,6 +334,7 @@ class ControlTree:
         placements: list[tuple[str, list[str]]],
         now: float | None = None,
         lease_s: float | None = None,
+        block_size: int | None = None,
     ) -> tuple[list[tuple[str, list[str]]], list[BlockRecord]]:
         """placements: (block_id, direcciones de las réplicas en orden de pipeline).
         La política de selección vive en el servicer; el árbol solo la guarda.
@@ -286,6 +342,8 @@ class ControlTree:
         now y lease_s los fija el líder y viajan en el comando replicado: dentro de
         apply() no se puede leer el reloj, cada nodo calcularía una hora distinta.
         Sin ellos (entradas viejas del journal) no hay lease, como antes.
+        block_size (B3) va último y opcional por la misma razón: un journal previo lo
+        reproduce sin él, y el archivo lo infiere del primer bloque.
 
         Devuelve (placements guardados, bloques de una subida pendiente vencida que se
         reemplazó). Los placements: si un reintento con el mismo op_id llega con
@@ -309,7 +367,9 @@ class ControlTree:
                 for bid, addresses in placements
             ]
             expires_at = now + lease_s if now is not None and lease_s else 0.0
-            parent.children[name] = FileNode(state="pending", blocks=blocks, lease_expires_at=expires_at)
+            parent.children[name] = FileNode(
+                state="pending", blocks=blocks, lease_expires_at=expires_at, block_size=block_size or 0
+            )
             return [(b.block_id, list(b.datanode_addresses)) for b in blocks], stale_blocks
 
     def confirm_block(
@@ -353,6 +413,152 @@ class ControlTree:
             if not isinstance(node, FileNode) or node.state != "pending":
                 raise PathNotFoundError(f"no hay una subida pendiente para: {virtual_path}")
             del parent.children[name]
+
+    # --- Escritura copy-on-write (B3) ----------------------------------------------------
+    #
+    # Los bloques nunca se modifican en su lugar: una escritura reserva bloques nuevos
+    # (begin_write), el cliente los escribe por el pipeline normal y commit_write los
+    # publica con un compare-and-set de la versión del archivo. Hasta el commit, el
+    # archivo visible es el anterior.
+
+    def write_layout(self, virtual_path: str, default_block_size: int) -> tuple[int, int, list[int]]:
+        """(versión, tamaño de bloque, tamaños de los bloques) de un archivo confirmado.
+        Solo lectura: el líder la usa, tras la barrera, para armar la propuesta de begin_write."""
+        with self._lock:
+            node = self._get_committed_file(virtual_path)
+            return (
+                getattr(node, "version", 0),
+                _block_size_of(node, default_block_size),
+                [block.size_bytes for block in node.blocks],
+            )
+
+    def _require_write_lock(self, canonical_path: str, lock_id: str, now: float) -> None:
+        self._cleanup_expired_locks(canonical_path, now)
+        state = self._locks.get(canonical_path)
+        if state is None or state.mode != "w" or lock_id not in state.holders:
+            raise ConflictError(f"hace falta el lock exclusivo vigente para escribir: {canonical_path}")
+
+    def _cleanup_expired_writes(self, now: float | None) -> None:
+        """Una reserva vencida deja de existir: sus bloques quedan para el recolector (A3)."""
+        if now is None:
+            return
+        self._writes = {
+            write_id: reservation
+            for write_id, reservation in self._writes.items()
+            if reservation.lease_expires_at > now
+        }
+
+    def begin_write(
+        self,
+        virtual_path: str,
+        write_id: str,
+        lock_id: str,
+        base_version: int,
+        offset: int,
+        length: int,
+        proposals: list[tuple[int, str, list[str]]],
+        now: float,
+        lease_s: float,
+        default_block_size: int,
+    ) -> tuple[str, int, int, list[tuple]]:
+        """Reserva los bloques nuevos de una escritura. `proposals` son (índice, block_id,
+        réplicas) que el líder generó ANTES del commit (apply() no genera UUIDs ni elige
+        réplicas); acá solo se valida que sigan correspondiendo al archivo actual."""
+        with self._lock:
+            canonical_path = self._canonical_path(virtual_path)
+            node = self._get_committed_file(canonical_path)
+            self._require_write_lock(canonical_path, lock_id, now)
+            self._cleanup_expired_writes(now)
+            if write_id in self._writes:
+                raise ConflictError(f"write_id repetido: {write_id}")
+            version = getattr(node, "version", 0)
+            if version != base_version:
+                raise ConflictError(f"el archivo cambió (versión {version}, se esperaba {base_version}); reintentá")
+            block_size = _block_size_of(node, default_block_size)
+            plan = plan_write_slots([b.size_bytes for b in node.blocks], block_size, offset, length)
+            if [index for index, _ in plan] != [index for index, _, _ in proposals]:
+                raise ConflictError("la propuesta de bloques no coincide con el archivo actual; reintentá")
+            slots = [
+                WriteSlotRecord(index, block_id, list(addresses), new_size)
+                for (index, new_size), (_, block_id, addresses) in zip(plan, proposals)
+            ]
+            self._writes[write_id] = WriteReservation(
+                write_id, canonical_path, version, lock_id, block_size, slots, now + lease_s
+            )
+            described = []
+            for slot in slots:
+                old = node.blocks[slot.index] if slot.index < len(node.blocks) else None
+                described.append(
+                    (
+                        slot.index,
+                        old.block_id if old else "",
+                        old.size_bytes if old else 0,
+                        list(old.datanode_addresses) if old else [],
+                        slot.new_block_id,
+                        list(slot.new_addresses),
+                        slot.new_size,
+                    )
+                )
+            return write_id, version, block_size, described
+
+    def commit_write(
+        self,
+        virtual_path: str,
+        write_id: str,
+        lock_id: str,
+        base_version: int,
+        confirmed: list[tuple[int, str, str, int]],
+        now: float,
+    ) -> tuple[int, list[BlockRecord]]:
+        """Publica los bloques nuevos si la versión sigue siendo la reservada (CAS) y el
+        writer conserva el lock. Devuelve (versión nueva, bloques reemplazados), para
+        que el servicer del líder borre los viejos después del commit."""
+        with self._lock:
+            canonical_path = self._canonical_path(virtual_path)
+            node = self._get_committed_file(canonical_path)
+            self._cleanup_expired_writes(now)
+            reservation = self._writes.get(write_id)
+            if reservation is None or reservation.path != canonical_path:
+                raise ConflictError(f"no hay una reserva vigente {write_id} para {canonical_path}")
+            if reservation.lock_id != lock_id:
+                raise ConflictError(f"la reserva {write_id} es de otro lock")
+            self._require_write_lock(canonical_path, lock_id, now)
+            version = getattr(node, "version", 0)
+            if base_version != reservation.base_version or version != reservation.base_version:
+                raise ConflictError(f"el archivo cambió (versión {version}); la escritura no se publica")
+            expected = [(s.index, s.new_block_id, s.new_size) for s in reservation.slots]
+            if [(index, block_id, size) for index, block_id, _, size in confirmed] != expected:
+                raise ConflictError("los bloques confirmados no coinciden con la reserva")
+            replaced: list[BlockRecord] = []
+            for slot, (_, _, checksum, size) in zip(reservation.slots, confirmed):
+                new_block = BlockRecord(slot.new_block_id, list(slot.new_addresses), checksum, size, True)
+                if slot.index < len(node.blocks):
+                    replaced.append(node.blocks[slot.index])
+                    node.blocks[slot.index] = new_block
+                else:
+                    node.blocks.append(new_block)
+            node.version = version + 1
+            node.block_size = reservation.block_size
+            del self._writes[write_id]
+            return node.version, replaced
+
+    def abort_write(self, virtual_path: str, write_id: str, lock_id: str, now: float | None = None) -> list[BlockRecord]:
+        """Descarta una reserva y devuelve sus bloques nuevos, para borrarlos. Abortar
+        una reserva que ya no existe (vencida, o commit ya aplicado) no es error y no
+        devuelve nada: así un abort tras un commit con resultado incierto es inofensivo."""
+        with self._lock:
+            canonical_path = self._canonical_path(virtual_path)
+            self._cleanup_expired_writes(now)
+            reservation = self._writes.get(write_id)
+            if reservation is None or reservation.path != canonical_path:
+                return []
+            if reservation.lock_id != lock_id:
+                raise ConflictError(f"la reserva {write_id} es de otro lock")
+            del self._writes[write_id]
+            return [
+                BlockRecord(slot.new_block_id, list(slot.new_addresses), size_bytes=slot.new_size)
+                for slot in reservation.slots
+            ]
 
     def update_block_replicas(
         self,

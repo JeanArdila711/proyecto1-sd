@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import grpc
 
@@ -136,7 +137,8 @@ def _canonical_lock_path(path: str) -> str:
 
 
 class LeaseLock:
-    """Handle local de un lock durable; B3 puede reutilizarlo como FileHandle."""
+    """Handle local de un lock durable, y el handle de archivo de RF3 (D-P3): `open`
+    lo devuelve, y `read`/`write` operan bajo este mismo lock en vez de tomar otro."""
 
     def __init__(self, client: "DistributedDFShaClient", path: str, mode: str, lock_id: str, lease_s: float):
         self._client = client
@@ -158,6 +160,14 @@ class LeaseLock:
 
     def close(self) -> None:
         self.release()
+
+    def read(self, offset: int = 0, length: int | None = None) -> bytes:
+        buffer = io.BytesIO()
+        self._client._read_range(self.path, offset, length, buffer, held=self)
+        return buffer.getvalue()
+
+    def write(self, offset: int, data: bytes) -> int:
+        return self._client._write_with_lock(self, offset, data)
 
 
 class DistributedDFShaClient:
@@ -276,7 +286,8 @@ class DistributedDFShaClient:
         return held
 
     def open(self, path: str, mode: str) -> LeaseLock:
-        """Interfaz compatible con B3: por ahora el handle solo gestiona el lock."""
+        """RF3 `open` (D-P3): "r" toma el lock compartido y "w" el exclusivo. El handle
+        devuelto lee y escribe bajo ese lock hasta `close()`."""
         return self.lock(path, mode)
 
     def locks(self) -> list[LeaseLock]:
@@ -463,12 +474,19 @@ class DistributedDFShaClient:
             raise
         return bytes_written
 
-    def _read_range(self, path: str, offset: int, length: int | None, fh) -> int:
+    def _read_range(self, path: str, offset: int, length: int | None, fh, held: LeaseLock | None = None) -> int:
         if offset < 0 or (length is not None and length < 0):
             raise InvalidPathError(f"rango inválido: offset={offset}, length={length}")
         # D-P3: el lock compartido se toma antes de ListBlocks y dura toda la lectura,
         # igual que en download: un writer o el GC no pueden cambiar la versión leída.
-        held = self.lock(path, "r")
+        # Un handle abierto (`held`, o uno propio sobre la misma ruta) ya tiene su lock: se
+        # lee bajo ese y no se suelta. Pedir otro "r" chocaría con el "w" propio.
+        if held is None:
+            canonical_path = _canonical_lock_path(path)
+            held = next((h for h in self.locks() if h.path == canonical_path and not h.lost), None)
+        own_lock = held is None
+        if own_lock:
+            held = self.lock(path, "r")
         try:
             blocks = self._call("ListBlocks", control_node_pb2.ListBlocksRequest(path=path)).blocks
             size = sum(block.size_bytes for block in blocks)
@@ -489,12 +507,109 @@ class DistributedDFShaClient:
         except grpc.RpcError as exc:
             raise _translate(exc) from exc
         finally:
+            if own_lock:
+                try:
+                    held.release()
+                except DFShaError:
+                    # Un Unlock fallido no cambia el resultado de la lectura; el lease lo
+                    # libera después.
+                    pass
+
+    def write(self, path: str, offset: int, data: bytes) -> int:
+        """RF3 `write`: escribe `data` desde `offset`, sobrescribiendo o extendiendo (D-P4).
+        Si ya hay un handle propio abierto en modo "w" sobre la ruta, escribe bajo ese
+        lock; si no, toma el exclusivo solo para esta escritura."""
+        canonical_path = _canonical_lock_path(path)
+        for held in self.locks():
+            if held.path == canonical_path and held.mode == "w" and not held.lost:
+                return self._write_with_lock(held, offset, data)
+        held = self.lock(path, "w")
+        try:
+            return self._write_with_lock(held, offset, data)
+        finally:
             try:
                 held.release()
             except DFShaError:
-                # Un Unlock fallido no cambia el resultado de la lectura; el lease lo
-                # libera después.
-                pass
+                pass  # el lease lo libera; no tapar el resultado de la escritura
+
+    def _write_with_lock(self, held: LeaseLock, offset: int, data: bytes) -> int:
+        if held.mode != "w" or held.released or held.lost:
+            raise ConflictError(f"hace falta un handle abierto en modo w para escribir en {held.path}")
+        begun = self._call(
+            "BeginWrite",
+            control_node_pb2.BeginWriteRequest(
+                path=held.path, offset=offset, length=len(data), lock_id=held.lock_id, op_id=_new_op_id()
+            ),
+        )
+        try:
+            confirmed = []
+            for slot in begun.slots:
+                content = self._slot_content(slot, begun.block_size, offset, data)
+                new_block = SimpleNamespace(
+                    block_id=slot.new_block_id,
+                    datanode_addresses=list(slot.new_addresses),
+                    size_bytes=slot.new_size,
+                )
+                # el bloque nuevo viaja por el pipeline de siempre, con su checksum
+                checksum, bytes_written = self._write_block(new_block, io.BytesIO(content))
+                confirmed.append(
+                    control_node_pb2.ConfirmedSlot(
+                        index=slot.index, block_id=slot.new_block_id, checksum=checksum, size_bytes=bytes_written
+                    )
+                )
+            self._call(
+                "CommitWrite",
+                control_node_pb2.CommitWriteRequest(
+                    path=held.path,
+                    write_id=begun.write_id,
+                    base_version=begun.base_version,
+                    lock_id=held.lock_id,
+                    slots=confirmed,
+                    op_id=_new_op_id(),
+                ),
+            )
+        except (grpc.RpcError, OSError, DFShaError) as exc:
+            # Si el commit llegó a aplicarse (resultado incierto), la reserva ya no existe
+            # y el abort no borra nada: nunca destruye una escritura publicada.
+            try:
+                self._call(
+                    "AbortWrite",
+                    control_node_pb2.AbortWriteRequest(
+                        path=held.path, write_id=begun.write_id, lock_id=held.lock_id, op_id=_new_op_id()
+                    ),
+                )
+            except DFShaError:
+                pass  # best-effort: no tapar la excepción original con la del abort
+            if isinstance(exc, grpc.RpcError):
+                raise _translate(exc) from exc
+            raise
+        return len(data)
+
+    def _slot_content(self, slot, block_size: int, offset: int, data: bytes) -> bytes:
+        """Contenido completo del bloque nuevo: los datos de la escritura que caen en él,
+        y el resto copiado del bloque viejo (copy-on-write).
+
+        ponytail: arma el bloque entero en memoria (hasta 128 MB); mezclar por streaming
+        si llega a importar."""
+        block_start = slot.index * block_size
+        block_end = block_start + slot.new_size
+        write_start = max(offset, block_start)
+        write_end = min(offset + len(data), block_end)
+        if write_start == block_start and write_end == block_end:
+            return data[write_start - offset : write_end - offset]
+        content = bytearray(slot.new_size)
+        if slot.old_block_id:
+            old_block = SimpleNamespace(
+                block_id=slot.old_block_id,
+                datanode_addresses=list(slot.old_addresses),
+                size_bytes=slot.old_size,
+            )
+            old = io.BytesIO()
+            self._read_block_with_failover(old_block, old)
+            old_bytes = old.getvalue()[: slot.new_size]
+            content[: len(old_bytes)] = old_bytes
+        content[write_start - block_start : write_end - block_start] = data[write_start - offset : write_end - offset]
+        return bytes(content)
 
     def _read_block_with_failover(self, block, fh, offset: int = 0, length: int = 0) -> int:
         """Prueba otra réplica solo cuando una falla recuperable invalida este bloque.

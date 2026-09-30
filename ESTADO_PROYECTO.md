@@ -213,3 +213,16 @@ python -m pytest tests/ -v
 - Por D-P3, la lectura toma el lock compartido antes de `ListBlocks` y lo mantiene hasta terminar; un `Unlock` fallido al final no convierte en error una lectura exitosa.
 - Shell: `cat <ruta> [offset] [largo]` y `read <ruta> <offset> <largo> <local>`. Los comandos de RF3 (`cat`, `read`, `lock`, `unlock`, `locks`) ahora avisan "no disponible" con el cliente de Hito 1 en vez de tumbar la shell con `AttributeError`, un bug de B1 corregido de paso.
 - Implementado por Claude fuera de Kiro, en paralelo con A2, para ahorrar créditos.
+
+## Hito 3 — B3: escritura copy-on-write (`write` de RF3)
+
+- Tres RPC nuevos (`BeginWrite`, `CommitWrite`, `AbortWrite`) y tres mutaciones replicadas (`begin_write`, `commit_write`, `abort_write`). Los bloques siguen siendo inmutables: una escritura reserva bloques nuevos, el cliente los escribe por el pipeline normal y el commit los publica juntos. Hasta el commit, el archivo visible es el anterior.
+- **Determinismo:** el líder arma la propuesta (block_ids y réplicas vivas) leyendo el árbol después de la barrera, y `begin_write` la vuelve a validar dentro de `apply()`. Si el archivo cambió entre medio, `ConflictError`. La cuenta de qué bloques toca una escritura vive en una sola función pura, `tree.plan_write_slots`, que usan las dos puntas.
+- **Consistencia:** `commit_write` es un compare-and-set de `FileNode.version`, y además exige que la reserva siga vigente y que el writer conserve el lock exclusivo. Los bloques viejos se borran después del commit: es seguro porque el lock exclusivo impide lectores activos. Si el borrado falla o el líder cae antes, quedan huérfanos para A3.
+- **Idempotencia:** reintentar `BeginWrite` o `CommitWrite` con el mismo `op_id` devuelve el resultado original. Un `AbortWrite` después de un commit con resultado incierto no borra nada.
+- **Compatibilidad:** `FileNode` gana `version` y `block_size` con defaults simples; `ControlTree._writes` se inicializa en `__setstate__`; `begin_upload` recibe `block_size` como último argumento opcional, así los journals previos se reproducen igual. Los archivos viejos infieren el tamaño de bloque del primer bloque. Probado sobre el fixture real de `9985c6d` (S2).
+- **Cliente:** `open(ruta, "r"|"w")` devuelve un handle (`LeaseLock`) con `read`/`write`/`close`; `write(ruta, offset, datos)` toma el exclusivo solo para esa escritura si no hay un handle propio abierto. Una lectura reutiliza el handle propio abierto sobre la misma ruta en vez de pedir otro lock. Ante cualquier falla antes del commit, `AbortWrite` sin tapar el error original.
+- **Shell:** `write <ruta> <offset> <local>`, `open <ruta> r|w` y `close <ruta>`.
+- **Límites conocidos, marcados con `ponytail:`:** la reserva vive un `--upload-lease-s` y no se renueva, así que una escritura que tarde más se rechaza en el commit; el cliente arma cada bloque nuevo entero en memoria; la shell lee el archivo local entero.
+- Probado en Docker: escritura en el medio de un archivo, un lector que bloquea al escritor, una escritura de 20 bytes que cruza el borde de un bloque de 1 MiB (coincide byte a byte), 0 huérfanos después de los commits, y una escritura exitosa después de matar al líder.
+- Implementado por Claude fuera de Kiro, para ahorrar créditos.

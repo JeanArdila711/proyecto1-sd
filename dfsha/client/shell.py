@@ -18,6 +18,9 @@ _HELP_TEXT = """Comandos disponibles:
   cat <ruta> [offset] [largo] muestra el archivo, o un rango de bytes, como texto
   read <ruta> <offset> <largo> <local>
                               guarda un rango de bytes del archivo en un archivo local
+  write <ruta> <offset> <local>
+                              escribe el contenido de un archivo local desde un offset
+  open <ruta> r|w             abre un handle (toma el lock); close <ruta> lo cierra
   lock <ruta> r|w             toma un lock con lease
   unlock <ruta>               libera un lock propio de la ruta
   locks                       lista los locks propios
@@ -32,6 +35,9 @@ Las rutas con espacios van entre comillas: send "C:\\mis docs\\a.pdf" a.pdf"""
 _RF3_COMMANDS = {
     "cat": "read",
     "read": "read_to_file",
+    "write": "write",
+    "open": "open",
+    "close": "unlock",
     "lock": "lock",
     "unlock": "unlock",
     "locks": "locks",
@@ -151,6 +157,29 @@ def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
                 resolve_relative(current_dir, args[0]), offset, length, local_path
             )
             return current_dir, f"{bytes_read} bytes leídos en {local_path}"
+
+        if cmd == "write":
+            parsed = _parse_range(args[1:2]) if len(args) == 3 else None
+            if parsed is None:
+                return current_dir, "write: uso: write <ruta> <offset> <local>"
+            offset, _ = parsed
+            # ponytail: lee el archivo local entero en memoria; streaming si hace falta
+            data = Path(args[2]).read_bytes()
+            remote_path = resolve_relative(current_dir, args[0])
+            bytes_written = client.write(remote_path, offset, data)
+            return current_dir, f"{bytes_written} bytes escritos en {remote_path} desde el byte {offset}"
+
+        if cmd == "open":
+            if len(args) != 2 or args[1] not in {"r", "w"}:
+                return current_dir, "open: uso: open <ruta> r|w"
+            handle = client.open(resolve_relative(current_dir, args[0]), args[1])
+            return current_dir, f"abierto {handle.path} ({handle.mode}), lock {handle.lock_id}"
+
+        if cmd == "close":
+            if len(args) != 1:
+                return current_dir, "close: uso: close <ruta>"
+            client.unlock(resolve_relative(current_dir, args[0]))
+            return current_dir, ""
 
         if cmd == "lock":
             if len(args) != 2 or args[1] not in {"r", "w"}:

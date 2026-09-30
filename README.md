@@ -22,6 +22,10 @@ cambios. Sobre eso, Hito 2 agrega la arquitectura distribuida:
 - **RF3 parcial (B2)** — `read` por rangos de bytes: `cat <ruta> [offset] [largo]`
   y `read <ruta> <offset> <largo> <local>` en la shell. Cada DataNode sirve solo
   la parte pedida de cada bloque, y la lectura toma un lock compartido mientras dura.
+- **RF3 (B3)** — `write` en cualquier posición, con copy-on-write: `write <ruta>
+  <offset> <local>`, y `open <ruta> r|w` / `close <ruta>` en la shell. Los bloques
+  tocados se reescriben como bloques nuevos y se publican juntos en un solo commit
+  de Raft; hasta entonces el archivo visible es el anterior. Exige el lock exclusivo.
 - **Hito 2 / sub-proyecto 1** — ControlNode (metadatos del árbol) separado
   de un DataNode (bloques), particionamiento de archivos en bloques (128 MB
   por defecto) y un cliente/shell distribuida que habla con ambos.
@@ -151,6 +155,9 @@ Los binarios legacy versionados y su procedimiento de regeneración están en
 
 ## Fuera de alcance por ahora
 
-RF3 parcial: B1 incorpora `lock` lectores/escritor con lease y B2 `read` por
-rangos; `open` y `write` copy-on-write completos se incorporan con B3. Detección automática de DataNodes
-caídos, re-replicación y autenticación siguen en el roadmap.
+RF3 está completo: `lock` (B1), `read` por rangos (B2) y `open`/`write`/`close`
+con copy-on-write (B3). Siguen en el roadmap el recolector de bloques huérfanos
+(A3), la seguridad (TLS, autenticación, permisos, cifrado en reposo) y el despliegue
+en AWS. *(Antes decía: "RF3 parcial: B1 incorpora `lock` [...] y B2 `read` por rangos;
+`open` y `write` copy-on-write completos se incorporan con B3. Detección automática
+de DataNodes caídos, re-replicación y autenticación siguen en el roadmap".)*

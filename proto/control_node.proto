@@ -15,6 +15,11 @@ service ControlNodeService {
   rpc Lock(LockRequest) returns (LockResponse);
   rpc RenewLock(RenewLockRequest) returns (RenewLockResponse);
   rpc Unlock(UnlockRequest) returns (UnlockResponse);
+  // RF3 write (B3): escritura copy-on-write en tres pasos. BeginWrite reserva bloques
+  // nuevos, el cliente los escribe por el pipeline normal y CommitWrite los publica.
+  rpc BeginWrite(BeginWriteRequest) returns (BeginWriteResponse);
+  rpc CommitWrite(CommitWriteRequest) returns (CommitWriteResponse);
+  rpc AbortWrite(AbortWriteRequest) returns (AbortWriteResponse);
 }
 
 message ListDirRequest { string path = 1; }
@@ -93,3 +98,48 @@ message RenewLockResponse {}
 
 message UnlockRequest { string path = 1; string lock_id = 2; string op_id = 3; }
 message UnlockResponse {}
+
+// Un bloque que toca la escritura. old_block_id vacío = el slot extiende el archivo.
+message WriteSlot {
+  int64 index = 1;
+  string old_block_id = 2;
+  int64 old_size = 3;
+  repeated string old_addresses = 4;
+  string new_block_id = 5;
+  repeated string new_addresses = 6;
+  int64 new_size = 7;
+}
+
+message BeginWriteRequest {
+  string path = 1;
+  int64 offset = 2;
+  int64 length = 3;
+  string lock_id = 4; // lock exclusivo vigente del que escribe
+  string op_id = 5;
+}
+message BeginWriteResponse {
+  string write_id = 1;
+  int64 base_version = 2;
+  int64 block_size = 3;
+  double lease_s = 4; // vida de la reserva: sin commit en ese tiempo, se descarta
+  repeated WriteSlot slots = 5;
+}
+
+message ConfirmedSlot {
+  int64 index = 1;
+  string block_id = 2;
+  string checksum = 3;
+  int64 size_bytes = 4;
+}
+message CommitWriteRequest {
+  string path = 1;
+  string write_id = 2;
+  int64 base_version = 3;
+  string lock_id = 4;
+  repeated ConfirmedSlot slots = 5;
+  string op_id = 6;
+}
+message CommitWriteResponse { int64 version = 1; }
+
+message AbortWriteRequest { string path = 1; string write_id = 2; string lock_id = 3; string op_id = 4; }
+message AbortWriteResponse {}

@@ -343,3 +343,15 @@ Los errores de forma del protocolo que no nacen de una excepción de dominio (po
 Solo el líder del ControlNode ejecuta el re-replicador. Antes de cada fotografía de bloques confirmados confirma una barrera Raft; identifica direcciones caídas y vivas exclusivamente mediante el monitor local de A1. Al terminar una copia, publica la nueva lista con el CAS replicado `update_block_replicas(path, block_id, expected, new)` y un `op_id` estable por decisión. Un timeout conserva resultado desconocido para reintentar de forma idempotente; un CAS obsoleto o un archivo que ya fue borrado se ignoran. Esta última copia queda como huérfana hasta A3.
 
 Por ahora `ReplicateBlock` no lleva token: C3 agregará la capability administrativa de la orden y la capability de bloque del destino.
+
+## 14. Actualización Hito 3 B3 — escritura copy-on-write
+
+`write` de RF3 son tres RPC unarios nuevos de `ControlNodeService`, todos con `op_id`:
+
+| RPC | Qué hace | Errores |
+|---|---|---|
+| `BeginWrite(path, offset, length, lock_id)` | Pasa la barrera de lectura, arma la propuesta de bloques nuevos (IDs y réplicas vivas) y la reserva por Raft. Devuelve `write_id`, `base_version`, `block_size` y un `WriteSlot` por bloque tocado (bloque viejo y bloque nuevo) | `ABORTED` sin lock exclusivo vigente o si el archivo cambió; `PERMISSION_DENIED` (`InvalidPathError`) si `offset` > tamaño o `length` <= 0; `UNAVAILABLE` en un follower o un líder sin mayoría |
+| `CommitWrite(path, write_id, base_version, lock_id, slots)` | Compare-and-set de la versión: si sigue siendo `base_version`, la reserva sigue vigente y el lock sigue siendo del writer, publica los bloques nuevos y suma 1 a la versión. Después del commit, el líder borra los bloques viejos | `ABORTED` si algo de lo anterior no se cumple; no publica nada |
+| `AbortWrite(path, write_id, lock_id)` | Descarta la reserva y borra los bloques nuevos. Abortar una reserva que ya no existe no es error | `ABORTED` si la reserva es de otro lock |
+
+El cliente escribe cada bloque nuevo con el mismo `WriteBlock` del pipeline de subida (enlaces ② y ⑤), y cuando la escritura toca un bloque solo en parte, primero lee el bloque viejo con `ReadBlock` para completarlo. Un reintento de `BeginWrite` o `CommitWrite` con el mismo `op_id` devuelve el resultado original: no reserva dos veces ni publica dos veces. Si el `CommitWrite` queda con resultado incierto, el `AbortWrite` posterior es inofensivo, porque una reserva ya publicada no existe y no se borra nada.

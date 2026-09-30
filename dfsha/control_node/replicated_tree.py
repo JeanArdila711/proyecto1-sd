@@ -25,6 +25,9 @@ MUTATIONS = frozenset(
         "renew_lock",
         "release_lock",
         "update_block_replicas",
+        "begin_write",
+        "commit_write",
+        "abort_write",
     }
 )
 

@@ -359,3 +359,29 @@ def test_legacy_fixture_initializes_locks_and_preserves_legacy_outcomes(tmp_path
 
 def assert_legacy_locks(replica) -> None:
     assert replica.tree._locks == {}
+
+
+def test_legacy_fixture_supports_cow_writes_on_old_files(tmp_path):
+    """B3 sobre estado real de 9985c6d: sin reservas, archivos sin version/block_size
+    (los toman del atributo de clase) y write_layout que infiere el tamaño de bloque."""
+    manifest = _fixture_manifest()
+    nodes, _ = _start_restored_cluster(tmp_path)
+    try:
+        replicas = [replicated for _, replicated in nodes]
+        expected_op_ids = {operation["op_id"] for operation in manifest["legacy_operations"]}
+        assert wait_for(lambda: all(expected_op_ids <= set(replica.applied_ops) for replica in replicas))
+        assert_legacy_upgrade(replicas, manifest, extension_checks=(assert_legacy_writes,))
+    finally:
+        _stop_cluster(nodes)
+
+
+def assert_legacy_writes(replica) -> None:
+    tree = replica.tree
+    assert tree._writes == {}
+    committed = [path for path, _ in tree.iter_blocks()]
+    assert committed, "el fixture legacy tiene que traer archivos confirmados"
+    for path in set(committed):
+        version, block_size, sizes = tree.write_layout(path, 5)
+        assert version == 0
+        assert block_size > 0
+        assert all(size == block_size for size in sizes[:-1])

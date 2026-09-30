@@ -21,6 +21,7 @@ from dfsha.common.exceptions import (
 )
 from dfsha.control_node.datanode_monitor import DataNodeMonitor
 from dfsha.control_node.replicated_tree import ReplicatedTree
+from dfsha.control_node.tree import plan_write_slots
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
 DEFAULT_REPLICATION_FACTOR = 3
@@ -269,6 +270,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 proposed,
                 time.time(),  # lo decide el líder y viaja en el log: apply() no lee el reloj
                 self._upload_lease_s,
+                self._block_size_bytes,  # B3: el archivo recuerda con qué tamaño se partió
             )
         except (PathExistsError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
@@ -380,3 +382,102 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         except (PathNotFoundError, ConflictError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.UnlockResponse()
+
+    # --- RF3 write: copy-on-write (B3) ---------------------------------------------------
+
+    def BeginWrite(self, request, context):
+        # La propuesta se arma leyendo el árbol: tiene que estar al día (misma regla
+        # que toda lectura). begin_write la vuelve a validar dentro de apply().
+        self._read_barrier(context)
+        try:
+            version, block_size, sizes = self._replicated.tree.write_layout(request.path, self._block_size_bytes)
+            plan = plan_write_slots(sizes, block_size, request.offset, request.length)
+        except (PathNotFoundError, InvalidPathError) as exc:
+            _abort_on_domain_error(context, exc)
+            return control_node_pb2.BeginWriteResponse()
+        try:
+            proposals = [(index, uuid.uuid4().hex, self._pick_replicas()) for index, _ in plan]
+        except InsufficientLiveDataNodes as exc:
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+            return control_node_pb2.BeginWriteResponse()
+        try:
+            # Igual que BeginUpload: la respuesta sale de lo que DEVUELVE el commit. Un
+            # reintento con el mismo op_id recibe la reserva original, no la propuesta nueva.
+            write_id, base_version, block_size, slots = self._commit(
+                context,
+                request.op_id,
+                "begin_write",
+                request.path,
+                uuid.uuid4().hex,
+                request.lock_id,
+                version,
+                request.offset,
+                request.length,
+                proposals,
+                time.time(),
+                # ponytail: la reserva vive un lease de subida y no se renueva; una
+                # escritura que tarde más que --upload-lease-s se rechaza en el commit.
+                # Renovar por bloque si llega a hacer falta.
+                self._upload_lease_s,
+                self._block_size_bytes,
+            )
+        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+            _abort_on_domain_error(context, exc)
+            return control_node_pb2.BeginWriteResponse()
+        return control_node_pb2.BeginWriteResponse(
+            write_id=write_id,
+            base_version=base_version,
+            block_size=block_size,
+            lease_s=self._upload_lease_s,
+            slots=[
+                control_node_pb2.WriteSlot(
+                    index=index,
+                    old_block_id=old_block_id,
+                    old_size=old_size,
+                    old_addresses=old_addresses,
+                    new_block_id=new_block_id,
+                    new_addresses=new_addresses,
+                    new_size=new_size,
+                )
+                for index, old_block_id, old_size, old_addresses, new_block_id, new_addresses, new_size in slots
+            ],
+        )
+
+    def CommitWrite(self, request, context):
+        try:
+            version, replaced = self._commit(
+                context,
+                request.op_id,
+                "commit_write",
+                request.path,
+                request.write_id,
+                request.lock_id,
+                request.base_version,
+                [(s.index, s.block_id, s.checksum, s.size_bytes) for s in request.slots],
+                time.time(),
+            )
+        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+            _abort_on_domain_error(context, exc)
+            return control_node_pb2.CommitWriteResponse()
+        # Borrar la versión anterior es seguro recién ahora: el writer tiene el lock
+        # exclusivo, así que no hay lectores usándola. Si falla o el líder cae antes,
+        # quedan huérfanos para el recolector (A3).
+        self._delete_blocks(replaced)
+        return control_node_pb2.CommitWriteResponse(version=version)
+
+    def AbortWrite(self, request, context):
+        try:
+            reserved = self._commit(
+                context,
+                request.op_id,
+                "abort_write",
+                request.path,
+                request.write_id,
+                request.lock_id,
+                time.time(),
+            )
+        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+            _abort_on_domain_error(context, exc)
+            return control_node_pb2.AbortWriteResponse()
+        self._delete_blocks(reserved)
+        return control_node_pb2.AbortWriteResponse()

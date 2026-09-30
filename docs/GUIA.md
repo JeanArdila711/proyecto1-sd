@@ -44,6 +44,8 @@ dfsha:/$ exit
 | `rm <ruta>` | Borra un archivo (falla mientras tenga un lock vigente) |
 | `cat <ruta> [offset] [largo]` | Muestra el archivo, o un rango de bytes, como texto |
 | `read <ruta> <offset> <largo> <local>` | Guarda un rango de bytes del archivo en un archivo local |
+| `write <ruta> <offset> <local>` | Escribe el contenido de un archivo local desde un offset (sobrescribe o extiende) |
+| `open <ruta> r|w` · `close <ruta>` | Abre un handle tomando el lock compartido o exclusivo, y lo cierra |
 | `lock <ruta> r|w` · `unlock <ruta>` · `locks` | Toma, libera o lista locks propios con lease |
 
 Las rutas con espacios van entre comillas: `send "/intercambio/mi tesis.pdf" /docs/tesis.pdf`.
@@ -201,3 +203,5 @@ controlada están en `tests/fixtures/README.md`.
 En una shell, `lock /docs/tesis.pdf r` toma un lock compartido y `lock /docs/tesis.pdf w` uno exclusivo; `locks` muestra los propios y `unlock /docs/tesis.pdf` libera uno. `receive` toma y renueva automáticamente un lock compartido hasta terminar, por lo que un escritor recibe conflicto mientras la descarga sigue activa. El ControlNode usa `--lock-lease-s` (30 s por defecto); el cliente renueva cada tercio.
 
 `cat /docs/nota.txt 30 30` muestra 30 bytes desde el byte 30, y `read /docs/tesis.pdf 1048000 5000 /intercambio/rango.bin` guarda 5000 bytes en un archivo local, aunque crucen el borde entre dos bloques. Igual que `receive`, una lectura toma un lock compartido mientras dura. Un offset más allá del final del archivo da un error explícito; justo en el final devuelve vacío.
+
+`write /docs/nota.txt 5 /intercambio/parche.txt` escribe el contenido de `parche.txt` desde el byte 5: sobrescribe lo que había ahí y, si se pasa del final, extiende el archivo. Un offset mayor al tamaño se rechaza (no hay archivos con huecos). La escritura es copy-on-write: los bloques tocados se escriben como bloques nuevos por el pipeline de siempre y se publican juntos en un solo commit; si algo falla antes, el archivo sigue siendo el de antes y los bloques nuevos se descartan. Necesita el lock exclusivo, así que falla con "lock en conflicto" mientras alguien lo tenga abierto para leer. `open /docs/nota.txt w` lo toma y lo mantiene hasta `close /docs/nota.txt`; mientras tanto, `write` y `cat` sobre esa ruta usan ese mismo handle.
