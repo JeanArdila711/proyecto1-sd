@@ -3,6 +3,7 @@ from pathlib import Path
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.common.exceptions import BlockCorruptedError, BlockNotFoundError
 from dfsha.data_node.main import serve
 from dfsha.generated import data_node_pb2, data_node_pb2_grpc
@@ -12,7 +13,7 @@ BLOCK_ID = "1234567890abcdef1234567890abcdef"  # formato real: uuid4().hex (32 h
 
 @pytest.fixture
 def datanode_stub(tmp_path):
-    server, port = serve(tmp_path, "localhost", 0)
+    server, port = serve(tmp_path, "localhost", 0, TEST_ENCRYPTION_KEY)
     channel = grpc.insecure_channel(f"localhost:{port}")
     stub = data_node_pb2_grpc.DataNodeServiceStub(channel)
     yield stub

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
-from conftest import FAST_RAFT_CONF, free_port, wait_for
+from conftest import FAST_RAFT_CONF, TEST_ENCRYPTION_KEY, free_port, wait_for
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.control_node.main import serve as serve_control_node
 from dfsha.control_node.tree import ControlTree
@@ -77,13 +77,13 @@ def test_pending_blocks_lists_the_upload_without_changing_what_abort_upload_retu
 
 def test_block_store_lists_only_blocks_with_their_size_and_age(tmp_path):
     old, young = _hex(1), _hex(2)
-    block_store.write_block(tmp_path, old, [b"viejo"])
-    block_store.write_block(tmp_path, young, [b"nuevo!!"])
+    block_store.write_block(tmp_path, TEST_ENCRYPTION_KEY, old, [b"viejo"])
+    block_store.write_block(tmp_path, TEST_ENCRYPTION_KEY, young, [b"nuevo!!"])
     (tmp_path / f"{_hex(3)}.part-{uuid.uuid4().hex}").write_bytes(b"temporal")  # subida a medias
     past = time.time() - 500
     os.utime(tmp_path / old, (past, past))
 
-    listed = {block_id: (size, age) for block_id, size, age in block_store.list_blocks(tmp_path)}
+    listed = {block_id: (size, age) for block_id, size, age in block_store.list_blocks(tmp_path, TEST_ENCRYPTION_KEY)}
 
     assert set(listed) == {old, young}
     assert listed[old][0] == 5 and listed[young][0] == 7
@@ -92,15 +92,15 @@ def test_block_store_lists_only_blocks_with_their_size_and_age(tmp_path):
 
 
 def test_block_store_lists_nothing_for_a_missing_root(tmp_path):
-    assert list(block_store.list_blocks(tmp_path / "no-existe")) == []
+    assert list(block_store.list_blocks(tmp_path / "no-existe", TEST_ENCRYPTION_KEY)) == []
 
 
 def test_list_stored_blocks_rpc_streams_every_block(tmp_path):
-    server, port = serve_data_node(tmp_path / "dn", "localhost", 0)
+    server, port = serve_data_node(tmp_path / "dn", "localhost", 0, TEST_ENCRYPTION_KEY)
     channel = grpc.insecure_channel(f"localhost:{port}")
     try:
         for n in range(3):
-            block_store.write_block(tmp_path / "dn", _hex(n), [bytes(n + 1)])
+            block_store.write_block(tmp_path / "dn", TEST_ENCRYPTION_KEY, _hex(n), [bytes(n + 1)])
         stub = data_node_pb2_grpc.DataNodeServiceStub(channel)
         stored = list(stub.ListStoredBlocks(data_node_pb2.ListStoredBlocksRequest(), timeout=5))
         assert sorted((b.block_id, b.size_bytes) for b in stored) == [(_hex(0), 1), (_hex(1), 2), (_hex(2), 3)]
@@ -304,7 +304,7 @@ def test_collector_stops_its_thread_and_closes_its_channels():
 def system(tmp_path):
     datanodes = []
     for i in range(3):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         datanodes.append({"server": server, "address": f"localhost:{port}", "root": tmp_path / f"dn{i}"})
     started = []
 
@@ -356,8 +356,8 @@ def test_old_orphans_are_collected_and_files_stay_readable(system, tmp_path):
     _upload(client, tmp_path, "/a.bin", bytes(range(12)))
     in_use = _stored(datanodes)
     old_orphan, young_orphan = _hex(7001), _hex(7002)
-    block_store.write_block(datanodes[0]["root"], old_orphan, [b"huerfano"])
-    block_store.write_block(datanodes[1]["root"], young_orphan, [b"reciente"])
+    block_store.write_block(datanodes[0]["root"], TEST_ENCRYPTION_KEY, old_orphan, [b"huerfano"])
+    block_store.write_block(datanodes[1]["root"], TEST_ENCRYPTION_KEY, young_orphan, [b"reciente"])
     _age(datanodes[0]["root"], old_orphan, 500)
 
     server._dfsha_garbage_collector.run_cycle()

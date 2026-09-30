@@ -3,9 +3,11 @@ import os
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import DFShaError
 from dfsha.control_node.servicer import ControlNodeServicer
+from dfsha.data_node import block_store
 from dfsha.data_node.main import serve as serve_data_node
 from dfsha.generated import control_node_pb2, data_node_pb2
 
@@ -23,7 +25,7 @@ def make_cluster(tmp_path, start_control_node):
         datanodes = []
         for i in range(num_datanodes):
             root = tmp_path / f"dn{i}"
-            server, port = serve_data_node(root, "localhost", 0)
+            server, port = serve_data_node(root, "localhost", 0, TEST_ENCRYPTION_KEY)
             servers.append(server)
             datanodes.append({"address": f"localhost:{port}", "server": server, "root": root})
 
@@ -70,8 +72,10 @@ def test_pipeline_writes_block_to_all_three_replicas_with_same_checksum(make_clu
     [block] = _blocks_of(client, "/a.txt")
     assert len(block.datanode_addresses) == 3
     for dn in datanodes:
-        assert (dn["root"] / block.block_id).read_bytes() == b"hola"
-        assert (dn["root"] / f"{block.block_id}.sha256").read_text() == block.checksum
+        assert b"".join(
+            block_store.read_block(dn["root"], TEST_ENCRYPTION_KEY, block.block_id, 1024)
+        ) == b"hola"
+        assert not (dn["root"] / f"{block.block_id}.sha256").exists()
 
 
 def test_download_fails_over_when_first_replica_is_down(make_cluster, tmp_path):
@@ -207,7 +211,9 @@ def test_pipeline_with_block_larger_than_forwarding_queue(make_cluster, tmp_path
 
     [block] = _blocks_of(client, "/grande.bin")
     for dn in datanodes:
-        assert (dn["root"] / block.block_id).read_bytes() == content
+        assert b"".join(
+            block_store.read_block(dn["root"], TEST_ENCRYPTION_KEY, block.block_id, 1024 * 1024)
+        ) == content
 
     destino = tmp_path / "salida.bin"
     client.download("/grande.bin", destino)
@@ -305,7 +311,7 @@ def test_pipeline_forwarding_uses_remaining_incoming_deadline(tmp_path, monkeypa
         def WriteBlock(self, chunks, timeout):
             raise AssertionError("el pool simulado no debe ejecutar el forwarding")
 
-    servicer = DataNodeServicer(tmp_path)
+    servicer = DataNodeServicer(tmp_path, TEST_ENCRYPTION_KEY)
     servicer._forward_pool.shutdown(wait=True, cancel_futures=True)
     pool = ForwardPool()
     servicer._forward_pool = pool

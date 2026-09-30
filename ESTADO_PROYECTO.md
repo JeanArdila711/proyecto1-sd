@@ -237,3 +237,9 @@ python -m pytest tests/ -v
 - **`AbortUpload`** borra al instante: el servicer lee los bloques de la subida (`pending_blocks`) antes del commit y los borra si sale bien. `abort_upload` sigue sin devolver nada A PROPÓSITO: la primera versión los devolvía, y el test de upgrade de S2 la rechazó. El resultado de un comando replicado queda guardado en `applied_ops`, y reproducir un journal viejo con un retorno distinto da otro estado. Cambiar el valor de retorno de un método replicado es tan riesgoso como cambiarle la firma.
 - **`inspect huerfanos`** ahora pide el inventario por RPC en vez de leer los volúmenes, y separa los bloques en uso, los que no tienen uso visible pero son jóvenes, y los que el recolector va a borrar. El servicio `inspect` de compose ya no monta los volúmenes de los DataNodes.
 - Implementado por Claude fuera de Kiro, para ahorrar créditos.
+## Hito 3 — C4: cifrado en reposo del DataNode
+
+- Cada bloque físico es un único contenedor `DFSE1` en `dfsha/data_node/block_store.py`: header con versión y prefijo aleatorio, chunks de 1 MiB AES-256-GCM y metadata final autenticada con tamaño lógico, conteo y SHA-256 del plaintext. Ya no existe sidecar `.sha256`.
+- `ReadBlock` autentica primero la metadata y luego únicamente los chunks requeridos para el rango; corrupción, truncación, llave incorrecta o un archivo legacy/plaintext producen `BlockCorruptedError`/`DATA_LOSS` sin migración silenciosa. `list_blocks` informa tamaño lógico y edad calculada por el reloj del DataNode.
+- `--encryption-key-file` es obligatorio: lee una llave cruda de exactamente 32 bytes. `scripts/generate_secrets.py` crea solo `secrets/dn1.key`, `dn2.key` y `dn3.key`, con modo 0600 y sin sobrescribir salvo `--force`; Compose los monta como solo lectura. No hay rotación de llaves.
+- El formato cambió sin migración: usar `docker compose down -v` antes de crear volúmenes cifrados nuevos; un volumen previo falla explícitamente al leerse.

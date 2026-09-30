@@ -8,9 +8,11 @@ from pathlib import Path
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.common.exceptions import ConflictError, PathNotFoundError
 from dfsha.control_node.replicated_tree import ReplicatedTree
 from dfsha.control_node.tree import ControlTree
+from dfsha.data_node import block_store
 from dfsha.data_node.main import serve as serve_data_node
 from dfsha.generated import control_node_pb2, data_node_pb2, data_node_pb2_grpc
 
@@ -77,8 +79,8 @@ def test_update_block_replicas_is_a_replicated_mutation():
 def replicated_datanodes(tmp_path):
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
-    source_server, source_port = serve_data_node(source_root, "localhost", 0)
-    target_server, target_port = serve_data_node(target_root, "localhost", 0)
+    source_server, source_port = serve_data_node(source_root, "localhost", 0, TEST_ENCRYPTION_KEY)
+    target_server, target_port = serve_data_node(target_root, "localhost", 0, TEST_ENCRYPTION_KEY)
     source_channel = grpc.insecure_channel(f"localhost:{source_port}")
     source_stub = data_node_pb2_grpc.DataNodeServiceStub(source_channel)
     try:
@@ -102,8 +104,10 @@ def test_replicate_block_copies_verified_source_to_target(replicated_datanodes):
     )
 
     assert response.bytes_written == len(b"replicar bloque completo")
-    assert (target_root / BLOCK_ID).read_bytes() == b"replicar bloque completo"
-    assert (target_root / f"{BLOCK_ID}.sha256").read_text().strip() == response.checksum
+    assert b"".join(
+        block_store.read_block(target_root, TEST_ENCRYPTION_KEY, BLOCK_ID, 1024)
+    ) == b"replicar bloque completo"
+    assert not (target_root / f"{BLOCK_ID}.sha256").exists()
 
 
 class _Unavailable(grpc.RpcError):
@@ -326,7 +330,7 @@ def test_three_node_degraded_upload_is_rereplicated_when_node_returns(tmp_path, 
     data_servers = []
     addresses = []
     for root in roots:
-        server, port = serve_data_node(root, "localhost", 0)
+        server, port = serve_data_node(root, "localhost", 0, TEST_ENCRYPTION_KEY)
         data_servers.append(server)
         addresses.append(f"localhost:{port}")
     control_address = start_control_node(
@@ -363,7 +367,9 @@ def test_three_node_degraded_upload_is_rereplicated_when_node_returns(tmp_path, 
         client.download("/archivo.bin", tmp_path / "con-dn3-caido.bin")
         assert (tmp_path / "con-dn3-caido.bin").read_bytes() == source.read_bytes()
 
-        data_servers[2], port = serve_data_node(roots[2], "localhost", int(addresses[2].rsplit(":", 1)[1]))
+        data_servers[2], port = serve_data_node(
+            roots[2], "localhost", int(addresses[2].rsplit(":", 1)[1]), TEST_ENCRYPTION_KEY
+        )
         assert wait_for(
             lambda: len(
                 client._call(
@@ -413,7 +419,7 @@ def test_four_nodes_repair_after_one_registered_replica_dies(tmp_path, start_con
     data_servers = []
     addresses = []
     for root in roots:
-        server, port = serve_data_node(root, "localhost", 0)
+        server, port = serve_data_node(root, "localhost", 0, TEST_ENCRYPTION_KEY)
         data_servers.append(server)
         addresses.append(f"localhost:{port}")
     control_address = start_control_node(

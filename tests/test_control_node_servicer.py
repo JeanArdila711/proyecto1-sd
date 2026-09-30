@@ -3,6 +3,7 @@ import uuid
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.data_node.main import serve as serve_data_node
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
@@ -14,7 +15,7 @@ def _op():
 @pytest.fixture
 def cluster(tmp_path, start_control_node):
     dn_root = tmp_path / "datanode"
-    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
+    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0, TEST_ENCRYPTION_KEY)
     datanode_address = f"localhost:{dn_port}"
 
     # D-P2: las pruebas históricas de un único DataNode optan por mínimo 1.
@@ -126,7 +127,7 @@ def test_abandoned_upload_frees_the_name_after_lease_and_deletes_its_blocks(tmp_
     huérfanos en disco."""
     import time
 
-    dn_server, dn_port = serve_data_node(tmp_path / "dn", "localhost", 0)
+    dn_server, dn_port = serve_data_node(tmp_path / "dn", "localhost", 0, TEST_ENCRYPTION_KEY)
     datanode = f"localhost:{dn_port}"
     channel = grpc.insecure_channel(start_control_node([datanode], block_size_bytes=5, upload_lease_s=0.5, min_write_replicas=1))
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)

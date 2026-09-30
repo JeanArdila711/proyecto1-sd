@@ -43,18 +43,18 @@ services:
     build: .
     pull_policy: build
     hostname: dn1
-    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061"]
-    volumes: [dn1-data:/data]
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn1.key]
+    volumes: [dn1-data:/data, ./secrets:/secrets:ro]
   dn2:
     <<: *datanode
     hostname: dn2
-    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061"]
-    volumes: [dn2-data:/data]
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn2.key]
+    volumes: [dn2-data:/data, ./secrets:/secrets:ro]
   dn3:
     <<: *datanode
     hostname: dn3
-    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061"]
-    volumes: [dn3-data:/data]
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn3.key]
+    volumes: [dn3-data:/data, ./secrets:/secrets:ro]
 
   cn0:
     <<: *controlnode

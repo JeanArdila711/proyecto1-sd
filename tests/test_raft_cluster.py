@@ -6,7 +6,7 @@ import uuid
 import grpc
 import pytest
 
-from conftest import FAST_RAFT_CONF, free_port, wait_for
+from conftest import FAST_RAFT_CONF, TEST_ENCRYPTION_KEY, free_port, wait_for
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import ConflictError
 from dfsha.control_node.main import build_raft_conf
@@ -93,7 +93,7 @@ class RaftCluster:
 def datanodes(tmp_path):
     servers, addresses = [], []
     for i in range(3):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         addresses.append(f"localhost:{port}")
     yield addresses

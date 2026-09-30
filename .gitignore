@@ -10,6 +10,9 @@ CLAUDE.md
 .worktrees/
 .DS_Store
 
+# Secretos locales de C4/C1: nunca se versionan.
+secrets/
+
 # Datos que crean los comandos del README al correr el clúster en la raíz del repo
 /dn[0-9]*/
 /cn[0-9]*/

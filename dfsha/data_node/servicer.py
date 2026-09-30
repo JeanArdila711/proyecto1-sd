@@ -47,8 +47,9 @@ def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> Non
 
 
 class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, encryption_key: bytes) -> None:
         self._root = root
+        self._encryption_key = encryption_key
         # Executor propio para el forwarding del pipeline: si compartiera el del
         # servidor gRPC, N escrituras concurrentes podrían quedarse sin worker
         # para reenviar y el pipeline se auto-bloquearía.
@@ -90,7 +91,7 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
 
         if not downstream:
             checksum, bytes_written = block_store.write_block(
-                self._root, block_id, (msg.data for msg in request_iterator)
+                self._root, self._encryption_key, block_id, (msg.data for msg in request_iterator)
             )
             return data_node_pb2.WriteBlockResponse(checksum=checksum, bytes_written=bytes_written)
 
@@ -126,7 +127,9 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
                 pending.put(None)
 
         try:
-            checksum, bytes_written = block_store.write_block(self._root, block_id, tee())
+            checksum, bytes_written = block_store.write_block(
+                self._root, self._encryption_key, block_id, tee()
+            )
         except BaseException:
             forwarding.cancel()
             raise
@@ -163,7 +166,12 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
         length = request.length or None  # 0 = hasta el final del bloque
         try:
             for chunk in block_store.read_block(
-                self._root, request.block_id, CHUNK_SIZE_BYTES, request.offset, length
+                self._root,
+                self._encryption_key,
+                request.block_id,
+                CHUNK_SIZE_BYTES,
+                request.offset,
+                length,
             ):
                 yield data_node_pb2.ReadBlockChunk(data=chunk)
         except (BlockNotFoundError, BlockCorruptedError) as exc:
@@ -180,12 +188,14 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
         """Copia un bloque verificado hacia un único destino interno."""
         try:
             block_store.validate_block_id(request.block_id)
-            local_chunks = block_store.read_block(self._root, request.block_id, CHUNK_SIZE_BYTES)
-            # read_block es un generador: verifica existencia y checksum en el primer
-            # next(). Hay que forzarlo ACÁ, antes de abrir el stream al destino. Si no,
-            # el error salta dentro del iterador de gRPC y un origen corrupto o sin el
-            # bloque responde UNAVAILABLE ("Exception iterating requests!"), como si el
-            # nodo estuviera caído, y el re-replicador insiste con el mismo origen.
+            local_chunks = block_store.read_block(
+                self._root, self._encryption_key, request.block_id, CHUNK_SIZE_BYTES
+            )
+            # read_block es un generador: verifica existencia y metadata autenticada en
+            # el primer next(). Hay que forzarlo ACÁ, antes de abrir el stream al destino.
+            # Si no, un origen corrupto o sin el bloque responde UNAVAILABLE
+            # ("Exception iterating requests!"), como si el nodo estuviera caído, y el
+            # re-replicador insiste con el mismo origen.
             first_chunk = next(local_chunks, None)
 
             def chunks():
@@ -207,7 +217,9 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
             return data_node_pb2.ReplicateBlockResponse()
         except grpc.RpcError as exc:
             context.abort(
-                exc.code() if exc.code() in {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED} else grpc.StatusCode.UNAVAILABLE,
+                exc.code()
+                if exc.code() in {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+                else grpc.StatusCode.UNAVAILABLE,
                 f"no se pudo replicar hacia {request.target}: {exc.details()}",
             )
             return data_node_pb2.ReplicateBlockResponse()
@@ -217,5 +229,5 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
 
     def ListStoredBlocks(self, request, context):
         # C3 agregará acá la capability interna: solo el ControlNode puede pedir el inventario.
-        for block_id, size_bytes, age_s in block_store.list_blocks(self._root):
+        for block_id, size_bytes, age_s in block_store.list_blocks(self._root, self._encryption_key):
             yield data_node_pb2.StoredBlock(block_id=block_id, size_bytes=size_bytes, age_s=age_s)

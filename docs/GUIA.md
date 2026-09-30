@@ -6,13 +6,19 @@ Todo se hace con `docker compose` desde la raíz del repo. Los comandos son los 
 
 ---
 
-## 1. Levantar el clúster
+## 1. Generar secretos y levantar el clúster
+
+Los DataNodes no tienen modo plaintext: cada uno exige una llave AES-256-GCM **cruda** de exactamente 32 bytes. El script crea `secrets/dn1.key`, `secrets/dn2.key` y `secrets/dn3.key` con modo `0600`; `secrets/` no se versiona y Compose lo monta solo lectura. No hay rotación automática.
 
 ```bash
 git pull
+python scripts/generate_secrets.py
+docker compose down -v   # obligatorio al venir de bloques legacy/plaintext o cambiar llave
 docker compose up -d --build
 docker compose ps
 ```
+
+Si falta una llave o no mide 32 bytes, el DataNode falla al arrancar. C4 no migra volúmenes ni lee bloques plaintext/legacy: para comenzar de cero se usa `docker compose down -v`.
 
 Tienen que aparecer 6 servicios `healthy`: `dn1`, `dn2`, `dn3` (DataNodes) y `cn0`, `cn1`, `cn2` (ControlNodes).
 
@@ -75,7 +81,7 @@ Ejemplo del mapa con bloques de 1 MB y factor 2:
   bloques por DataNode               3           3           2
 ```
 
-`C` = cabeza del pipeline de escritura, `r` = réplica, `·` = ese nodo no tiene el bloque.
+`C` = cabeza del pipeline de escritura, `r` = réplica, `·` = ese nodo no tiene el bloque. Cada entrada física es un contenedor cifrado DFSE1; el checksum lógico de los bloques sigue siendo SHA-256 de plaintext y se verifica al autenticar sus chunks.
 
 ---
 
@@ -134,7 +140,7 @@ docker compose run --rm inspect arbol
 **Bloque corrupto** — la réplica aparece `CORRUPTO` y el archivo baja bien desde otra:
 
 ```bash
-docker compose exec dn2 sh -c 'f=$(ls /data | grep -v sha256 | head -1); printf "\377" | dd of=/data/$f bs=1 seek=100 count=1 conv=notrunc 2>/dev/null; echo corrompido $f'
+docker compose exec dn2 sh -c 'f=$(ls /data | head -1); printf "\\377" | dd of=/data/$f bs=1 seek=100 count=1 conv=notrunc 2>/dev/null; echo corrompido $f'
 docker compose run --rm inspect bloques /docs/tesis.pdf
 # en la shell: receive /docs/tesis.pdf /intercambio/copia2.pdf
 ```

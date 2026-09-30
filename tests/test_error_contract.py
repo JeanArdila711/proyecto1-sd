@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.client.distributed_client import (
     ALLOWED_DOMAIN_ERROR_TYPES,
     DistributedDFShaClient,
@@ -140,7 +141,7 @@ def control_stub(tmp_path, start_control_node):
 
 @pytest.fixture
 def data_stub(tmp_path):
-    server, port = serve_data_node(tmp_path / "data", "localhost", 0)
+    server, port = serve_data_node(tmp_path / "data", "localhost", 0, TEST_ENCRYPTION_KEY)
     channel = grpc.insecure_channel(f"localhost:{port}")
     stub = data_node_pb2_grpc.DataNodeServiceStub(channel)
     try:

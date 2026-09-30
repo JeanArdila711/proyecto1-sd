@@ -8,7 +8,7 @@ import uuid
 import grpc
 import pytest
 
-from conftest import wait_for
+from conftest import TEST_ENCRYPTION_KEY, wait_for
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.client.shell import handle_command
 from dfsha.common.exceptions import ConflictError, DFShaError, InvalidPathError
@@ -29,7 +29,7 @@ def cluster(tmp_path, start_control_node):
     """3 DataNodes, factor 3, bloques de 5 bytes y /a.bin de 23 bytes."""
     servers, roots, addresses = [], [], []
     for i in range(3):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         roots.append(tmp_path / f"dn{i}")
         addresses.append(f"localhost:{port}")
@@ -267,7 +267,7 @@ def test_a_stale_reservation_cannot_be_committed_after_another_write(cluster):
 def test_a_lock_that_expires_before_the_commit_rejects_the_write(tmp_path, start_control_node):
     servers, addresses = [], []
     for i in range(2):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         addresses.append(f"localhost:{port}")
     control = start_control_node(addresses, block_size_bytes=5, replication_factor=2, lock_lease_s=0.3)
@@ -363,7 +363,7 @@ def test_a_crash_after_the_commit_leaves_the_new_version_visible(cluster, monkey
 def raft_cluster(tmp_path):
     servers, addresses = [], []
     for i in range(3):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         addresses.append(f"localhost:{port}")
     cluster = RaftCluster(tmp_path, addresses, persistent=False)
@@ -428,7 +428,7 @@ def test_begin_write_on_a_leader_without_majority_is_unavailable(tmp_path):
     confirmar la barrera y no debe reservar sobre datos viejos."""
     servers, addresses = [], []
     for i in range(3):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         addresses.append(f"localhost:{port}")
     cluster = RaftCluster(

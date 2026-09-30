@@ -3,6 +3,7 @@ from pathlib import Path
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import BlockCorruptedError, NotAFileError, PathExistsError, PathNotFoundError
 from dfsha.data_node.main import serve as serve_data_node
@@ -11,7 +12,7 @@ from dfsha.data_node.main import serve as serve_data_node
 @pytest.fixture
 def client(tmp_path, start_control_node):
     dn_root = tmp_path / "datanode"
-    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
+    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0, TEST_ENCRYPTION_KEY)
     datanode_address = f"localhost:{dn_port}"
 
     # D-P2: este fixture prueba el modo deliberado de una sola réplica.
@@ -202,7 +203,7 @@ def test_slow_active_write_exceeding_rpc_timeout_completes_before_block_deadline
     from dfsha.data_node import block_store
 
     root = tmp_path / "slow-datanode"
-    server, port = serve_data_node(root, "localhost", 0)
+    server, port = serve_data_node(root, "localhost", 0, TEST_ENCRYPTION_KEY)
     client = DistributedDFShaClient(
         [start_control_node([f"localhost:{port}"], block_size_bytes=4, min_write_replicas=1)],
         rpc_timeout_s=0.03,
@@ -211,13 +212,13 @@ def test_slow_active_write_exceeding_rpc_timeout_completes_before_block_deadline
     )
     original_write_block = block_store.write_block
 
-    def slow_write_block(root, block_id, chunks):
+    def slow_write_block(root, key, block_id, chunks):
         def delayed_chunks():
             for chunk in chunks:
                 time.sleep(0.02)
                 yield chunk
 
-        return original_write_block(root, block_id, delayed_chunks())
+        return original_write_block(root, key, block_id, delayed_chunks())
 
     monkeypatch.setattr("dfsha.client.distributed_client.CHUNK_SIZE_BYTES", 1)
     monkeypatch.setattr(block_store, "write_block", slow_write_block)
@@ -239,7 +240,7 @@ def test_write_exceeding_block_deadline_aborts_upload_without_partial_block(
     from dfsha.data_node import block_store
 
     root = tmp_path / "slow-datanode"
-    server, port = serve_data_node(root, "localhost", 0)
+    server, port = serve_data_node(root, "localhost", 0, TEST_ENCRYPTION_KEY)
     client = DistributedDFShaClient(
         [start_control_node([f"localhost:{port}"], block_size_bytes=4, min_write_replicas=1)],
         rpc_timeout_s=0.03,
@@ -248,13 +249,13 @@ def test_write_exceeding_block_deadline_aborts_upload_without_partial_block(
     )
     original_write_block = block_store.write_block
 
-    def slow_write_block(root, block_id, chunks):
+    def slow_write_block(root, key, block_id, chunks):
         def delayed_chunks():
             for chunk in chunks:
                 time.sleep(0.03)
                 yield chunk
 
-        return original_write_block(root, block_id, delayed_chunks())
+        return original_write_block(root, key, block_id, delayed_chunks())
 
     monkeypatch.setattr("dfsha.client.distributed_client.CHUNK_SIZE_BYTES", 1)
     monkeypatch.setattr(block_store, "write_block", slow_write_block)
@@ -360,7 +361,7 @@ def test_expired_lock_during_slow_download_does_not_mask_success_or_leak_resourc
     import time
 
     dn_root = tmp_path / "datanode"
-    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
+    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0, TEST_ENCRYPTION_KEY)
     client = DistributedDFShaClient(
         [
             start_control_node(

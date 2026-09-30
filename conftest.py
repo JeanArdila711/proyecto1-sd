@@ -7,6 +7,9 @@ import pytest
 
 from dfsha.control_node.main import serve as serve_control_node
 
+# Llave cruda fija exclusivamente para pruebas de contenedor cifrado C4.
+TEST_ENCRYPTION_KEY = bytes.fromhex("00" * 32)
+
 # Raft rápido para tests: un clúster de 1 nodo se elige líder en ~0.1 s en vez de
 # ~1 s. pysyncobj exige raftMinTimeout > 3 * appendEntriesPeriod.
 FAST_RAFT_CONF = {

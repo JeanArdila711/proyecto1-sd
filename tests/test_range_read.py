@@ -8,6 +8,7 @@ import uuid
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.client.shell import handle_command
 from dfsha.common.exceptions import BlockCorruptedError, ConflictError, DFShaError, InvalidPathError
@@ -23,28 +24,28 @@ CONTENT = bytes(range(23))  # con bloques de 5: 5 + 5 + 5 + 5 + 3
 
 def _stored_block(tmp_path, data=b"0123456789"):
     block_id = uuid.uuid4().hex
-    block_store.write_block(tmp_path, block_id, [data])
+    block_store.write_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, [data])
     return block_id
 
 
 def test_block_store_reads_a_range_inside_the_block(tmp_path):
     block_id = _stored_block(tmp_path)
-    assert b"".join(block_store.read_block(tmp_path, block_id, 2, offset=2, length=3)) == b"234"
+    assert b"".join(block_store.read_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, 2, offset=2, length=3)) == b"234"
 
 
 def test_block_store_range_without_length_reads_until_the_end(tmp_path):
     block_id = _stored_block(tmp_path)
-    assert b"".join(block_store.read_block(tmp_path, block_id, 4, offset=7)) == b"789"
+    assert b"".join(block_store.read_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, 4, offset=7)) == b"789"
 
 
 def test_block_store_range_at_the_end_is_empty(tmp_path):
     block_id = _stored_block(tmp_path)
-    assert b"".join(block_store.read_block(tmp_path, block_id, 4, offset=10, length=5)) == b""
+    assert b"".join(block_store.read_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, 4, offset=10, length=5)) == b""
 
 
 def test_block_store_default_signature_still_reads_the_whole_block(tmp_path):
     block_id = _stored_block(tmp_path)
-    assert b"".join(block_store.read_block(tmp_path, block_id, 3)) == b"0123456789"
+    assert b"".join(block_store.read_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, 3)) == b"0123456789"
 
 
 def test_block_store_range_still_verifies_the_whole_block(tmp_path):
@@ -56,14 +57,14 @@ def test_block_store_range_still_verifies_the_whole_block(tmp_path):
     raw[9] ^= 0xFF
     path.write_bytes(bytes(raw))
     with pytest.raises(BlockCorruptedError):
-        b"".join(block_store.read_block(tmp_path, block_id, 4, offset=0, length=2))
+        b"".join(block_store.read_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, 4, offset=0, length=2))
 
 
 @pytest.mark.parametrize("offset,length", [(-1, None), (0, -1)])
 def test_block_store_rejects_negative_ranges(tmp_path, offset, length):
     block_id = _stored_block(tmp_path)
     with pytest.raises(ValueError):
-        b"".join(block_store.read_block(tmp_path, block_id, 4, offset=offset, length=length))
+        b"".join(block_store.read_block(tmp_path, TEST_ENCRYPTION_KEY, block_id, 4, offset=offset, length=length))
 
 
 # --- RPC del DataNode ------------------------------------------------------------
@@ -71,7 +72,7 @@ def test_block_store_rejects_negative_ranges(tmp_path, offset, length):
 
 @pytest.fixture
 def datanode(tmp_path):
-    server, port = serve_data_node(tmp_path / "dn", "localhost", 0)
+    server, port = serve_data_node(tmp_path / "dn", "localhost", 0, TEST_ENCRYPTION_KEY)
     channel = grpc.insecure_channel(f"localhost:{port}")
     yield data_node_pb2_grpc.DataNodeServiceStub(channel), tmp_path / "dn"
     channel.close()
@@ -110,7 +111,7 @@ def cluster(tmp_path, start_control_node):
     """3 DataNodes, factor 3, bloques de 5 bytes, y un archivo de 23 bytes subido."""
     servers, roots, addresses = [], [], []
     for i in range(3):
-        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0)
+        server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         roots.append(tmp_path / f"dn{i}")
         addresses.append(f"localhost:{port}")

@@ -59,12 +59,19 @@ python scripts/generate_proto.py
 
 ## Correr con Docker (recomendado)
 
+Cada DataNode exige una llave AES-256-GCM **cruda** de 32 bytes. Se generan fuera del repo, con permiso `0600`; no hay rotación automática ni modo plaintext. Como C4 cambió el formato de los volúmenes, el primer arranque y cualquier reinicio desde cero requieren `down -v`:
+
 ```bash
-docker compose up -d --build            # 3 DataNodes + 3 ControlNodes
-docker compose run --rm shell           # shell distribuida
-docker compose run --rm inspect mapa    # dónde quedó cada bloque
-docker compose down                     # apagar
+python scripts/generate_secrets.py   # crea secrets/dn1.key, dn2.key y dn3.key
+# si cambias llaves o vienes de bloques plaintext/legacy:
+docker compose down -v
+docker compose up -d --build         # 3 DataNodes + 3 ControlNodes
+docker compose run --rm shell        # shell distribuida
+docker compose run --rm inspect mapa # dónde quedó cada bloque
+docker compose down                  # apagar (con -v borra también los bloques)
 ```
+
+Las llaves se montan como solo lectura en los DataNodes. Si falta una o no mide exactamente 32 bytes, el DataNode falla al arrancar; no migra ni intenta leer bloques legacy/plaintext.
 
 Guía completa (shell, inspector, pruebas de fallo, configuración): **[docs/GUIA.md](docs/GUIA.md)**.
 
@@ -98,12 +105,15 @@ Orden de arranque: primero los DataNodes, después los ControlNodes (necesitan
 saber sus direcciones al arrancar).
 
 ```bash
-# 1. Tres DataNodes, cada uno con su raíz y su puerto
-python -m dfsha.data_node.main --root ./dn1 --port 50061
-python -m dfsha.data_node.main --root ./dn2 --port 50062
-python -m dfsha.data_node.main --root ./dn3 --port 50063
+# 1. Generá una llave cruda distinta de 32 bytes por DataNode, con modo 0600.
+python scripts/generate_secrets.py
 
-# 2. Tres ControlNodes. --raft-cluster es la MISMA lista, en el mismo orden,
+# 2. Tres DataNodes, cada uno con su raíz, llave y puerto.
+python -m dfsha.data_node.main --root ./dn1 --port 50061 --encryption-key-file ./secrets/dn1.key
+python -m dfsha.data_node.main --root ./dn2 --port 50062 --encryption-key-file ./secrets/dn2.key
+python -m dfsha.data_node.main --root ./dn3 --port 50063 --encryption-key-file ./secrets/dn3.key
+
+# 3. Tres ControlNodes. --raft-cluster es la MISMA lista, en el mismo orden,
 #    en los 3; --node-id es la posición de cada uno en esa lista. Cada nodo
 #    necesita su propio --data-dir (journal y snapshots de Raft).
 for i in 0 1 2; do

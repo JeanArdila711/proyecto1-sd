@@ -1,6 +1,7 @@
 import grpc
 import pytest
 
+from conftest import TEST_ENCRYPTION_KEY
 from dfsha.client.distributed_client import DistributedDFShaClient
 from dfsha.common.exceptions import BlockCorruptedError
 from dfsha.data_node.main import serve as serve_data_node
@@ -10,7 +11,7 @@ from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_p
 @pytest.fixture
 def cluster(tmp_path, start_control_node):
     dn_root = tmp_path / "datanode"
-    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
+    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0, TEST_ENCRYPTION_KEY)
     datanode_address = f"localhost:{dn_port}"
 
     # D-P2: esta integración histórica conserva explícitamente el mínimo de una copia.

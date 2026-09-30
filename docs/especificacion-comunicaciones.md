@@ -127,8 +127,9 @@ respuesta:  { checksum: <SHA-256 hex>, bytes_written }
 ### Lectura: `ReadBlock(block_id, offset, length) → stream ReadBlockChunk`
 
 - `offset` y `length` (Hito 3, B2) piden un rango dentro del bloque; `length` 0 significa hasta el final, así que un cliente que no los manda lee el bloque completo. Un rango negativo: `INVALID_ARGUMENT`.
-- El DataNode recalcula el SHA-256 del bloque **completo** antes de enviar el primer byte, aunque se pida solo un rango. Si no coincide con el guardado: `DATA_LOSS`, sin enviar datos.
-- Trozos de 1 MiB.
+- Cada DataNode guarda un único contenedor cifrado autocontenido `DFSE1` por `block_id`: AES-256-GCM por chunks de 1 MiB, nonce de prefijo aleatorio más contador y AAD con `block_id`, índice y marca final. No hay sidecar `.sha256` ni archivos plaintext.
+- La metadata final autenticada fija tamaño lógico, cantidad de chunks y SHA-256 del plaintext. `ReadBlock` autentica primero esa metadata y después solo los chunks requeridos por el rango; magic ausente, framing legacy/plaintext, truncación o tag inválido producen `DATA_LOSS` sin migración silenciosa.
+- El checksum de `WriteBlock` sigue siendo SHA-256 hexadecimal del plaintext y se compara entre réplicas.
 - **Failover en el cliente:** prueba las réplicas en orden; ante `UNAVAILABLE` o `DATA_LOSS` descarta los bytes parciales de ese bloque (`seek` + `truncate`) y pasa a la siguiente. Solo falla si fallan todas.
 
 | `StatusCode` | Significado |
@@ -285,7 +286,7 @@ sequenceDiagram
 | ④ ControlNode → DataNode | `insecure_channel` | mTLS |
 | ⑤ DataNode ↔ DataNode | `insecure_channel` | mTLS |
 
-Ya implementado a favor de la seguridad: validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco, y verificación de integridad SHA-256 en cada lectura.
+Ya implementado a favor de la seguridad: validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco y cifrado autenticado en reposo `DFSE1` (AES-256-GCM por chunk). Cada DataNode recibe una llave cruda distinta de 32 bytes mediante `--encryption-key-file`; `secrets/` queda fuera del repo y se monta solo lectura en Docker. No hay rotación ni migración: al pasar a C4 se crean volúmenes nuevos con `docker compose down -v`.
 
 ## 11. Matriz de errores de dominio
 
