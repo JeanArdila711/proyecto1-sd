@@ -403,6 +403,9 @@ class ControlTree:
             node.state = "committed"
 
     def abort_upload(self, virtual_path: str) -> None:
+        # No devuelve los bloques a propósito: el resultado de un comando replicado queda
+        # en applied_ops, y reproducir un journal viejo con un retorno distinto daría otro
+        # estado. El servicer los lee antes con pending_blocks().
         with self._lock:
             parts = self._parts(virtual_path)
             if not parts:
@@ -413,6 +416,15 @@ class ControlTree:
             if not isinstance(node, FileNode) or node.state != "pending":
                 raise PathNotFoundError(f"no hay una subida pendiente para: {virtual_path}")
             del parent.children[name]
+
+    def pending_blocks(self, virtual_path: str) -> list[BlockRecord]:
+        """Copia de los bloques de una subida pendiente; [] si no hay ninguna. Solo lectura."""
+        with self._lock:
+            try:
+                node = self._get_pending_file(virtual_path)
+            except (PathNotFoundError, InvalidPathError):
+                return []
+            return [BlockRecord(b.block_id, list(b.datanode_addresses), b.checksum, b.size_bytes) for b in node.blocks]
 
     # --- Escritura copy-on-write (B3) ----------------------------------------------------
     #
@@ -578,6 +590,31 @@ class ControlTree:
                 block.datanode_addresses = list(new)
                 return
             raise PathNotFoundError(f"bloque {block_id} no existe en {virtual_path}")
+
+    def referenced_blocks(self, now: float) -> dict[str, set[str]]:
+        """block_id -> DataNodes que la metadata le asigna, para el recolector (A3).
+
+        Cuenta como en uso: archivos confirmados, TODAS las subidas pendientes (con el
+        lease vencido también: complete_upload la acepta igual mientras nadie reemplace
+        el nombre, así que borrarle los bloques perdería datos) y las reservas de
+        escritura COW vigentes a `now`. Devuelve copias: nadie se lleva referencias."""
+        with self._lock:
+            referenced: dict[str, set[str]] = {}
+
+            def visit(node: DirNode) -> None:
+                for child in node.children.values():
+                    if isinstance(child, DirNode):
+                        visit(child)
+                        continue
+                    for block in child.blocks:
+                        referenced.setdefault(block.block_id, set()).update(block.datanode_addresses)
+
+            visit(self._root)
+            for reservation in self._writes.values():
+                if reservation.lease_expires_at > now:
+                    for slot in reservation.slots:
+                        referenced.setdefault(slot.new_block_id, set()).update(slot.new_addresses)
+            return referenced
 
     def iter_blocks(self) -> list[tuple[str, BlockRecord]]:
         """Devuelve una fotografía independiente de los bloques confirmados."""

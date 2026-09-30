@@ -8,6 +8,7 @@ service DataNodeService {
   rpc ReadBlock(ReadBlockRequest) returns (stream ReadBlockChunk);
   rpc DeleteBlock(DeleteBlockRequest) returns (DeleteBlockResponse);
   rpc ReplicateBlock(ReplicateBlockRequest) returns (ReplicateBlockResponse);
+  rpc ListStoredBlocks(ListStoredBlocksRequest) returns (stream StoredBlock);
 }
 
 message WriteBlockHeader {
@@ -52,4 +53,14 @@ message ReplicateBlockRequest {
 message ReplicateBlockResponse {
   string checksum = 1;
   int64 bytes_written = 2;
+}
+
+// Inventario del DataNode para el recolector de huérfanos (A3). Stream: puede haber
+// muchos bloques. age_s la calcula el DataNode con su reloj, así quien decide borrar
+// no compara relojes de máquinas distintas.
+message ListStoredBlocksRequest {}
+message StoredBlock {
+  string block_id = 1;
+  int64 size_bytes = 2;
+  double age_s = 3;
 }

@@ -76,6 +76,8 @@ services:
       - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
       - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
       - --rereplication-max-per-cycle=${DFSHA_REREPLICATION_MAX_PER_CYCLE:-4}
+      - --gc-interval-s=${DFSHA_GC_INTERVAL_S:-60}
+      - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn0-raft:/raft]
   cn1:
@@ -98,6 +100,8 @@ services:
       - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
       - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
       - --rereplication-max-per-cycle=${DFSHA_REREPLICATION_MAX_PER_CYCLE:-4}
+      - --gc-interval-s=${DFSHA_GC_INTERVAL_S:-60}
+      - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn1-raft:/raft]
   cn2:
@@ -120,6 +124,8 @@ services:
       - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
       - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
       - --rereplication-max-per-cycle=${DFSHA_REREPLICATION_MAX_PER_CYCLE:-4}
+      - --gc-interval-s=${DFSHA_GC_INTERVAL_S:-60}
+      - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn2-raft:/raft]
 
@@ -140,10 +146,6 @@ services:
     profiles: [herramientas]
     entrypoint: [python, scripts/inspect_cluster.py]
     command: [estado]
-    volumes:        # solo para `huerfanos`, que lee las carpetas de bloques
-      - dn1-data:/dn1:ro
-      - dn2-data:/dn2:ro
-      - dn3-data:/dn3:ro
 
   tests:
     <<: *dfsha

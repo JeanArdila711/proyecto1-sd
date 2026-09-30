@@ -9,8 +9,7 @@ Corre dentro de la red de Docker:
     docker compose run --rm inspect mapa
     docker compose run --rm inspect huerfanos
 
-Solo usa los RPC públicos de ControlNodes y DataNodes, salvo `huerfanos`, que lee
-las carpetas de bloques (el servicio monta los volúmenes de los DataNodes).
+Solo usa RPC de ControlNodes y DataNodes; no lee los volúmenes de los DataNodes.
 """
 from __future__ import annotations
 
@@ -21,7 +20,6 @@ from pathlib import Path
 
 DEFAULT_CN = "cn0:50051,cn1:50051,cn2:50051"
 DEFAULT_DN = "dn1:50061,dn2:50061,dn3:50061"
-DEFAULT_DN_ROOTS = "/dn1,/dn2,/dn3"
 
 
 def _load_repo(repo: Path):
@@ -212,26 +210,41 @@ def cmd_mapa(args):
 
 
 def cmd_huerfanos(args):
-    cns = _split(args.control_nodes)
-    roots = [Path(r) for r in _split(args.datanode_roots)]
+    """Inventario de cada DataNode (por RPC, sin leer volúmenes) contra la metadata.
+
+    Solo ve archivos visibles: un bloque de una subida o una escritura en curso aparece
+    como "sin uso visible", pero el recolector (que sí ve subidas y reservas) no lo borra."""
+    import grpc
+    from dfsha.generated import data_node_pb2, data_node_pb2_grpc
+
+    cns, dns = _split(args.control_nodes), _split(args.datanodes)
     _, stub = leader_stub(cns)
-    referenced = set()
+    assigned: dict[str, set[str]] = {}
     for path, is_dir, _ in walk(stub):
         if not is_dir:
-            referenced.update(b.block_id for b in blocks_of(stub, path))
-    print(f"\nBloques referenciados por archivos visibles: {len(referenced)}\n")
-    total_orphans = 0
-    for root in roots:
-        on_disk = sorted(p.name for p in root.iterdir() if len(p.name) == 32) if root.exists() else []
-        orphans = [b for b in on_disk if b not in referenced]
-        total_orphans += len(orphans)
-        size = sum((root / b).stat().st_size for b in orphans)
-        print(f"  {str(root):<45} {len(on_disk):>4} en disco   {len(orphans):>4} huérfanos ({human(size)})")
-        for b in orphans[: args.limite]:
-            print(f"      huérfano {b}")
-    print(f"\n  Total huérfanos: {total_orphans}"
-          + ("  ← espacio que nadie va a liberar" if total_orphans else "")
-          + "\n")
+            for b in blocks_of(stub, path):
+                assigned.setdefault(b.block_id, set()).update(b.datanode_addresses)
+    print(f"\nBloques en uso por archivos visibles: {len(assigned)}   (gracia del recolector: {args.gracia_s:.0f} s)\n")
+    total_candidates = 0
+    for address in dns:
+        dn = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(address))
+        try:
+            stored = list(dn.ListStoredBlocks(data_node_pb2.ListStoredBlocksRequest(), timeout=30))
+        except grpc.RpcError as exc:
+            print(f"  {short(address):<8} no responde ({exc.code().name})")
+            continue
+        unused = [b for b in stored if address not in assigned.get(b.block_id, ())]
+        young = [b for b in unused if b.age_s < args.gracia_s]
+        candidates = [b for b in unused if b.age_s >= args.gracia_s]
+        total_candidates += len(candidates)
+        print(
+            f"  {short(address):<8} {len(stored):>4} en disco   {len(stored) - len(unused):>4} en uso   "
+            f"{len(young):>4} sin uso visible y jóvenes   {len(candidates):>4} a borrar "
+            f"({human(sum(b.size_bytes for b in candidates))})"
+        )
+        for b in candidates[: args.limite]:
+            print(f"      a borrar {b.block_id}  ({b.age_s:.0f} s)")
+    print(f"\n  Total a borrar en el próximo ciclo del recolector: {total_candidates}\n")
 
 
 def main() -> None:
@@ -247,8 +260,8 @@ def main() -> None:
     p.add_argument("ruta")
     p.add_argument("--sin-verificar", action="store_true", help="no descargar los bloques para verificar el SHA")
     sub.add_parser("mapa", help="matriz archivos × DataNodes: cómo quedó particionado todo")
-    p = sub.add_parser("huerfanos", help="bloques en disco que ningún archivo visible usa")
-    p.add_argument("--datanode-roots", default=DEFAULT_DN_ROOTS, help="carpetas de bloques de los DataNodes, separadas por comas")
+    p = sub.add_parser("huerfanos", help="bloques en disco que ningún archivo visible usa (vía RPC)")
+    p.add_argument("--gracia-s", type=float, default=1200.0, help="la misma --gc-grace-s del ControlNode")
     p.add_argument("--limite", type=int, default=5)
     args = parser.parse_args()
 

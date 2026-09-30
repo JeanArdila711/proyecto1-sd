@@ -317,10 +317,18 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         return control_node_pb2.CompleteUploadResponse()
 
     def AbortUpload(self, request, context):
+        # Camino rápido: se leen los bloques de la subida ANTES del commit (con la barrera,
+        # sobre el árbol al día) y se borran si el abort sale bien. abort_upload no los
+        # devuelve para no cambiar el resultado que guarda el log (ver tree.abort_upload).
+        # Si la subida cambió entre la lectura y el commit, lo que quede lo recoge A3.
+        self._read_barrier(context)
+        blocks = self._replicated.tree.pending_blocks(request.path)
         try:
             self._commit(context, request.op_id, "abort_upload", request.path)
         except (PathNotFoundError, NotADirectoryError, InvalidPathError) as exc:
             _abort_on_domain_error(context, exc)
+            return control_node_pb2.AbortUploadResponse()
+        self._delete_blocks(blocks)
         return control_node_pb2.AbortUploadResponse()
 
     def ListBlocks(self, request, context):

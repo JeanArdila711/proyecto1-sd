@@ -12,6 +12,11 @@ from dfsha.control_node.datanode_monitor import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
     DataNodeMonitor,
 )
+from dfsha.control_node.garbage_collector import (
+    DEFAULT_GC_GRACE_S,
+    DEFAULT_GC_INTERVAL_S,
+    GarbageCollector,
+)
 from dfsha.control_node.replicated_tree import ReplicatedTree
 from dfsha.control_node.rereplicator import (
     DEFAULT_REREPLICATION_DELAY_S,
@@ -85,6 +90,8 @@ def serve(
     rereplication_interval_s: float = DEFAULT_REREPLICATION_INTERVAL_S,
     rereplication_delay_s: float = DEFAULT_REREPLICATION_DELAY_S,
     rereplication_max_per_cycle: int = DEFAULT_REREPLICATION_MAX_PER_CYCLE,
+    gc_interval_s: float = DEFAULT_GC_INTERVAL_S,
+    gc_grace_s: float = DEFAULT_GC_GRACE_S,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
     DataNodes, que se detiene junto con el servidor.
@@ -125,11 +132,15 @@ def serve(
         delay_s=rereplication_delay_s,
         max_per_cycle=rereplication_max_per_cycle,
     )
+    garbage_collector = GarbageCollector(
+        servicer, monitor, interval_s=gc_interval_s, grace_s=gc_grace_s, rereplicator=rereplicator
+    )
     original_stop = server.stop
 
     def stop_with_cleanup(grace):
         termination = original_stop(grace)
         termination.wait()
+        garbage_collector.stop()
         rereplicator.stop()
         monitor.stop()
         servicer.close()
@@ -140,9 +151,11 @@ def serve(
     server.start()
     monitor.start()
     rereplicator.start()
+    garbage_collector.start()
     # Atributos de diagnóstico para pruebas de lifecycle; no son parte del RPC.
     server._dfsha_datanode_monitor = monitor
     server._dfsha_rereplicator = rereplicator
+    server._dfsha_garbage_collector = garbage_collector
     server._dfsha_control_servicer = servicer
     return server, bound_port, raft
 
@@ -180,6 +193,13 @@ def main() -> None:
         default=DEFAULT_LOCK_LEASE_S,
         help="segundos de lease para locks lectores/escritor; el cliente renueva cada tercio",
     )
+    parser.add_argument("--gc-interval-s", type=float, default=DEFAULT_GC_INTERVAL_S)
+    parser.add_argument(
+        "--gc-grace-s",
+        type=float,
+        default=DEFAULT_GC_GRACE_S,
+        help="edad mínima de un bloque sin uso antes de borrarlo",
+    )
     args = parser.parse_args()
 
     cluster = _split_addresses(args.raft_cluster)
@@ -212,6 +232,8 @@ def main() -> None:
         rereplication_max_per_cycle=args.rereplication_max_per_cycle,
         upload_lease_s=args.upload_lease_s,
         lock_lease_s=args.lock_lease_s,
+        gc_interval_s=args.gc_interval_s,
+        gc_grace_s=args.gc_grace_s,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")

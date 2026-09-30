@@ -77,6 +77,10 @@ class ReReplicator:
         self.thread = threading.Thread(target=self._run, name="dfsha-rereplicator", daemon=False)
         self._started = False
         self.lost_blocks: list[tuple[str, str]] = []
+        # (block_id, destino) de copias hechas cuyo commit todavía no entró: el recolector
+        # (A3) no las toca aunque la metadata aún no las nombre.
+        self._in_flight: set[tuple[str, str]] = set()
+        self._in_flight_lock = threading.Lock()
         self.ignored_deleted_paths: list[str] = []
 
     def start(self) -> None:
@@ -91,6 +95,10 @@ class ReReplicator:
             self.thread.join()
         for channel in self._channels.values():
             channel.close()
+
+    def in_flight_copies(self) -> set[tuple[str, str]]:
+        with self._in_flight_lock:
+            return set(self._in_flight)
 
     def _datanode_stub(self, address: str):
         if address not in self._channels:
@@ -144,10 +152,16 @@ class ReReplicator:
             new = live + [target]
             # Si un origen tiene la copia corrupta o no la tiene, se prueba el siguiente
             # vivo en vez de insistir con el primero.
-            for source in live:
-                if self._replicate(block.block_id, source, target, block.size_bytes, block.checksum):
-                    self._commit_replicas(path, block.block_id, expected, new)
-                    break
+            with self._in_flight_lock:
+                self._in_flight.add((block.block_id, target))
+            try:
+                for source in live:
+                    if self._replicate(block.block_id, source, target, block.size_bytes, block.checksum):
+                        self._commit_replicas(path, block.block_id, expected, new)
+                        break
+            finally:
+                with self._in_flight_lock:
+                    self._in_flight.discard((block.block_id, target))
             completed += 1
 
     def _dead_for(self, address: str) -> float:

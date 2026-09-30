@@ -60,7 +60,7 @@ docker compose run --rm inspect lider                      # solo el nombre del 
 docker compose run --rm inspect arbol                      # todos los directorios y archivos
 docker compose run --rm inspect mapa                       # en qué DataNode está cada bloque
 docker compose run --rm inspect bloques /docs/tesis.pdf    # réplicas de un archivo, verificando su SHA-256
-docker compose run --rm inspect huerfanos                  # bloques en disco que ningún archivo usa
+docker compose run --rm inspect huerfanos                  # bloques sin uso: jóvenes y a borrar por el recolector
 ```
 
 Ejemplo del mapa con bloques de 1 MB y factor 2:
@@ -155,6 +155,8 @@ Los parámetros están en `.env`. Después de cambiarlos: `docker compose up -d`
 | `DFSHA_REREPLICATION_INTERVAL_S` | 10 | 1 | Período de búsqueda de bloques sub-replicados por el líder |
 | `DFSHA_REREPLICATION_DELAY_S` | 30 | 2 | Cuánto tiene que llevar muerta una réplica antes de reponerla en otro nodo |
 | `DFSHA_REREPLICATION_MAX_PER_CYCLE` | 4 | 4 | Máximo de copias que hace cada ciclo |
+| `DFSHA_GC_INTERVAL_S` | 60 | 5 | Cada cuánto el líder busca bloques huérfanos en los DataNodes |
+| `DFSHA_GC_GRACE_S` | 1200 | 5 | Edad mínima de un bloque sin uso antes de borrarlo |
 | `DFSHA_UPLOAD_LEASE_S` | 600 | 15 | Segundos hasta liberar una subida abandonada |
 
 ---

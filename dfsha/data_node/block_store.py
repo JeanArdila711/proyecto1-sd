@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -92,3 +93,22 @@ def delete_block(root: Path, block_id: str) -> None:
         raise BlockNotFoundError(f"no existe el bloque: {block_id}")
     target.unlink()
     _checksum_path(root, block_id).unlink(missing_ok=True)
+
+
+def list_blocks(root: Path, now: float | None = None) -> Iterator[tuple[str, int, float]]:
+    """(block_id, tamaño, edad en segundos) de cada bloque guardado. Ignora checksums y
+    temporales `.part-` de escrituras en curso.
+
+    La edad la calcula el DataNode con su propio reloj: así quien decide borrar (el
+    recolector del líder) nunca compara relojes de dos máquinas distintas."""
+    if not root.exists():
+        return
+    now = time.time() if now is None else now
+    for entry in root.iterdir():
+        if not _VALID_BLOCK_ID.match(entry.name):
+            continue
+        try:
+            stat = entry.stat()
+        except FileNotFoundError:
+            continue  # se borró entre el listado y el stat
+        yield entry.name, stat.st_size, max(0.0, now - stat.st_mtime)

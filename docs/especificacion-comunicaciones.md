@@ -355,3 +355,9 @@ Por ahora `ReplicateBlock` no lleva token: C3 agregará la capability administra
 | `AbortWrite(path, write_id, lock_id)` | Descarta la reserva y borra los bloques nuevos. Abortar una reserva que ya no existe no es error | `ABORTED` si la reserva es de otro lock |
 
 El cliente escribe cada bloque nuevo con el mismo `WriteBlock` del pipeline de subida (enlaces ② y ⑤), y cuando la escritura toca un bloque solo en parte, primero lee el bloque viejo con `ReadBlock` para completarlo. Un reintento de `BeginWrite` o `CommitWrite` con el mismo `op_id` devuelve el resultado original: no reserva dos veces ni publica dos veces. Si el `CommitWrite` queda con resultado incierto, el `AbortWrite` posterior es inofensivo, porque una reserva ya publicada no existe y no se borra nada.
+
+## 15. Actualización Hito 3 A3 — recolector de huérfanos
+
+`ListStoredBlocks(ListStoredBlocksRequest) → stream StoredBlock{block_id, size_bytes, age_s}` es un RPC interno nuevo de `DataNodeService` (enlace ④): el inventario de bloques en disco, sin checksums ni temporales. Va como stream porque puede haber muchos. `age_s` la calcula el DataNode con su propio reloj, así el ControlNode nunca compara relojes de máquinas distintas. *(El plan decía `mtime_unix`; se cambió por esa razón.)*
+
+El recolector corre solo en el líder, cada `--gc-interval-s`. Primero lista cada DataNode vivo y **después** pasa la barrera de lectura y toma la foto de la metadata: con ese orden, un bloque reservado entre las dos lecturas ya figura en la foto. Borra con `DeleteBlock` (enlace ④) un bloque que ningún archivo, subida pendiente ni reserva COW vigente usa, o una réplica que la metadata ya no le asigna a ese nodo, siempre que tenga más de `--gc-grace-s` de edad y no sea una copia en vuelo del re-replicador. `NOT_FOUND` al borrar cuenta como éxito. `AbortUpload` además borra al instante los bloques de la subida descartada.

@@ -214,3 +214,8 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
         return data_node_pb2.ReplicateBlockResponse(
             checksum=response.checksum, bytes_written=response.bytes_written
         )
+
+    def ListStoredBlocks(self, request, context):
+        # C3 agregará acá la capability interna: solo el ControlNode puede pedir el inventario.
+        for block_id, size_bytes, age_s in block_store.list_blocks(self._root):
+            yield data_node_pb2.StoredBlock(block_id=block_id, size_bytes=size_bytes, age_s=age_s)

@@ -156,8 +156,9 @@ Los binarios legacy versionados y su procedimiento de regeneración están en
 ## Fuera de alcance por ahora
 
 RF3 está completo: `lock` (B1), `read` por rangos (B2) y `open`/`write`/`close`
-con copy-on-write (B3). Siguen en el roadmap el recolector de bloques huérfanos
-(A3), la seguridad (TLS, autenticación, permisos, cifrado en reposo) y el despliegue
-en AWS. *(Antes decía: "RF3 parcial: B1 incorpora `lock` [...] y B2 `read` por rangos;
+con copy-on-write (B3). La alta disponibilidad de datos también: detección de
+DataNodes caídos (A1), re-replicación (A2) y recolector de bloques huérfanos (A3).
+Siguen en el roadmap la seguridad (TLS, autenticación, permisos, cifrado en reposo)
+y el despliegue en AWS. *(Antes decía: "RF3 parcial: B1 incorpora `lock` [...] y B2 `read` por rangos;
 `open` y `write` copy-on-write completos se incorporan con B3. Detección automática
 de DataNodes caídos, re-replicación y autenticación siguen en el roadmap".)*
