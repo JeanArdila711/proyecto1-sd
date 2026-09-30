@@ -354,6 +354,53 @@ class ControlTree:
                 raise PathNotFoundError(f"no hay una subida pendiente para: {virtual_path}")
             del parent.children[name]
 
+    def update_block_replicas(
+        self,
+        virtual_path: str,
+        block_id: str,
+        expected: list[str],
+        new: list[str],
+    ) -> None:
+        """Reemplaza réplicas solo si la fotografía esperada todavía coincide."""
+        with self._lock:
+            node = self._get_committed_file(virtual_path)
+            for block in node.blocks:
+                if block.block_id != block_id:
+                    continue
+                if block.datanode_addresses != expected:
+                    raise ConflictError(f"réplicas cambiaron para bloque {block_id}")
+                block.datanode_addresses = list(new)
+                return
+            raise PathNotFoundError(f"bloque {block_id} no existe en {virtual_path}")
+
+    def iter_blocks(self) -> list[tuple[str, BlockRecord]]:
+        """Devuelve una fotografía independiente de los bloques confirmados."""
+        with self._lock:
+            snapshot: list[tuple[str, BlockRecord]] = []
+
+            def visit(node: DirNode, prefix: str) -> None:
+                for name, child in node.children.items():
+                    path = f"{prefix}/{name}" if prefix else f"/{name}"
+                    if isinstance(child, DirNode):
+                        visit(child, path)
+                    elif child.state == "committed":
+                        for block in child.blocks:
+                            snapshot.append(
+                                (
+                                    path,
+                                    BlockRecord(
+                                        block_id=block.block_id,
+                                        datanode_addresses=list(block.datanode_addresses),
+                                        checksum=block.checksum,
+                                        size_bytes=block.size_bytes,
+                                        confirmed=block.confirmed,
+                                    ),
+                                )
+                            )
+
+            visit(self._root, "")
+            return snapshot
+
     def list_blocks(self, virtual_path: str) -> list[BlockRecord]:
         with self._lock:
             parts = self._parts(virtual_path)

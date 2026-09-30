@@ -105,13 +105,16 @@ docker compose kill cn0 cn1
 docker compose start cn0 cn1
 ```
 
-**Subida con un DataNode caído** — esperá al menos 6 s tras la caída para que el sondeo pull lo declare muerto. Con los defaults (factor 3, mínimo 2), `send` confirma dos réplicas y el archivo queda sub-replicado; si quedan menos de dos nodos vivos responde `UNAVAILABLE` y no hace visible el archivo:
+**Subida con un DataNode caído y re-replicación** — esperá al menos 6 s tras la caída para que el sondeo pull lo declare muerto. Con los defaults (factor 3, mínimo 2), `send` confirma dos réplicas y el archivo queda sub-replicado. Al levantar el nodo, esperá un ciclo de 10 s: el re-replicador agrega la tercera copia. Las copias de un nodo que sigue caído se reponen en otro nodo recién cuando lleva más de 30 s muerto. Con menos de dos nodos vivos responde `UNAVAILABLE` y no hace visible el archivo:
 
 ```bash
 docker compose kill dn3
 sleep 7
 # en la shell: send /intercambio/tesis.pdf /docs/otro.pdf
+docker compose run --rm inspect bloques /docs/otro.pdf
 docker compose start dn3
+sleep 41
+docker compose run --rm inspect bloques /docs/otro.pdf
 ```
 
 **Apagar todo** — los archivos siguen ahí:
@@ -145,6 +148,9 @@ Los parámetros están en `.env`. Después de cambiarlos: `docker compose up -d`
 | `DFSHA_MIN_WRITE_REPLICAS` | 2 | 2 | Copias vivas mínimas para confirmar una subida; debe estar entre 1 y el factor |
 | `DFSHA_HEARTBEAT_INTERVAL_S` | 2 | 0.5 | Período de sondeo `Ping` de cada ControlNode |
 | `DFSHA_DATANODE_DEAD_AFTER_S` | 6 | 2 | Sin respuesta acumulada antes de excluir un DataNode del pipeline |
+| `DFSHA_REREPLICATION_INTERVAL_S` | 10 | 1 | Período de búsqueda de bloques sub-replicados por el líder |
+| `DFSHA_REREPLICATION_DELAY_S` | 30 | 2 | Cuánto tiene que llevar muerta una réplica antes de reponerla en otro nodo |
+| `DFSHA_REREPLICATION_MAX_PER_CYCLE` | 4 | 4 | Máximo de copias que hace cada ciclo |
 | `DFSHA_UPLOAD_LEASE_S` | 600 | 15 | Segundos hasta liberar una subida abandonada |
 
 ---

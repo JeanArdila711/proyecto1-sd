@@ -333,3 +333,12 @@ Los errores de forma del protocolo que no nacen de una excepción de dominio (po
 `DataNodeService` añade `Ping(PingRequest) → PingResponse`, un RPC unario idempotente sin datos de aplicación. Cada ControlNode lo invoca contra las direcciones **internas** configuradas, con deadline corto, cada `--heartbeat-interval-s`; tras `--datanode-dead-after-s` sin respuesta, la dirección se excluye solo de la vista local de ese ControlNode. No se replica por Raft ni se anuncia al cliente.
 
 `BeginUpload` arma cada pipeline únicamente con los DataNodes que su monitor local ve vivos. Selecciona `min(replication_factor, vivos)` direcciones internas con round-robin. Si hay menos de `--min-write-replicas` (default 2), devuelve `UNAVAILABLE` antes de crear la subida; con el mínimo pero menos que el factor, confirma el bloque sub-replicado. Los RPC de datos `Ping`, `ReadBlock`, `WriteBlock`, `DeleteBlock` y el forwarding usan deadlines explícitos. Solo los pasos idempotentes se reintentan con backoff exponencial y jitter; `WriteBlock` no se reintenta tras haber empezado su stream.
+
+
+## 13. Actualización Hito 3 A2 — re-replicación
+
+`ReplicateBlock(ReplicateBlockRequest{block_id, target})` es un RPC unario interno de `DataNodeService`. El DataNode origen verifica su copia con la misma lectura con checksum de `ReadBlock` y la envía completa al destino mediante `WriteBlock` con `downstream` vacío. El deadline cubre toda la transferencia y el forwarding usa el tiempo restante del contexto entrante.
+
+Solo el líder del ControlNode ejecuta el re-replicador. Antes de cada fotografía de bloques confirmados confirma una barrera Raft; identifica direcciones caídas y vivas exclusivamente mediante el monitor local de A1. Al terminar una copia, publica la nueva lista con el CAS replicado `update_block_replicas(path, block_id, expected, new)` y un `op_id` estable por decisión. Un timeout conserva resultado desconocido para reintentar de forma idempotente; un CAS obsoleto o un archivo que ya fue borrado se ignoran. Esta última copia queda como huérfana hasta A3.
+
+Por ahora `ReplicateBlock` no lleva token: C3 agregará la capability administrativa de la orden y la capability de bloque del destino.

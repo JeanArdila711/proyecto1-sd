@@ -193,3 +193,14 @@ python -m pytest tests/ -v
 
 - Los locks se indexan con la ruta canónica derivada de sus partes, por lo que variantes como `/docs/a.txt`, `docs/a.txt` y `/docs//a.txt` compiten por el mismo holder; `Remove` aplica la misma clave.
 - El cliente guarda y libera rutas canónicas. Si `RenewLock` informa `ConflictError`, marca el `LeaseLock` como perdido, lo elimina de sus locks propios y detiene el renovador cuando corresponde; una liberación tardía limpia estado local sin alterar el resultado de una descarga exitosa.
+## Hito 3 — A2: re-replicación
+
+- El líder toma fotografías copiadas de bloques confirmados, identifica réplicas vivas únicamente con el monitor A1 y ordena `ReplicateBlock` desde una copia sana a un DataNode vivo que falte.
+- La metadata se publica con `update_block_replicas` compare-and-set y `op_id`; conflictos, timeouts y archivos borrados durante la copia no detienen el hilo. La copia de ese último caso queda huérfana para que A3 la recoja.
+- El re-replicador tiene barrera Raft, límites por ciclo, deadlines por tamaño, reintentos idempotentes con backoff+jitter y cierre coordinado con el ControlNode.
+
+### Correcciones de revisión A2
+
+- **Delay:** se repara una réplica caída solo cuando lleva más de `--rereplication-delay-s` muerta (según `DataNodeMonitor.dead_for`), y el ciclo nunca duerme. Antes dormía el delay antes de cada reparación y después actuaba con una foto vieja: un nodo que revivía durante la espera igual se sacaba de la metadata. Un bloque escrito con menos copias (D-P2), sin réplicas muertas, se completa en el siguiente ciclo.
+- **Origen corrupto:** `ReplicateBlock` verifica el bloque local antes de abrir el stream al destino, así un origen corrupto responde `DATA_LOSS` y uno sin el bloque `NOT_FOUND` (antes salían como `UNAVAILABLE`). El re-replicador prueba el siguiente origen vivo en vez de insistir con el primero, que dejaba un bloque sin reparar para siempre.
+- **Límite conocido:** el re-replicador decide por liveness, no por integridad. Una réplica corrupta en un nodo vivo sigue contando como copia: la lectura la esquiva por failover, pero nadie la repone. Detectarla requiere un escaneo periódico de checksums, que no está en el plan.

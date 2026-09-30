@@ -73,6 +73,9 @@ services:
       - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
       - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
       - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
+      - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
+      - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
+      - --rereplication-max-per-cycle=${DFSHA_REREPLICATION_MAX_PER_CYCLE:-4}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn0-raft:/raft]
   cn1:
@@ -92,6 +95,9 @@ services:
       - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
       - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
       - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
+      - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
+      - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
+      - --rereplication-max-per-cycle=${DFSHA_REREPLICATION_MAX_PER_CYCLE:-4}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn1-raft:/raft]
   cn2:
@@ -111,6 +117,9 @@ services:
       - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
       - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
       - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
+      - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
+      - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
+      - --rereplication-max-per-cycle=${DFSHA_REREPLICATION_MAX_PER_CYCLE:-4}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn2-raft:/raft]
 

@@ -122,17 +122,41 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         if not self._raft._isLeader():
             context.abort(grpc.StatusCode.UNAVAILABLE, "este ControlNode no es el líder")
 
+    def _is_leader_raw(self) -> bool:
+        """Consulta de liderazgo utilizable por hilos internos sin contexto gRPC."""
+        return self._raft._isLeader()
+
+    def _read_barrier_raw(self) -> bool:
+        """Barrera linealizable para trabajo interno del líder, sin ServicerContext."""
+        if not self._is_leader_raw():
+            return False
+        try:
+            self._replicated.read_barrier(sync=True, timeout=self._commit_timeout_s)
+        except SyncObjException:
+            return False
+        return True
+
     def _read_barrier(self, context: grpc.ServicerContext) -> None:
         """Antes de leer el árbol local: confirmar por Raft que este nodo sigue
         siendo líder y que ya aplicó todo lo confirmado (ver ReplicatedTree.read_barrier)."""
         self._require_leader(context)
+        if not self._read_barrier_raw():
+            context.abort(grpc.StatusCode.UNAVAILABLE, "no se pudo confirmar el liderazgo para leer")
+
+    def _commit_raw(self, op_id: str, method: str, *args) -> tuple:
+        """Commit interno estructurado, sin ``grpc.ServicerContext``.
+
+        ``unknown`` conserva el op_id para que el re-replicador pueda reintentar un
+        resultado que pudo haberse confirmado después del timeout.
+        """
+        if not self._is_leader_raw():
+            return ("unavailable", "este ControlNode no es el líder")
         try:
-            self._replicated.read_barrier(sync=True, timeout=self._commit_timeout_s)
-        except SyncObjException as exc:
-            context.abort(
-                grpc.StatusCode.UNAVAILABLE,
-                f"no se pudo confirmar el liderazgo para leer ({exc})",
+            return self._replicated.apply(
+                op_id, method, args, sync=True, timeout=self._commit_timeout_s
             )
+        except SyncObjException as exc:
+            return ("unknown", str(exc))
 
     def _commit(self, context: grpc.ServicerContext, op_id: str, method: str, *args):
         """Replica una mutación por Raft y devuelve su resultado, o lanza la misma
@@ -142,16 +166,11 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             # mkdir recibiría la respuesta del primero. Se rechaza, nunca se inventa.
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "falta op_id")
         self._require_leader(context)
-        try:
-            outcome = self._replicated.apply(
-                op_id, method, args, sync=True, timeout=self._commit_timeout_s
-            )
-        except SyncObjException as exc:
-            # Resultado DESCONOCIDO: la entrada puede confirmarse igual después. El
-            # cliente reintenta con el mismo op_id y la deduplicación lo vuelve seguro.
+        outcome = self._commit_raw(op_id, method, *args)
+        if outcome[0] in {"unknown", "unavailable"}:
             context.abort(
                 grpc.StatusCode.UNAVAILABLE,
-                f"no se pudo confirmar en el clúster ({exc}); reintentar con el mismo op_id",
+                f"no se pudo confirmar en el clúster ({outcome[1]}); reintentar con el mismo op_id",
             )
         if outcome[0] == "error":
             _, class_name, message = outcome

@@ -166,3 +166,42 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
         except BlockNotFoundError as exc:
             _abort_on_domain_error(context, exc)
         return data_node_pb2.DeleteBlockResponse()
+
+    def ReplicateBlock(self, request, context):
+        """Copia un bloque verificado hacia un único destino interno."""
+        try:
+            block_store.validate_block_id(request.block_id)
+            local_chunks = block_store.read_block(self._root, request.block_id, CHUNK_SIZE_BYTES)
+            # read_block es un generador: verifica existencia y checksum en el primer
+            # next(). Hay que forzarlo ACÁ, antes de abrir el stream al destino. Si no,
+            # el error salta dentro del iterador de gRPC y un origen corrupto o sin el
+            # bloque responde UNAVAILABLE ("Exception iterating requests!"), como si el
+            # nodo estuviera caído, y el re-replicador insiste con el mismo origen.
+            first_chunk = next(local_chunks, None)
+
+            def chunks():
+                yield data_node_pb2.WriteBlockChunk(
+                    header=data_node_pb2.WriteBlockHeader(block_id=request.block_id)
+                )
+                if first_chunk is not None:
+                    yield data_node_pb2.WriteBlockChunk(data=first_chunk)
+                for chunk in local_chunks:
+                    yield data_node_pb2.WriteBlockChunk(data=chunk)
+
+            # C3 agregará aquí la capability administrativa y la capability del
+            # bloque destinada a ``request.target``.
+            response = self._peer_stub(request.target).WriteBlock(
+                chunks(), timeout=context.time_remaining()
+            )
+        except (BlockNotFoundError, BlockCorruptedError) as exc:
+            _abort_on_domain_error(context, exc)
+            return data_node_pb2.ReplicateBlockResponse()
+        except grpc.RpcError as exc:
+            context.abort(
+                exc.code() if exc.code() in {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED} else grpc.StatusCode.UNAVAILABLE,
+                f"no se pudo replicar hacia {request.target}: {exc.details()}",
+            )
+            return data_node_pb2.ReplicateBlockResponse()
+        return data_node_pb2.ReplicateBlockResponse(
+            checksum=response.checksum, bytes_written=response.bytes_written
+        )

@@ -111,12 +111,9 @@ python -m dfsha.client.distributed_shell_main \
   --control-nodes localhost:50051,localhost:50052,localhost:50053
 ```
 
-`--replication-factor` (default 3) controla cuántas réplicas intenta el pipeline. `--min-write-replicas` (default 2) controla cuántas copias vivas debe confirmar una subida: con al menos ese mínimo, el bloque puede quedar sub-replicado hasta que A2 reponga las copias. Cada ControlNode sondea los DataNodes con `--heartbeat-interval-s` (2 s) y los excluye del pipeline después de `--datanode-dead-after-s` (6 s) sin respuesta. Las direcciones configuradas siguen siendo internas.
+`--replication-factor` (default 3) controla cuántas réplicas intenta el pipeline. `--min-write-replicas` (default 2) controla cuántas copias vivas debe confirmar una subida: con al menos ese mínimo, el bloque puede quedar sub-replicado hasta que el re-replicador lo complete. Cada ControlNode sondea los DataNodes con `--heartbeat-interval-s` (2 s) y los excluye del pipeline después de `--datanode-dead-after-s` (6 s) sin respuesta. El re-replicador corre cada `--rereplication-interval-s` (10 s), espera `--rereplication-delay-s` (30 s) antes de copiar y limita cada ciclo con `--rereplication-max-per-cycle` (4). Las direcciones configuradas siguen siendo internas.
 
-**Para ver la replicación funcionando:** subí un archivo con `send`, matá uno
-de los DataNodes y bajalo con `receive` — sigue funcionando, y sigue
-funcionando con dos caídos. Una subida nueva, en cambio, falla mientras haya
-un DataNode caído en su pipeline: la escritura exige las 3 réplicas.
+**Para ver la re-replicación funcionando:** bajá un DataNode, esperá el umbral de liveness y subí un archivo: se confirma con dos copias. Volvé a levantar el nodo: en el siguiente ciclo, `inspect bloques` muestra la tercera réplica. Si en cambio el nodo sigue caído, sus copias se reponen en otro nodo recién cuando lleva más de `--rereplication-delay-s` muerto, para no copiar en cada reinicio. La descarga sigue funcionando durante toda la caída.
 
 **Para ver el clúster de ControlNodes funcionando:** con la shell abierta,
 matá con `kill -9` al ControlNode líder (el que responde; los demás devuelven

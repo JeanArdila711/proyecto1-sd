@@ -170,11 +170,14 @@ def cmd_bloques(args):
     print("  " + "─" * 96)
     for i, b in enumerate(blocks):
         cells = []
+        statuses = []
         for pos, address in enumerate(b.datanode_addresses):
             status = replica_status(address, b.block_id, b.checksum) if not args.sin_verificar else "?"
+            statuses.append(status)
             role = "cabeza" if pos == 0 else f"réplica {pos + 1}"
             cells.append(f"{short(address)}[{role}]={status}")
-        print(f"  b{i:<2}  {b.block_id[:8]:<10} {human(b.size_bytes):>9}   " + "  ".join(cells))
+        lost = "  ← SIN RÉPLICA VIVA" if statuses and not any(status == "ok" for status in statuses) else ""
+        print(f"  b{i:<2}  {b.block_id[:8]:<10} {human(b.size_bytes):>9}   " + "  ".join(cells) + lost)
     print(f"\n  checksum registrado del b0: {blocks[0].checksum}" if blocks else "")
     print()
 

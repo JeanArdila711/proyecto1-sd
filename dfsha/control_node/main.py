@@ -13,6 +13,12 @@ from dfsha.control_node.datanode_monitor import (
     DataNodeMonitor,
 )
 from dfsha.control_node.replicated_tree import ReplicatedTree
+from dfsha.control_node.rereplicator import (
+    DEFAULT_REREPLICATION_DELAY_S,
+    DEFAULT_REREPLICATION_INTERVAL_S,
+    DEFAULT_REREPLICATION_MAX_PER_CYCLE,
+    ReReplicator,
+)
 from dfsha.control_node.servicer import (
     DEFAULT_COMMIT_TIMEOUT_S,
     DEFAULT_MIN_WRITE_REPLICAS,
@@ -76,6 +82,9 @@ def serve(
     commit_timeout_s: float = DEFAULT_COMMIT_TIMEOUT_S,
     upload_lease_s: float = DEFAULT_UPLOAD_LEASE_S,
     lock_lease_s: float = DEFAULT_LOCK_LEASE_S,
+    rereplication_interval_s: float = DEFAULT_REREPLICATION_INTERVAL_S,
+    rereplication_delay_s: float = DEFAULT_REREPLICATION_DELAY_S,
+    rereplication_max_per_cycle: int = DEFAULT_REREPLICATION_MAX_PER_CYCLE,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
     DataNodes, que se detiene junto con el servidor.
@@ -108,11 +117,20 @@ def serve(
         lock_lease_s,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
+    rereplicator = ReReplicator(
+        servicer,
+        monitor,
+        replication_factor=replication_factor,
+        interval_s=rereplication_interval_s,
+        delay_s=rereplication_delay_s,
+        max_per_cycle=rereplication_max_per_cycle,
+    )
     original_stop = server.stop
 
     def stop_with_cleanup(grace):
         termination = original_stop(grace)
         termination.wait()
+        rereplicator.stop()
         monitor.stop()
         servicer.close()
         return termination
@@ -121,8 +139,10 @@ def serve(
     bound_port = server.add_insecure_port(f"{host}:{port}")
     server.start()
     monitor.start()
+    rereplicator.start()
     # Atributos de diagnóstico para pruebas de lifecycle; no son parte del RPC.
     server._dfsha_datanode_monitor = monitor
+    server._dfsha_rereplicator = rereplicator
     server._dfsha_control_servicer = servicer
     return server, bound_port, raft
 
@@ -144,6 +164,9 @@ def main() -> None:
     parser.add_argument("--min-write-replicas", type=int, default=DEFAULT_MIN_WRITE_REPLICAS)
     parser.add_argument("--heartbeat-interval-s", type=float, default=DEFAULT_HEARTBEAT_INTERVAL_S)
     parser.add_argument("--datanode-dead-after-s", type=float, default=DEFAULT_DATANODE_DEAD_AFTER_S)
+    parser.add_argument("--rereplication-interval-s", type=float, default=DEFAULT_REREPLICATION_INTERVAL_S)
+    parser.add_argument("--rereplication-delay-s", type=float, default=DEFAULT_REREPLICATION_DELAY_S)
+    parser.add_argument("--rereplication-max-per-cycle", type=int, default=DEFAULT_REREPLICATION_MAX_PER_CYCLE)
     parser.add_argument(
         "--upload-lease-s",
         type=float,
@@ -184,6 +207,9 @@ def main() -> None:
         min_write_replicas=args.min_write_replicas,
         heartbeat_interval_s=args.heartbeat_interval_s,
         datanode_dead_after_s=args.datanode_dead_after_s,
+        rereplication_interval_s=args.rereplication_interval_s,
+        rereplication_delay_s=args.rereplication_delay_s,
+        rereplication_max_per_cycle=args.rereplication_max_per_cycle,
         upload_lease_s=args.upload_lease_s,
         lock_lease_s=args.lock_lease_s,
     )

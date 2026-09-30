@@ -24,6 +24,7 @@ MUTATIONS = frozenset(
         "acquire_lock",
         "renew_lock",
         "release_lock",
+        "update_block_replicas",
     }
 )
 
