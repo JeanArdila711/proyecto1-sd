@@ -60,6 +60,14 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
             self._channels[address] = grpc.insecure_channel(address)
         return data_node_pb2_grpc.DataNodeServiceStub(self._channels[address])
 
+    def close(self) -> None:
+        for channel in self._channels.values():
+            channel.close()
+        self._forward_pool.shutdown(wait=True, cancel_futures=True)
+
+    def Ping(self, request, context):
+        return data_node_pb2.PingResponse()
+
     def WriteBlock(self, request_iterator, context):
         try:
             first = next(request_iterator)
@@ -101,7 +109,11 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
                 yield data_node_pb2.WriteBlockChunk(data=item)
 
         stub = self._peer_stub(downstream[0])
-        forwarding = self._forward_pool.submit(stub.WriteBlock, forwarded_chunks())
+        # El deadline entrante cubre la transferencia completa; al siguiente salto
+        # solo le queda ese presupuesto, nunca el timeout corto de un RPC de control.
+        forwarding = self._forward_pool.submit(
+            stub.WriteBlock, forwarded_chunks(), timeout=context.time_remaining()
+        )
 
         def tee():
             try:

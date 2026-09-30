@@ -17,7 +17,9 @@ def make_cluster(tmp_path, start_control_node):
     servers = []
     clients = []
 
-    def _make(num_datanodes, replication_factor=3, block_size_bytes=5):
+    def _make(num_datanodes, replication_factor=3, block_size_bytes=5, min_write_replicas=None, **monitor_kwargs):
+        if min_write_replicas is None:
+            min_write_replicas = min(2, num_datanodes)  # D-P2 conserva los fixtures reducidos.
         datanodes = []
         for i in range(num_datanodes):
             root = tmp_path / f"dn{i}"
@@ -29,6 +31,8 @@ def make_cluster(tmp_path, start_control_node):
             [dn["address"] for dn in datanodes],
             block_size_bytes=block_size_bytes,
             replication_factor=replication_factor,
+            min_write_replicas=min_write_replicas,
+            **monitor_kwargs,
         )
         client = DistributedDFShaClient([cn_address])
         clients.append(client)
@@ -115,9 +119,9 @@ def test_download_discards_partial_bytes_when_replica_dies_mid_block(make_cluste
     dying_address = middle.datanode_addresses[0]
 
     class _DyingStub:
-        def ReadBlock(self, request):
+        def ReadBlock(self, request, timeout=None):
             if request.block_id != middle.block_id:
-                yield from real_stub(dying_address).ReadBlock(request)
+                yield from real_stub(dying_address).ReadBlock(request, timeout=timeout)
                 return
             yield data_node_pb2.ReadBlockChunk(data=b"XYZ")
             raise _MidStreamError()
@@ -160,6 +164,8 @@ def test_fewer_datanodes_than_factor_replicates_to_all_available(make_cluster, t
 def test_failed_replica_in_pipeline_aborts_upload(make_cluster, tmp_path):
     client, datanodes = make_cluster(3)
     # el primer bloque de un ControlNode recién arrancado va a dn0 -> dn1 -> dn2
+    # D-P2: el nodo muere después del último sondeo, por eso todavía puede entrar
+    # en este pipeline y la subida debe abortarse sin volver visible el archivo.
     datanodes[1]["server"].stop(grace=None)
 
     with pytest.raises(DFShaError):
@@ -213,3 +219,106 @@ def test_servicer_rejects_invalid_configuration():
         ControlNodeServicer(None, None, [], block_size_bytes=5)
     with pytest.raises(ValueError):
         ControlNodeServicer(None, None, ["localhost:1"], block_size_bytes=5, replication_factor=0)
+
+
+def test_upload_uses_exactly_two_live_replicas_when_one_datanode_is_dead(make_cluster, tmp_path):
+    """D-P2: con tres nodos y uno ya declarado muerto, se confirma con dos."""
+    client, datanodes = make_cluster(
+        3,
+        heartbeat_interval_s=0.01,
+        datanode_dead_after_s=0.04,
+    )
+    dead = datanodes[2]
+    dead["server"].stop(grace=None)
+    import time
+
+    time.sleep(0.12)  # dos o más sondeos: supera el umbral de muerte
+    _upload(client, tmp_path, "/degradado.txt", b"hola")
+
+    [block] = _blocks_of(client, "/degradado.txt")
+    assert len(block.datanode_addresses) == 2
+    assert dead["address"] not in block.datanode_addresses
+    assert {datanodes[0]["address"], datanodes[1]["address"]} == set(block.datanode_addresses)
+    destination = tmp_path / "degradado.descargado"
+    client.download("/degradado.txt", destination)
+    assert destination.read_bytes() == b"hola"
+
+
+def test_upload_below_minimum_live_replicas_is_unavailable_and_invisible(make_cluster, tmp_path):
+    client, datanodes = make_cluster(
+        3,
+        heartbeat_interval_s=0.01,
+        datanode_dead_after_s=0.04,
+    )
+    datanodes[1]["server"].stop(grace=None)
+    datanodes[2]["server"].stop(grace=None)
+    import time
+
+    time.sleep(0.12)
+    stub = __import__("dfsha.generated.control_node_pb2_grpc", fromlist=["ControlNodeServiceStub"]).ControlNodeServiceStub(
+        client._control_channels[client._control_addresses[0]]
+    )
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/invisible.txt", size_bytes=4, op_id=os.urandom(8).hex()))
+    assert exc_info.value.code() == grpc.StatusCode.UNAVAILABLE
+    assert "al menos 2" in exc_info.value.details()
+    assert [entry.name for entry in client.list_dir("/")] == []
+
+
+def test_minimum_write_replica_configuration_fails_fast():
+    with pytest.raises(ValueError, match="min_write_replicas"):
+        ControlNodeServicer(None, None, ["localhost:1"], block_size_bytes=5, min_write_replicas=0)
+    with pytest.raises(ValueError, match="min_write_replicas"):
+        ControlNodeServicer(None, None, ["localhost:1"], block_size_bytes=5, replication_factor=3, min_write_replicas=4)
+    with pytest.raises(ValueError, match="menos que min_write_replicas"):
+        ControlNodeServicer(None, None, ["localhost:1"], block_size_bytes=5, replication_factor=3, min_write_replicas=2)
+
+
+def test_pipeline_forwarding_uses_remaining_incoming_deadline(tmp_path, monkeypatch):
+    """El siguiente DataNode hereda el tiempo restante, no un timeout corto fijo."""
+    from dfsha.data_node.servicer import DataNodeServicer
+
+    class Context:
+        def time_remaining(self):
+            return 7.5
+
+    class Future:
+        def result(self):
+            import hashlib
+
+            return data_node_pb2.WriteBlockResponse(
+                checksum=hashlib.sha256(b"x").hexdigest(), bytes_written=1
+            )
+
+    class ForwardPool:
+        def __init__(self):
+            self.submissions = []
+
+        def submit(self, callable, *args, **kwargs):
+            self.submissions.append((callable, args, kwargs))
+            return Future()
+
+        def shutdown(self, **kwargs):
+            pass
+
+    class Stub:
+        def WriteBlock(self, chunks, timeout):
+            raise AssertionError("el pool simulado no debe ejecutar el forwarding")
+
+    servicer = DataNodeServicer(tmp_path)
+    servicer._forward_pool.shutdown(wait=True, cancel_futures=True)
+    pool = ForwardPool()
+    servicer._forward_pool = pool
+    monkeypatch.setattr(servicer, "_peer_stub", lambda _: Stub())
+    try:
+        response = servicer._write_and_forward(
+            iter([data_node_pb2.WriteBlockChunk(data=b"x")]),
+            Context(),
+            "1234567890abcdef1234567890abcdef",
+            ["next:50061"],
+        )
+    finally:
+        servicer.close()
+
+    assert response.bytes_written == 1
+    assert pool.submissions[0][2]["timeout"] == 7.5

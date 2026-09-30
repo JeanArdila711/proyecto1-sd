@@ -17,7 +17,8 @@ def cluster(tmp_path, start_control_node):
     dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
     datanode_address = f"localhost:{dn_port}"
 
-    channel = grpc.insecure_channel(start_control_node([datanode_address], block_size_bytes=5))
+    # D-P2: las pruebas históricas de un único DataNode optan por mínimo 1.
+    channel = grpc.insecure_channel(start_control_node([datanode_address], block_size_bytes=5, min_write_replicas=1))
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
 
     yield stub, datanode_address
@@ -127,7 +128,7 @@ def test_abandoned_upload_frees_the_name_after_lease_and_deletes_its_blocks(tmp_
 
     dn_server, dn_port = serve_data_node(tmp_path / "dn", "localhost", 0)
     datanode = f"localhost:{dn_port}"
-    channel = grpc.insecure_channel(start_control_node([datanode], block_size_bytes=5, upload_lease_s=0.5))
+    channel = grpc.insecure_channel(start_control_node([datanode], block_size_bytes=5, upload_lease_s=0.5, min_write_replicas=1))
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
     dn_stub = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(datanode))
     try:

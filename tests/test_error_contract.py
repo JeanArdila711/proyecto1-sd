@@ -80,8 +80,9 @@ class ReadStub:
         self.chunks = chunks
         self.calls = 0
 
-    def ReadBlock(self, request):
+    def ReadBlock(self, request, timeout=None):
         self.calls += 1
+        self.timeout = timeout
         if self.error is not None:
             raise self.error
         return iter(data_node_pb2.ReadBlockChunk(data=data) for data in self.chunks)
@@ -128,7 +129,7 @@ def hito1_stub(tmp_path):
 
 @pytest.fixture
 def control_stub(tmp_path, start_control_node):
-    address = start_control_node(["localhost:1"], block_size_bytes=5)
+    address = start_control_node(["localhost:1"], block_size_bytes=5, min_write_replicas=1)
     channel = grpc.insecure_channel(address)
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
     try:

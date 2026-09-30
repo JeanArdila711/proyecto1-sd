@@ -70,6 +70,9 @@ services:
       - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
       - --block-size-mb=${DFSHA_BLOCK_MB:-128}
       - --replication-factor=${DFSHA_REPLICATION:-3}
+      - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
+      - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
+      - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn0-raft:/raft]
   cn1:
@@ -86,6 +89,9 @@ services:
       - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
       - --block-size-mb=${DFSHA_BLOCK_MB:-128}
       - --replication-factor=${DFSHA_REPLICATION:-3}
+      - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
+      - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
+      - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn1-raft:/raft]
   cn2:
@@ -102,6 +108,9 @@ services:
       - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
       - --block-size-mb=${DFSHA_BLOCK_MB:-128}
       - --replication-factor=${DFSHA_REPLICATION:-3}
+      - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
+      - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
+      - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
     volumes: [cn2-raft:/raft]
 
@@ -134,7 +143,6 @@ services:
 
 networks:
   dfsha:
-    name: dfsha
 
 volumes:
   dn1-data:

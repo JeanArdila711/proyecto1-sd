@@ -109,8 +109,7 @@ python -m dfsha.client.distributed_shell_main \
   --control-nodes localhost:50051,localhost:50052,localhost:50053
 ```
 
-`--replication-factor` (default 3) controla cuántas réplicas tiene cada
-bloque. Con menos DataNodes que el factor, se replica en todos los que haya.
+`--replication-factor` (default 3) controla cuántas réplicas intenta el pipeline. `--min-write-replicas` (default 2) controla cuántas copias vivas debe confirmar una subida: con al menos ese mínimo, el bloque puede quedar sub-replicado hasta que A2 reponga las copias. Cada ControlNode sondea los DataNodes con `--heartbeat-interval-s` (2 s) y los excluye del pipeline después de `--datanode-dead-after-s` (6 s) sin respuesta. Las direcciones configuradas siguen siendo internas.
 
 **Para ver la replicación funcionando:** subí un archivo con `send`, matá uno
 de los DataNodes y bajalo con `receive` — sigue funcionando, y sigue

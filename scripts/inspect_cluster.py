@@ -134,11 +134,10 @@ def cmd_estado(args):
     for i, address in enumerate(dns):
         stub = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(address))
         try:
-            # un block_id válido que no existe: si responde NOT_FOUND, el nodo está vivo
-            list(stub.ReadBlock(data_node_pb2.ReadBlockRequest(block_id="0" * 32), timeout=3))
+            stub.Ping(data_node_pb2.PingRequest(), timeout=3)
             state = "vivo"
-        except grpc.RpcError as exc:
-            state = "vivo" if exc.code() == grpc.StatusCode.NOT_FOUND else "CAÍDO"
+        except grpc.RpcError:
+            state = "CAÍDO"
         print(f"    dn{i + 1}  {address:<22} {state}")
     print()
 

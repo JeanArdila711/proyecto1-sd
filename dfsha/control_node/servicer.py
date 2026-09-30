@@ -19,10 +19,12 @@ from dfsha.common.exceptions import (
     PathExistsError,
     PathNotFoundError,
 )
+from dfsha.control_node.datanode_monitor import DataNodeMonitor
 from dfsha.control_node.replicated_tree import ReplicatedTree
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
 DEFAULT_REPLICATION_FACTOR = 3
+DEFAULT_MIN_WRITE_REPLICAS = 2
 
 # Cuánto espera el líder a que una mutación quede confirmada por la mayoría. Tiene
 # que ser menor que el timeout por intento del cliente, para que el servidor alcance
@@ -33,6 +35,7 @@ DEFAULT_COMMIT_TIMEOUT_S = 3.0
 # libre para otro BeginUpload. Tiene que cubrir la escritura de UN bloque completo
 # (128 MB por un enlace lento) más un failover de líder; se renueva con cada ConfirmBlock.
 DEFAULT_UPLOAD_LEASE_S = 600.0
+DEFAULT_DATA_PLANE_TIMEOUT_S = 5.0
 
 _ERROR_STATUS_MAP = {
     PathNotFoundError: grpc.StatusCode.NOT_FOUND,
@@ -45,6 +48,11 @@ _ERROR_STATUS_MAP = {
     AccessDeniedError: grpc.StatusCode.PERMISSION_DENIED,
     AuthError: grpc.StatusCode.UNAUTHENTICATED,
 }
+
+
+class InsufficientLiveDataNodes(Exception):
+    def __init__(self, available: int, minimum: int) -> None:
+        super().__init__(f"solo hay {available} DataNodes vivos; se requieren al menos {minimum}")
 
 
 def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> None:
@@ -63,11 +71,22 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         replication_factor: int = DEFAULT_REPLICATION_FACTOR,
         commit_timeout_s: float = DEFAULT_COMMIT_TIMEOUT_S,
         upload_lease_s: float = DEFAULT_UPLOAD_LEASE_S,
+        min_write_replicas: int = DEFAULT_MIN_WRITE_REPLICAS,
+        datanode_monitor: DataNodeMonitor | None = None,
     ) -> None:
         if not datanode_addresses:
             raise ValueError("hace falta al menos un DataNode")
         if replication_factor < 1:
             raise ValueError(f"el factor de replicación debe ser >= 1, no {replication_factor}")
+        if not 1 <= min_write_replicas <= replication_factor:
+            raise ValueError(
+                "min_write_replicas debe estar entre 1 y replication_factor "
+                f"({replication_factor}), no {min_write_replicas}"
+            )
+        if len(datanode_addresses) < min_write_replicas:
+            raise ValueError(
+                f"se configuraron {len(datanode_addresses)} DataNodes, menos que min_write_replicas={min_write_replicas}"
+            )
         self._raft = raft
         # nunca guardar replicated.tree: un snapshot restaurado lo reemplaza entero
         self._replicated = replicated
@@ -75,11 +94,16 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         self._upload_lease_s = upload_lease_s
         self._datanode_addresses = list(datanode_addresses)
         self._block_size_bytes = block_size_bytes
-        # con menos DataNodes que el factor pedido, se replica en todos los que haya
-        self._replication_factor = min(replication_factor, len(self._datanode_addresses))
+        self._replication_factor = replication_factor
+        self._min_write_replicas = min_write_replicas
+        self._monitor = datanode_monitor
         self._next_offset = 0
         self._offset_lock = threading.Lock()
         self._channels: dict[str, grpc.Channel] = {}
+
+    def close(self) -> None:
+        for channel in self._channels.values():
+            channel.close()
 
     def _datanode_stub(self, address: str):
         if address not in self._channels:
@@ -129,16 +153,20 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         return outcome[1]
 
     def _pick_replicas(self) -> list[str]:
-        """Round-robin: cada bloque arranca un nodo más adelante que el anterior, así
-        los bloques de un archivo se reparten en vez de apilarse en los mismos 3.
+        """Round-robin entre los DataNodes vivos: cada bloque arranca un nodo más
+        adelante que el anterior, así los bloques de un archivo se reparten en vez
+        de apilarse en los mismos nodos.
 
         Es estado local del líder, no replicado: tras un failover el offset vuelve a
         0, lo que solo cambia el reparto, no la corrección."""
-        total = len(self._datanode_addresses)
+        alive = self._monitor.alive_addresses() if self._monitor is not None else self._datanode_addresses
+        if len(alive) < self._min_write_replicas:
+            raise InsufficientLiveDataNodes(len(alive), self._min_write_replicas)
+        count = min(self._replication_factor, len(alive))
         with self._offset_lock:
             start = self._next_offset
-            self._next_offset = (start + 1) % total
-        return [self._datanode_addresses[(start + i) % total] for i in range(self._replication_factor)]
+            self._next_offset = (start + 1) % len(alive)
+        return [alive[(start + i) % len(alive)] for i in range(count)]
 
     def ListDir(self, request, context):
         self._read_barrier(context)
@@ -185,7 +213,8 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             for address in block.datanode_addresses:
                 try:
                     self._datanode_stub(address).DeleteBlock(
-                        data_node_pb2.DeleteBlockRequest(block_id=block.block_id)
+                        data_node_pb2.DeleteBlockRequest(block_id=block.block_id),
+                        timeout=DEFAULT_DATA_PLANE_TIMEOUT_S,
                     )
                 except grpc.RpcError:
                     # best-effort: la metadata ya se borró, un bloque físico que falle
@@ -198,7 +227,11 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             return control_node_pb2.BeginUploadResponse()
 
         num_blocks = -(-request.size_bytes // self._block_size_bytes)  # división hacia arriba
-        proposed = [(uuid.uuid4().hex, self._pick_replicas()) for _ in range(num_blocks)]
+        try:
+            proposed = [(uuid.uuid4().hex, self._pick_replicas()) for _ in range(num_blocks)]
+        except InsufficientLiveDataNodes as exc:
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+            return control_node_pb2.BeginUploadResponse()
         try:
             # La respuesta se arma con lo que DEVUELVE el commit, no con `proposed`: si
             # este op_id ya se había confirmado (reintento tras un failover), el

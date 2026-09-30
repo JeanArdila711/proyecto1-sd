@@ -104,10 +104,11 @@ docker compose kill cn0 cn1
 docker compose start cn0 cn1
 ```
 
-**Réplica caída al subir** — la subida de un archivo de varios bloques falla, porque toda escritura exige todas sus réplicas:
+**Subida con un DataNode caído** — esperá al menos 6 s tras la caída para que el sondeo pull lo declare muerto. Con los defaults (factor 3, mínimo 2), `send` confirma dos réplicas y el archivo queda sub-replicado; si quedan menos de dos nodos vivos responde `UNAVAILABLE` y no hace visible el archivo:
 
 ```bash
 docker compose kill dn3
+sleep 7
 # en la shell: send /intercambio/tesis.pdf /docs/otro.pdf
 docker compose start dn3
 ```
@@ -139,7 +140,10 @@ Los parámetros están en `.env`. Después de cambiarlos: `docker compose up -d`
 | Variable | Normal | Para la demo | Efecto |
 |---|---|---|---|
 | `DFSHA_BLOCK_MB` | 128 | 1 | Tamaño de bloque. Con 1, un archivo de pocos MB se parte en varios bloques |
-| `DFSHA_REPLICATION` | 3 | 2 | Réplicas por bloque. Con 3 réplicas y 3 DataNodes, cada nodo guarda todos los bloques |
+| `DFSHA_REPLICATION` | 3 | 2 | Réplicas objetivo por bloque |
+| `DFSHA_MIN_WRITE_REPLICAS` | 2 | 2 | Copias vivas mínimas para confirmar una subida; debe estar entre 1 y el factor |
+| `DFSHA_HEARTBEAT_INTERVAL_S` | 2 | 0.5 | Período de sondeo `Ping` de cada ControlNode |
+| `DFSHA_DATANODE_DEAD_AFTER_S` | 6 | 2 | Sin respuesta acumulada antes de excluir un DataNode del pipeline |
 | `DFSHA_UPLOAD_LEASE_S` | 600 | 15 | Segundos hasta liberar una subida abandonada |
 
 ---

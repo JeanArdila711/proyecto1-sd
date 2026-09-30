@@ -173,3 +173,11 @@ python -m pytest tests/ -v
 
 - `NOT_FOUND` sin `dfsha-error` o con un tipo desconocido no activa failover: se relanza el error y no se consulta la siguiente réplica.
 - Verificado con 202 pruebas en verde (`python -m pytest tests/ -q`).
+
+
+## Hito 3 — A1: liveness de DataNodes y pipeline degradado
+
+- Cada ControlNode sondea `Ping` localmente y excluye del pipeline las direcciones internas que no responden durante `--datanode-dead-after-s`; el estado de liveness no se replica por Raft.
+- Las subidas requieren `--min-write-replicas` (2 por defecto), no necesariamente el factor completo. Con menos del mínimo responden `UNAVAILABLE` antes de reservar metadata; con el mínimo, el bloque queda sub-replicado para la reposición de A2.
+- Los monitores, sus canales y los recursos de forwarding se cierran al detener los servidores; el cliente y los RPC del plano de datos usan deadlines explícitos.
+- Corrección de revisión: `ReadBlock` y `WriteBlock` calculan su deadline por bloque (`base + tamaño/throughput mínimo`, 1 MiB/s por defecto); el forwarding conserva el tiempo restante del deadline entrante, evitando cortar streams activos con el timeout corto de ControlNode.

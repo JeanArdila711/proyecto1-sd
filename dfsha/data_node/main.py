@@ -13,7 +13,17 @@ from dfsha.generated import data_node_pb2_grpc
 def serve(root: Path, host: str, port: int) -> tuple[grpc.Server, int]:
     root.mkdir(parents=True, exist_ok=True)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    data_node_pb2_grpc.add_DataNodeServiceServicer_to_server(DataNodeServicer(root), server)
+    servicer = DataNodeServicer(root)
+    data_node_pb2_grpc.add_DataNodeServiceServicer_to_server(servicer, server)
+    original_stop = server.stop
+
+    def stop_with_cleanup(grace):
+        termination = original_stop(grace)
+        termination.wait()
+        servicer.close()
+        return termination
+
+    server.stop = stop_with_cleanup
     bound_port = server.add_insecure_port(f"{host}:{port}")
     server.start()
     return server, bound_port
@@ -30,7 +40,10 @@ def main() -> None:
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")
     print(f"DataNode escuchando en {args.host}:{bound_port}, raíz={args.root}")
-    server.wait_for_termination()
+    try:
+        server.wait_for_termination()
+    finally:
+        server.stop(grace=1).wait()
 
 
 if __name__ == "__main__":

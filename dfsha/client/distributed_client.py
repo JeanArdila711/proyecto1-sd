@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 import uuid
 from pathlib import Path
@@ -33,6 +34,12 @@ DEFAULT_RPC_TIMEOUT_S = 5.0
 # Una elección tarda entre 0.4 y 1.4 s con los defaults de Raft; esto deja margen.
 DEFAULT_FAILOVER_BUDGET_S = 15.0
 _RETRY_BACKOFF_S = 0.2
+_MAX_RETRY_BACKOFF_S = 2.0
+
+# El deadline de un bloque cubre todo el stream. El piso de 1 MiB/s deja margen
+# para un bloque de 128 MiB en enlaces lentos sin relajar los RPC cortos de control.
+DEFAULT_BLOCK_TRANSFER_BASE_TIMEOUT_S = 5.0
+DEFAULT_MIN_TRANSFER_THROUGHPUT_BYTES_PER_S = 1024 * 1024
 
 # "Este nodo no puede atender ahora, probá otro": un follower (UNAVAILABLE), un nodo
 # caído (UNAVAILABLE) o uno que no respondió a tiempo (DEADLINE_EXCEEDED). Reintentar
@@ -111,6 +118,12 @@ def _is_recoverable_read_error(rpc_error: grpc.RpcError) -> bool:
     )
 
 
+def _retry_delay(attempt: int) -> float:
+    """Backoff exponencial con jitter para requests de control idempotentes."""
+    base = min(_RETRY_BACKOFF_S * (2**attempt), _MAX_RETRY_BACKOFF_S)
+    return base * random.uniform(0.5, 1.5)
+
+
 def _new_op_id() -> str:
     return uuid.uuid4().hex
 
@@ -121,17 +134,28 @@ class DistributedDFShaClient:
         control_node_addresses: list[str],
         rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
         failover_budget_s: float = DEFAULT_FAILOVER_BUDGET_S,
+        transfer_base_timeout_s: float = DEFAULT_BLOCK_TRANSFER_BASE_TIMEOUT_S,
+        minimum_transfer_throughput_bytes_per_s: float = DEFAULT_MIN_TRANSFER_THROUGHPUT_BYTES_PER_S,
     ) -> None:
         if isinstance(control_node_addresses, str):
             # un str se iteraría letra por letra como si fueran direcciones
             raise TypeError("control_node_addresses debe ser una lista de host:port")
         if not control_node_addresses:
             raise ValueError("hace falta al menos un ControlNode")
+        if (
+            rpc_timeout_s <= 0
+            or failover_budget_s <= 0
+            or transfer_base_timeout_s <= 0
+            or minimum_transfer_throughput_bytes_per_s <= 0
+        ):
+            raise ValueError("los timeouts y throughput del cliente deben ser mayores que cero")
         self._control_addresses = list(control_node_addresses)
         self._control_channels = {a: grpc.insecure_channel(a) for a in self._control_addresses}
         self._leader_index = 0  # último nodo que respondió: el líder más probable
         self._rpc_timeout_s = rpc_timeout_s
         self._failover_budget_s = failover_budget_s
+        self._transfer_base_timeout_s = transfer_base_timeout_s
+        self._minimum_transfer_throughput_bytes_per_s = minimum_transfer_throughput_bytes_per_s
         self._datanode_channels: dict[str, grpc.Channel] = {}
 
     def close(self) -> None:
@@ -148,6 +172,7 @@ class DistributedDFShaClient:
         deadline = time.monotonic() + self._failover_budget_s
         total = len(self._control_addresses)
         last_error: grpc.RpcError | None = None
+        attempt = 0
         while True:
             for offset in range(total):
                 index = (self._leader_index + offset) % total
@@ -167,12 +192,18 @@ class DistributedDFShaClient:
             # total * rpc_timeout_s. Suficiente para un clúster de 3.
             if time.monotonic() >= deadline:
                 raise _translate(last_error) from last_error
-            time.sleep(_RETRY_BACKOFF_S)
+            time.sleep(min(_retry_delay(attempt), max(0.0, deadline - time.monotonic())))
+            attempt += 1
 
     def _datanode_stub(self, address: str):
         if address not in self._datanode_channels:
             self._datanode_channels[address] = grpc.insecure_channel(address)
         return data_node_pb2_grpc.DataNodeServiceStub(self._datanode_channels[address])
+
+    def _block_transfer_timeout(self, size_bytes: int) -> float:
+        return self._transfer_base_timeout_s + (
+            size_bytes / self._minimum_transfer_throughput_bytes_per_s
+        )
 
     def list_dir(self, path: str):
         response = self._call("ListDir", control_node_pb2.ListDirRequest(path=path))
@@ -258,7 +289,9 @@ class DistributedDFShaClient:
         for address in block.datanode_addresses:
             try:
                 request = data_node_pb2.ReadBlockRequest(block_id=block.block_id)
-                for chunk in self._datanode_stub(address).ReadBlock(request):
+                for chunk in self._datanode_stub(address).ReadBlock(
+                    request, timeout=self._block_transfer_timeout(getattr(block, "size_bytes", 0))
+                ):
                     fh.write(chunk.data)
                 return fh.tell() - start
             except grpc.RpcError as exc:
@@ -294,5 +327,7 @@ class DistributedDFShaClient:
         # el cliente sube una sola copia, al primero del pipeline; los DataNodes
         # se encargan de encadenar las réplicas restantes
         stub = self._datanode_stub(block.datanode_addresses[0])
-        response = stub.WriteBlock(chunks())
+        response = stub.WriteBlock(
+            chunks(), timeout=self._block_transfer_timeout(block.size_bytes)
+        )
         return response.checksum, response.bytes_written

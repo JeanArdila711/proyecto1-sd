@@ -323,3 +323,10 @@ Los errores de forma del protocolo que no nacen de una excepción de dominio (po
 | `DeleteBlock` | `BlockNotFoundError` → `NOT_FOUND` |
 
 `ConflictError` → `ABORTED`, `AccessDeniedError` → `PERMISSION_DENIED` y `AuthError` → `UNAUTHENTICATED` quedan registrados en los tres traductores de dominio para los RPC de locks, permisos y autenticación que los introduzcan en Hito 3. En lectura de bloques, el cliente solo prueba la siguiente réplica ante `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` cuya metadata sea exactamente `BlockNotFoundError`; cualquier error permanente falla de inmediato.
+
+
+## 12. Actualización Hito 3 A1 — liveness y escritura degradada
+
+`DataNodeService` añade `Ping(PingRequest) → PingResponse`, un RPC unario idempotente sin datos de aplicación. Cada ControlNode lo invoca contra las direcciones **internas** configuradas, con deadline corto, cada `--heartbeat-interval-s`; tras `--datanode-dead-after-s` sin respuesta, la dirección se excluye solo de la vista local de ese ControlNode. No se replica por Raft ni se anuncia al cliente.
+
+`BeginUpload` arma cada pipeline únicamente con los DataNodes que su monitor local ve vivos. Selecciona `min(replication_factor, vivos)` direcciones internas con round-robin. Si hay menos de `--min-write-replicas` (default 2), devuelve `UNAVAILABLE` antes de crear la subida; con el mínimo pero menos que el factor, confirma el bloque sub-replicado. Los RPC de datos `Ping`, `ReadBlock`, `WriteBlock`, `DeleteBlock` y el forwarding usan deadlines explícitos. Solo los pasos idempotentes se reintentan con backoff exponencial y jitter; `WriteBlock` no se reintenta tras haber empezado su stream.
