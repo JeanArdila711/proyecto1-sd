@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -128,6 +129,36 @@ def _new_op_id() -> str:
     return uuid.uuid4().hex
 
 
+def _canonical_lock_path(path: str) -> str:
+    """Replica la clave de locks del ControlTree sin aceptar ``..`` como válido."""
+    return "/" + "/".join(part for part in path.strip("/").split("/") if part)
+
+
+class LeaseLock:
+    """Handle local de un lock durable; B3 puede reutilizarlo como FileHandle."""
+
+    def __init__(self, client: "DistributedDFShaClient", path: str, mode: str, lock_id: str, lease_s: float):
+        self._client = client
+        self.path = path
+        self.mode = mode
+        self.lock_id = lock_id
+        self.lease_s = lease_s
+        self.lost = False
+        self.released = False
+
+    def renew(self) -> None:
+        if self.released:
+            return
+        self._client._renew_held_lock(self)
+
+    def release(self) -> None:
+        if not self.released:
+            self._client._release_held_lock(self)
+
+    def close(self) -> None:
+        self.release()
+
+
 class DistributedDFShaClient:
     def __init__(
         self,
@@ -157,8 +188,20 @@ class DistributedDFShaClient:
         self._transfer_base_timeout_s = transfer_base_timeout_s
         self._minimum_transfer_throughput_bytes_per_s = minimum_transfer_throughput_bytes_per_s
         self._datanode_channels: dict[str, grpc.Channel] = {}
+        self._held_locks: dict[str, LeaseLock] = {}
+        self._locks_guard = threading.RLock()
+        self._lock_renewal_stop = threading.Event()
+        self._lock_renewal_thread: threading.Thread | None = None
 
     def close(self) -> None:
+        # Libera primero los leases para no dejar esperar al siguiente cliente; si la
+        # red ya cayó, el vencimiento del servidor conserva la propiedad de liveness.
+        for held in self.locks():
+            try:
+                held.release()
+            except DFShaError:
+                pass
+        self._stop_lock_renewer()
         for channel in self._control_channels.values():
             channel.close()
         for channel in self._datanode_channels.values():
@@ -218,6 +261,115 @@ class DistributedDFShaClient:
     def remove(self, path: str) -> None:
         self._call("Remove", control_node_pb2.RemoveRequest(path=path, op_id=_new_op_id()))
 
+    def lock(self, path: str, mode: str) -> LeaseLock:
+        if mode not in {"r", "w"}:
+            raise InvalidPathError(f"modo de lock inválido: {mode!r}")
+        canonical_path = _canonical_lock_path(path)
+        response = self._call(
+            "Lock", control_node_pb2.LockRequest(path=canonical_path, mode=mode, op_id=_new_op_id())
+        )
+        held = LeaseLock(self, canonical_path, mode, response.lock_id, response.lease_s)
+        with self._locks_guard:
+            self._held_locks[held.lock_id] = held
+        self._start_lock_renewer()
+        return held
+
+    def open(self, path: str, mode: str) -> LeaseLock:
+        """Interfaz compatible con B3: por ahora el handle solo gestiona el lock."""
+        return self.lock(path, mode)
+
+    def locks(self) -> list[LeaseLock]:
+        with self._locks_guard:
+            return list(self._held_locks.values())
+
+    def unlock(self, path: str) -> None:
+        canonical_path = _canonical_lock_path(path)
+        for held in reversed(self.locks()):
+            if held.path == canonical_path and not held.released:
+                held.release()
+                return
+        raise ConflictError(f"no hay lock propio para: {canonical_path}")
+
+    def _forget_held_lock(self, held: LeaseLock, *, lost: bool = False) -> None:
+        """Quita un lease local y detiene el renovador si era el último."""
+        with self._locks_guard:
+            held.lost = held.lost or lost
+            self._held_locks.pop(held.lock_id, None)
+            empty = not self._held_locks
+        if empty:
+            self._stop_lock_renewer()
+
+    def _renew_held_lock(self, held: LeaseLock) -> None:
+        if held.lost or held.released:
+            return
+        try:
+            self._call(
+                "RenewLock",
+                control_node_pb2.RenewLockRequest(
+                    path=held.path, lock_id=held.lock_id, op_id=_new_op_id()
+                ),
+            )
+        except ConflictError:
+            # El servidor ya depuró el holder vencido: no mantener un handle que
+            # aparenta proteger la lectura ni dejar vivo el hilo renovador.
+            self._forget_held_lock(held, lost=True)
+            raise
+
+    def _release_held_lock(self, held: LeaseLock) -> None:
+        if held.released:
+            return
+        try:
+            if not held.lost:
+                self._call(
+                    "Unlock",
+                    control_node_pb2.UnlockRequest(
+                        path=held.path, lock_id=held.lock_id, op_id=_new_op_id()
+                    ),
+                )
+        except ConflictError:
+            # Puede vencer entre la última renovación y Unlock. La limpieza local
+            # sigue siendo correcta e idempotente para un handle propio.
+            held.lost = True
+        finally:
+            held.released = True
+            self._forget_held_lock(held)
+
+    def _start_lock_renewer(self) -> None:
+        with self._locks_guard:
+            if self._lock_renewal_thread is not None and self._lock_renewal_thread.is_alive():
+                return
+            self._lock_renewal_stop = threading.Event()
+            self._lock_renewal_thread = threading.Thread(
+                target=self._renew_locks_until_stopped, name="dfsha-lock-renewer", daemon=True
+            )
+            self._lock_renewal_thread.start()
+
+    def _stop_lock_renewer(self) -> None:
+        with self._locks_guard:
+            thread = self._lock_renewal_thread
+            self._lock_renewal_stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._locks_guard:
+            if self._lock_renewal_thread is thread:
+                self._lock_renewal_thread = None
+
+    def _renew_locks_until_stopped(self) -> None:
+        while True:
+            with self._locks_guard:
+                held = list(self._held_locks.values())
+                stop_event = self._lock_renewal_stop
+            if not held or stop_event.wait(min(lock.lease_s for lock in held) / 3):
+                return
+            for lock in held:
+                try:
+                    lock.renew()
+                except DFShaError:
+                    # Una renovación puede cruzar un failover; _call ya reintenta.
+                    # Si el lease finalmente venció, la siguiente operación expone el
+                    # conflicto al usuario sin dejar morir este hilo ni filtrar recursos.
+                    pass
+
     def upload(self, local_path: Path, remote_path: str) -> int:
         if not local_path.is_file():
             raise NotAFileError(f"no existe o no es un archivo: {local_path}")
@@ -265,11 +417,13 @@ class DistributedDFShaClient:
         return total_written
 
     def download(self, remote_path: str, local_path: Path) -> int:
-        list_response = self._call("ListBlocks", control_node_pb2.ListBlocksRequest(path=remote_path))
-
+        held = self.lock(remote_path, "r")
         tmp_path = local_path.parent / f"{local_path.name}.part-{uuid.uuid4().hex}"
         bytes_written = 0
         try:
+            # La adquisición ocurre antes de ListBlocks y se conserva durante toda
+            # la lectura: un writer/GC no puede publicar/borrar la versión leída.
+            list_response = self._call("ListBlocks", control_node_pb2.ListBlocksRequest(path=remote_path))
             with tmp_path.open("wb") as fh:
                 for block in list_response.blocks:
                     bytes_written += self._read_block_with_failover(block, fh)
@@ -280,6 +434,13 @@ class DistributedDFShaClient:
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
+        finally:
+            try:
+                held.release()
+            except DFShaError:
+                # El resultado de la descarga no cambia por un Unlock tardío o por
+                # una red caída durante la limpieza; el lease la libera después.
+                pass
         return bytes_written
 
     def _read_block_with_failover(self, block, fh) -> int:

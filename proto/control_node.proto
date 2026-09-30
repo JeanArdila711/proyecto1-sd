@@ -12,6 +12,9 @@ service ControlNodeService {
   rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
   rpc AbortUpload(AbortUploadRequest) returns (AbortUploadResponse);
   rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+  rpc Lock(LockRequest) returns (LockResponse);
+  rpc RenewLock(RenewLockRequest) returns (RenewLockResponse);
+  rpc Unlock(UnlockRequest) returns (UnlockResponse);
 }
 
 message ListDirRequest { string path = 1; }
@@ -77,3 +80,16 @@ message BlockInfo {
 }
 
 message ListBlocksResponse { repeated BlockInfo blocks = 1; }
+
+message LockRequest {
+  string path = 1;
+  string mode = 2; // "r" (compartido) o "w" (exclusivo)
+  string op_id = 3;
+}
+message LockResponse { string lock_id = 1; double lease_s = 2; }
+
+message RenewLockRequest { string path = 1; string lock_id = 2; string op_id = 3; }
+message RenewLockResponse {}
+
+message UnlockRequest { string path = 1; string lock_id = 2; string op_id = 3; }
+message UnlockResponse {}

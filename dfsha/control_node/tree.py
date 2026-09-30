@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass, field
 
 from dfsha.common.exceptions import (
+    ConflictError,
     InvalidPathError,
     NotADirectoryError,
     NotAFileError,
@@ -41,6 +42,14 @@ def _lease_expired(node, now: float | None) -> bool:
 
 
 @dataclass
+class LockState:
+    """Estado durable de una ruta bloqueada; las expiraciones las fija el líder."""
+
+    mode: str  # "r" o "w"
+    holders: dict[str, tuple[str, float]] = field(default_factory=dict)
+
+
+@dataclass
 class DirNode:
     children: dict = field(default_factory=dict)  # str -> DirNode | FileNode
 
@@ -58,6 +67,8 @@ class ControlTree:
         # ponytail: un solo lock global sobre el árbol — ops en memoria, ~µs;
         # si algún día hay contención, pasar a locks por subárbol
         self._lock = threading.Lock()
+        # Estado replicado: snapshots anteriores a B1 lo recuperan en __setstate__.
+        self._locks: dict[str, LockState] = {}
 
     # Raft guarda snapshots del árbol con pickle, y un Lock no se puede serializar:
     # se descarta al guardar y se crea uno nuevo al restaurar.
@@ -69,11 +80,18 @@ class ControlTree:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._lock = threading.Lock()
+        # Snapshot pre-Hito 3: falta el atributo fuera de dataclass.
+        if not hasattr(self, "_locks"):
+            self._locks = {}
 
     def _parts(self, virtual_path: str) -> list[str]:
         if ".." in virtual_path.split("/"):
             raise InvalidPathError(f"la ruta contiene '..': {virtual_path!r}")
         return [p for p in virtual_path.strip("/").split("/") if p]
+
+    def _canonical_path(self, virtual_path: str) -> str:
+        """Representación única de una ruta válida para indexar locks."""
+        return "/" + "/".join(self._parts(virtual_path))
 
     def _get_node(self, parts: list[str]):
         if not parts:
@@ -144,11 +162,14 @@ class ControlTree:
                 raise NotEmptyError(f"directorio no vacío: {virtual_path}")
             del parent.children[name]
 
-    def remove_file(self, virtual_path: str) -> list[BlockRecord]:
+    def remove_file(self, virtual_path: str, now: float | None = None) -> list[BlockRecord]:
         """Devuelve los bloques que tenía el archivo, para que el servicer
-        le avise al DataNode que los borre."""
+        le avise al DataNode que los borre.
+
+        ``now`` es opcional para reproducir journals anteriores a B1."""
         with self._lock:
             parts = self._parts(virtual_path)
+            canonical_path = "/" + "/".join(parts)
             if not parts:
                 raise InvalidPathError("no se puede borrar la raíz")
             parent = self._walk_to_parent(parts[:-1])
@@ -161,8 +182,96 @@ class ControlTree:
             if node.state != "committed":
                 # una subida pendiente es invisible (igual que en list_dir/list_blocks)
                 raise PathNotFoundError(f"no existe: {virtual_path}")
+            self._cleanup_expired_locks(canonical_path, now)
+            if canonical_path in self._locks:
+                raise ConflictError(f"el archivo tiene locks vigentes: {virtual_path}")
             del parent.children[name]
             return node.blocks
+
+    def _cleanup_expired_locks(self, canonical_path: str, now: float | None) -> None:
+        """Elimina holders vencidos usando exclusivamente ``now`` del líder."""
+        if now is None:
+            return
+        state = self._locks.get(canonical_path)
+        if state is None:
+            return
+        state.holders = {
+            lock_id: holder
+            for lock_id, holder in state.holders.items()
+            if holder[1] > now
+        }
+        if not state.holders:
+            del self._locks[canonical_path]
+
+    def _get_committed_file(self, virtual_path: str) -> FileNode:
+        parts = self._parts(virtual_path)
+        node = self._get_node(parts)
+        if not isinstance(node, FileNode) or node.state != "committed":
+            raise PathNotFoundError(f"no existe: {virtual_path}")
+        return node
+
+    def acquire_lock(
+        self,
+        virtual_path: str,
+        lock_id: str,
+        owner: str,
+        mode: str,
+        now: float,
+        lease_s: float,
+    ) -> str:
+        """Toma un lock compartido o exclusivo con vencimiento determinado por líder."""
+        with self._lock:
+            canonical_path = self._canonical_path(virtual_path)
+            if mode not in {"r", "w"}:
+                raise InvalidPathError(f"modo de lock inválido: {mode!r}")
+            if lease_s <= 0:
+                raise InvalidPathError("lease_s debe ser mayor a 0")
+            self._get_committed_file(canonical_path)
+            self._cleanup_expired_locks(canonical_path, now)
+            state = self._locks.get(canonical_path)
+            if state is not None and (state.mode != "r" or mode != "r"):
+                raise ConflictError(f"lock en conflicto para: {virtual_path}")
+            if state is None:
+                state = LockState(mode=mode)
+                self._locks[canonical_path] = state
+            if lock_id in state.holders:
+                raise ConflictError(f"lock_id ya existe para: {virtual_path}")
+            state.holders[lock_id] = (owner, now + lease_s)
+            return lock_id
+
+    def renew_lock(self, virtual_path: str, lock_id: str, now: float, lease_s: float) -> None:
+        with self._lock:
+            canonical_path = self._canonical_path(virtual_path)
+            if lease_s <= 0:
+                raise InvalidPathError("lease_s debe ser mayor a 0")
+            self._get_committed_file(canonical_path)
+            self._cleanup_expired_locks(canonical_path, now)
+            state = self._locks.get(canonical_path)
+            if state is None or lock_id not in state.holders:
+                raise ConflictError(f"lock_id no vigente para: {virtual_path}")
+            owner, _ = state.holders[lock_id]
+            state.holders[lock_id] = (owner, now + lease_s)
+
+    def release_lock(self, virtual_path: str, lock_id: str, now: float | None = None) -> None:
+        """Libera un lock; con hora de líder tolera el lease que ya venció.
+
+        ``now`` es opcional para conservar la firma de los journals previos a B1.
+        Un lock_id ajeno sigue siendo un conflicto mientras exista otro holder vivo.
+        """
+        with self._lock:
+            canonical_path = self._canonical_path(virtual_path)
+            self._get_committed_file(canonical_path)
+            self._cleanup_expired_locks(canonical_path, now)
+            state = self._locks.get(canonical_path)
+            if state is None:
+                if now is not None:
+                    return
+                raise ConflictError(f"lock_id no pertenece a: {virtual_path}")
+            if lock_id not in state.holders:
+                raise ConflictError(f"lock_id no pertenece a: {virtual_path}")
+            del state.holders[lock_id]
+            if not state.holders:
+                del self._locks[canonical_path]
 
     def begin_upload(
         self,

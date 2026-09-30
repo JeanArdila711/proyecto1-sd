@@ -269,3 +269,135 @@ def test_write_exceeding_block_deadline_aborts_upload_without_partial_block(
     finally:
         client.close()
         server.stop(grace=None)
+
+
+def test_download_holds_shared_lock_until_slow_read_finishes(client, tmp_path, monkeypatch):
+    local = tmp_path / "archivo.txt"
+    local.write_bytes(b"abc")
+    client.upload(local, "/archivo.txt")
+    real_read = client._read_block_with_failover
+    entered = __import__("threading").Event()
+    allow_finish = __import__("threading").Event()
+
+    def slow_read(block, fh):
+        entered.set()
+        assert allow_finish.wait(3)
+        return real_read(block, fh)
+
+    monkeypatch.setattr(client, "_read_block_with_failover", slow_read)
+    import threading
+    error = []
+    thread = threading.Thread(target=lambda: _download_error(client, tmp_path / "out", error))
+    thread.start()
+    assert entered.wait(2)
+    with pytest.raises(Exception):
+        client.lock("/archivo.txt", "w")
+    allow_finish.set()
+    thread.join(timeout=3)
+    assert not thread.is_alive() and not error
+    writer = client.lock("/archivo.txt", "w")
+    writer.release()
+
+
+def _download_error(client, path, errors):
+    try:
+        client.download("/archivo.txt", path)
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def test_lock_renewer_and_close_release_resources(client, tmp_path):
+    local = tmp_path / "archivo.txt"
+    local.write_bytes(b"abc")
+    client.upload(local, "/archivo.txt")
+    held = client.lock("/archivo.txt", "r")
+    assert client._lock_renewal_thread is not None and client._lock_renewal_thread.is_alive()
+    held.release()
+    assert client._lock_renewal_thread is None
+    writer = client.lock("/archivo.txt", "w")
+    client.close()
+    assert client._lock_renewal_thread is None
+    assert writer.released
+
+
+def test_lock_renewer_calls_renew_before_the_lease_expires(client, tmp_path, monkeypatch):
+    local = tmp_path / "archivo.txt"
+    local.write_bytes(b"abc")
+    client.upload(local, "/archivo.txt")
+    renewed = __import__("threading").Event()
+    original = client._renew_held_lock
+
+    def renew_and_signal(held):
+        original(held)
+        renewed.set()
+
+    monkeypatch.setattr(client, "_renew_held_lock", renew_and_signal)
+    held = client.lock("/archivo.txt", "r")
+    held.lease_s = 0.06
+    client._stop_lock_renewer()
+    client._start_lock_renewer()
+    assert renewed.wait(1), "el renovador no llamó RenewLock cada lease/3"
+    held.close()
+
+
+
+def test_unlock_normalizes_path_and_keeps_canonical_local_lock(client, tmp_path):
+    local = tmp_path / "archivo.txt"
+    local.write_bytes(b"abc")
+    client.upload(local, "/docs//a.txt")
+
+    held = client.lock("docs/a.txt", "r")
+
+    assert held.path == "/docs/a.txt"
+    client.unlock("/docs//a.txt")
+    assert client.locks() == []
+
+
+def test_expired_lock_during_slow_download_does_not_mask_success_or_leak_resources(
+    tmp_path, start_control_node, monkeypatch
+):
+    import threading
+    import time
+
+    dn_root = tmp_path / "datanode"
+    dn_server, dn_port = serve_data_node(dn_root, "localhost", 0)
+    client = DistributedDFShaClient(
+        [
+            start_control_node(
+                [f"localhost:{dn_port}"], block_size_bytes=5, lock_lease_s=0.05, min_write_replicas=1
+            )
+        ]
+    )
+    source = tmp_path / "archivo.txt"
+    destination = tmp_path / "descargado.txt"
+    source.write_bytes(b"abc")
+    client.upload(source, "/archivo.txt")
+
+    renewal_started = threading.Event()
+    renewal_finished = threading.Event()
+    original_renew = client._renew_held_lock
+    original_read = client._read_block_with_failover
+
+    def renew_after_lease_expires(held):
+        renewal_started.set()
+        time.sleep(0.08)
+        try:
+            original_renew(held)
+        finally:
+            renewal_finished.set()
+
+    def slow_read(block, fh):
+        assert renewal_started.wait(1)
+        assert renewal_finished.wait(1)
+        return original_read(block, fh)
+
+    monkeypatch.setattr(client, "_renew_held_lock", renew_after_lease_expires)
+    monkeypatch.setattr(client, "_read_block_with_failover", slow_read)
+    try:
+        assert client.download("/archivo.txt", destination) == 3
+        assert destination.read_bytes() == b"abc"
+        assert client.locks() == []
+        assert client._lock_renewal_thread is None
+    finally:
+        client.close()
+        dn_server.stop(grace=None)

@@ -41,7 +41,8 @@ dfsha:/$ exit
 | `mkdir <ruta>` · `rmdir <ruta>` | Crea / borra un directorio vacío |
 | `send <local> <remota>` | Sube un archivo |
 | `receive <remota> <local>` | Descarga un archivo |
-| `rm <ruta>` | Borra un archivo |
+| `rm <ruta>` | Borra un archivo (falla mientras tenga un lock vigente) |
+| `lock <ruta> r|w` · `unlock <ruta>` · `locks` | Toma, libera o lista locks propios con lease |
 
 Las rutas con espacios van entre comillas: `send "/intercambio/mi tesis.pdf" /docs/tesis.pdf`.
 
@@ -185,3 +186,8 @@ controlada están en `tests/fixtures/README.md`.
 - `docs/especificacion-comunicaciones.md` — protocolos y contratos entre los componentes
 - `ESTADO_PROYECTO.md` — qué está hecho, decisiones y detalles de implementación
 - `docker compose logs -f cn0` — salida de un nodo
+
+
+### Locks con lease (B1)
+
+En una shell, `lock /docs/tesis.pdf r` toma un lock compartido y `lock /docs/tesis.pdf w` uno exclusivo; `locks` muestra los propios y `unlock /docs/tesis.pdf` libera uno. `receive` toma y renueva automáticamente un lock compartido hasta terminar, por lo que un escritor recibe conflicto mientras la descarga sigue activa. El ControlNode usa `--lock-lease-s` (30 s por defecto); el cliente renueva cada tercio.

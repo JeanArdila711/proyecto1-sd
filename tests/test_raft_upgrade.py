@@ -338,3 +338,24 @@ def test_follow_up_upgrade_contract_is_precise_and_the_hook_runs():
     }
     assert_legacy_upgrade([Replica()], manifest, extension_checks=(lambda replica: checked.append(replica),))
     assert checked and FOLLOW_UP_CONTRACT.keys() == {"B1", "B3", "C2", "C3"}
+
+
+
+def test_legacy_fixture_initializes_locks_and_preserves_legacy_outcomes(tmp_path):
+    manifest = _fixture_manifest()
+    nodes, _ = _start_restored_cluster(tmp_path)
+    try:
+        replicas = [replicated for _, replicated in nodes]
+        expected_op_ids = {operation["op_id"] for operation in manifest["legacy_operations"]}
+        assert wait_for(lambda: all(expected_op_ids <= set(replica.applied_ops) for replica in replicas))
+        assert_legacy_upgrade(
+            replicas,
+            manifest,
+            extension_checks=(assert_legacy_locks,),
+        )
+    finally:
+        _stop_cluster(nodes)
+
+
+def assert_legacy_locks(replica) -> None:
+    assert replica.tree._locks == {}

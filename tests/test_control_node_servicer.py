@@ -158,3 +158,39 @@ def test_abandoned_upload_frees_the_name_after_lease_and_deletes_its_blocks(tmp_
     finally:
         channel.close()
         dn_server.stop(grace=None)
+
+
+
+def test_lock_renew_unlock_and_remove_conflict_are_translated(cluster):
+    from dfsha.common.exceptions import ConflictError
+
+    stub, _ = cluster
+    begin = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/archivo.txt", size_bytes=1, op_id=_op()))
+    block = begin.blocks[0]
+    stub.ConfirmBlock(control_node_pb2.ConfirmBlockRequest(
+        path="/archivo.txt", block_id=block.block_id, checksum="sum", size_bytes=1, op_id=_op()))
+    stub.CompleteUpload(control_node_pb2.CompleteUploadRequest(path="/archivo.txt", op_id=_op()))
+
+    retry = stub.Lock(control_node_pb2.LockRequest(path="/archivo.txt", mode="r", op_id=_op()))
+    assert retry.lock_id and retry.lease_s > 0
+    same_op_id = _op()
+    first = stub.Lock(control_node_pb2.LockRequest(path="/archivo.txt", mode="r", op_id=same_op_id))
+    assert stub.Lock(control_node_pb2.LockRequest(path="/archivo.txt", mode="r", op_id=same_op_id)).lock_id == first.lock_id
+    stub.RenewLock(control_node_pb2.RenewLockRequest(path="/archivo.txt", lock_id=retry.lock_id, op_id=_op()))
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.Remove(control_node_pb2.RemoveRequest(path="/archivo.txt", op_id=_op()))
+    assert exc_info.value.code() == grpc.StatusCode.ABORTED
+    assert dict(exc_info.value.trailing_metadata())["dfsha-error"] == ConflictError.__name__
+    stub.Unlock(control_node_pb2.UnlockRequest(path="/archivo.txt", lock_id=retry.lock_id, op_id=_op()))
+    stub.Unlock(control_node_pb2.UnlockRequest(path="/archivo.txt", lock_id=first.lock_id, op_id=_op()))
+    stub.Remove(control_node_pb2.RemoveRequest(path="/archivo.txt", op_id=_op()))
+
+
+def test_lock_rejects_bad_mode_and_foreign_lock_id(cluster):
+    stub, _ = cluster
+    with pytest.raises(grpc.RpcError) as bad_mode:
+        stub.Lock(control_node_pb2.LockRequest(path="/missing", mode="x", op_id=_op()))
+    assert bad_mode.value.code() == grpc.StatusCode.PERMISSION_DENIED
+    with pytest.raises(grpc.RpcError) as foreign:
+        stub.RenewLock(control_node_pb2.RenewLockRequest(path="/missing", lock_id="foreign", op_id=_op()))
+    assert foreign.value.code() == grpc.StatusCode.NOT_FOUND

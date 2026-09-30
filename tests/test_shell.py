@@ -132,3 +132,34 @@ def test_send_con_espacios_en_la_ruta_local(tmp_path):
 def test_comilla_sin_cerrar_no_revienta_el_shell():
     _, output = handle_command(FakeClient(), "/", 'send "abierta destino')
     assert "error de sintaxis" in output
+
+
+
+def test_distributed_lock_commands_resolve_paths_and_list_own_locks():
+    class Lock:
+        lock_id = "lock-1"
+        mode = "r"
+        path = "/docs/a.txt"
+        released = False
+        def release(self):
+            self.released = True
+
+    class Client:
+        def __init__(self):
+            self.held = Lock()
+        def lock(self, path, mode):
+            assert (path, mode) == ("/docs/a.txt", "r")
+            return self.held
+        def locks(self):
+            return [self.held]
+        def unlock(self, path):
+            assert path == "/docs/a.txt"
+            self.held.release()
+
+    client = Client()
+    current, output = handle_command(client, "/docs", "lock a.txt r")
+    assert current == "/docs" and "lock-1" in output
+    _, output = handle_command(client, "/docs", "locks")
+    assert "/docs/a.txt" in output
+    _, output = handle_command(client, "/docs", "unlock a.txt")
+    assert output == "" and client.held.released

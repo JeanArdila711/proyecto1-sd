@@ -37,6 +37,10 @@ DEFAULT_COMMIT_TIMEOUT_S = 3.0
 DEFAULT_UPLOAD_LEASE_S = 600.0
 DEFAULT_DATA_PLANE_TIMEOUT_S = 5.0
 
+# Un lock se renueva en lease/3; se inyecta en tests cortos y no se calcula dentro
+# de apply(), donde cada réplica podría observar una hora distinta.
+DEFAULT_LOCK_LEASE_S = 30.0
+
 _ERROR_STATUS_MAP = {
     PathNotFoundError: grpc.StatusCode.NOT_FOUND,
     PathExistsError: grpc.StatusCode.ALREADY_EXISTS,
@@ -73,6 +77,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         upload_lease_s: float = DEFAULT_UPLOAD_LEASE_S,
         min_write_replicas: int = DEFAULT_MIN_WRITE_REPLICAS,
         datanode_monitor: DataNodeMonitor | None = None,
+        lock_lease_s: float = DEFAULT_LOCK_LEASE_S,
     ) -> None:
         if not datanode_addresses:
             raise ValueError("hace falta al menos un DataNode")
@@ -92,6 +97,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         self._replicated = replicated
         self._commit_timeout_s = commit_timeout_s
         self._upload_lease_s = upload_lease_s
+        self._lock_lease_s = lock_lease_s
         self._datanode_addresses = list(datanode_addresses)
         self._block_size_bytes = block_size_bytes
         self._replication_factor = replication_factor
@@ -198,8 +204,8 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
 
     def Remove(self, request, context):
         try:
-            blocks = self._commit(context, request.op_id, "remove_file", request.path)
-        except (PathNotFoundError, NotAFileError, NotADirectoryError, InvalidPathError) as exc:
+            blocks = self._commit(context, request.op_id, "remove_file", request.path, time.time())
+        except (PathNotFoundError, NotAFileError, NotADirectoryError, InvalidPathError, ConflictError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.RemoveResponse()
         # Efecto secundario fuera de la máquina de estados, solo en el líder y
@@ -314,3 +320,44 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 for b in blocks
             ]
         )
+
+    def Lock(self, request, context):
+        lock_id = uuid.uuid4().hex
+        try:
+            committed_lock_id = self._commit(
+                context,
+                request.op_id,
+                "acquire_lock",
+                request.path,
+                lock_id,
+                context.peer(),
+                request.mode,
+                time.time(),
+                self._lock_lease_s,
+            )
+        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+            _abort_on_domain_error(context, exc)
+            return control_node_pb2.LockResponse()
+        return control_node_pb2.LockResponse(lock_id=committed_lock_id, lease_s=self._lock_lease_s)
+
+    def RenewLock(self, request, context):
+        try:
+            self._commit(
+                context,
+                request.op_id,
+                "renew_lock",
+                request.path,
+                request.lock_id,
+                time.time(),
+                self._lock_lease_s,
+            )
+        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+            _abort_on_domain_error(context, exc)
+        return control_node_pb2.RenewLockResponse()
+
+    def Unlock(self, request, context):
+        try:
+            self._commit(context, request.op_id, "release_lock", request.path, request.lock_id, time.time())
+        except (PathNotFoundError, ConflictError) as exc:
+            _abort_on_domain_error(context, exc)
+        return control_node_pb2.UnlockResponse()

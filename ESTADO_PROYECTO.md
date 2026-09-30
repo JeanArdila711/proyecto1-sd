@@ -181,3 +181,15 @@ python -m pytest tests/ -v
 - Las subidas requieren `--min-write-replicas` (2 por defecto), no necesariamente el factor completo. Con menos del mínimo responden `UNAVAILABLE` antes de reservar metadata; con el mínimo, el bloque queda sub-replicado para la reposición de A2.
 - Los monitores, sus canales y los recursos de forwarding se cierran al detener los servidores; el cliente y los RPC del plano de datos usan deadlines explícitos.
 - Corrección de revisión: `ReadBlock` y `WriteBlock` calculan su deadline por bloque (`base + tamaño/throughput mínimo`, 1 MiB/s por defecto); el forwarding conserva el tiempo restante del deadline entrante, evitando cortar streams activos con el timeout corto de ControlNode.
+
+## Hito 3 — B1: locks lectores/escritor con lease
+
+- `ControlTree` replica por Raft locks compartidos (`r`) y exclusivos (`w`) con holders, dueño y vencimiento; el líder decide `now` antes del commit y los leases vencidos se limpian en las mutaciones.
+- `Lock`, `RenewLock` y `Unlock` usan `op_id`; `Remove` rechaza archivos con holders vigentes mediante `ConflictError`/`ABORTED` y metadata `dfsha-error`.
+- El cliente renueva locks cada tercio del lease, los libera al cerrar y mantiene un lock compartido durante `receive`; la shell expone `lock`, `unlock` y `locks`.
+- El upgrade S2 verifica que snapshots legacy inicializan `_locks` sin alterar los outcomes históricos de `applied_ops`.
+
+### Correcciones de revisión B1 — rutas canónicas y lease perdido
+
+- Los locks se indexan con la ruta canónica derivada de sus partes, por lo que variantes como `/docs/a.txt`, `docs/a.txt` y `/docs//a.txt` compiten por el mismo holder; `Remove` aplica la misma clave.
+- El cliente guarda y libera rutas canónicas. Si `RenewLock` informa `ConflictError`, marca el `LeaseLock` como perdido, lo elimina de sus locks propios y detiene el renovador cuando corresponde; una liberación tardía limpia estado local sin alterar el resultado de una descarga exitosa.

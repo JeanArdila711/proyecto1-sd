@@ -74,6 +74,9 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 | `CompleteUpload(path, op_id)` | ✓ | `pending → committed` si todos los bloques están confirmados. |
 | `AbortUpload(path, op_id)` | ✓ | Descarta una subida pendiente. |
 | `ListBlocks(path)` | — | Bloques en orden, con réplicas en orden de pipeline y checksum. |
+| `Lock(path, mode, op_id)` | ✓ | Toma lock compartido (`r`) o exclusivo (`w`) con lease. |
+| `RenewLock(path, lock_id, op_id)` | ✓ | Renueva el lease de un lock propio. |
+| `Unlock(path, lock_id, op_id)` | ✓ | Libera un lock propio. |
 
 **Descubrimiento del líder.** El cliente recibe la lista de los 3 ControlNodes. Solo el líder atiende; los seguidores responden `UNAVAILABLE`. El cliente empieza por el último líder conocido y rota ante `UNAVAILABLE` o `DEADLINE_EXCEEDED`.
 

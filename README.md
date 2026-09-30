@@ -17,6 +17,8 @@ cambios. Sobre eso, Hito 2 agrega la arquitectura distribuida:
 - **RF1** — gestión del sistema de archivos: `ls`, `cd`, `mkdir`, `rmdir`, `rm`.
 - **RF2** — transferencia de archivos: `send`/`receive`, con streaming gRPC
   para no cargar archivos grandes en memoria.
+- **RF3 parcial (B1)** — locks lectores/escritor con lease: varios lectores
+  conviven, un escritor es exclusivo y los leases vencidos se liberan solos.
 - **Hito 2 / sub-proyecto 1** — ControlNode (metadatos del árbol) separado
   de un DataNode (bloques), particionamiento de archivos en bloques (128 MB
   por defecto) y un cliente/shell distribuida que habla con ambos.
@@ -149,7 +151,6 @@ Los binarios legacy versionados y su procedimiento de regeneración están en
 
 ## Fuera de alcance por ahora
 
-RF3 (acceso granular a archivos: `open`/`close`/`read`/`write`/`lock`),
-detección automática de DataNodes
-caídos, re-replicación y autenticación. Ver el roadmap arriba para cuándo
-llega cada cosa.
+RF3 parcial: B1 incorpora `lock` lectores/escritor con lease; `open` y `write`
+copy-on-write completos se incorporan con B3. Detección automática de DataNodes
+caídos, re-replicación y autenticación siguen en el roadmap.

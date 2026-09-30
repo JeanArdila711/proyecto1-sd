@@ -18,6 +18,7 @@ from dfsha.control_node.servicer import (
     DEFAULT_MIN_WRITE_REPLICAS,
     DEFAULT_REPLICATION_FACTOR,
     DEFAULT_UPLOAD_LEASE_S,
+    DEFAULT_LOCK_LEASE_S,
     ControlNodeServicer,
 )
 from dfsha.generated import control_node_pb2_grpc
@@ -26,7 +27,13 @@ DEFAULT_BLOCK_SIZE_BYTES = 128 * 1024 * 1024
 
 
 def build_raft_conf(data_dir: Path | None, raft_conf_overrides: dict | None = None) -> SyncObjConf:
-    conf = {**(raft_conf_overrides or {}), "useFork": False}
+    # Timeouts de Raft: los defaults de pysyncobj; los tests los acortan.
+    conf = {
+        **(raft_conf_overrides or {}),
+        # La compactación del log por defecto hace fork() del proceso para serializar
+        # el snapshot, y fork() con los hilos de gRPC corriendo no está soportado.
+        "useFork": False,
+    }
     if data_dir is not None:
         data_dir.mkdir(parents=True, exist_ok=True)
         conf["journalFile"] = str(data_dir / "raft.journal")
@@ -68,8 +75,15 @@ def serve(
     raft_conf_overrides: dict | None = None,
     commit_timeout_s: float = DEFAULT_COMMIT_TIMEOUT_S,
     upload_lease_s: float = DEFAULT_UPLOAD_LEASE_S,
+    lock_lease_s: float = DEFAULT_LOCK_LEASE_S,
 ) -> tuple[grpc.Server, int, SyncObj]:
-    """Arranca Raft, gRPC y el monitor pull local de DataNodes."""
+    """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
+    DataNodes, que se detiene junto con el servidor.
+
+    data_dir=None deja el log solo en memoria (tests). En producción siempre va un
+    directorio: sin él, reiniciar los 3 nodos pierde el árbol entero.
+    Quien llama es dueño del SyncObj devuelto y tiene que hacerle destroy().
+    """
     validate_datanode_configuration(datanode_addresses, replication_factor, min_write_replicas)
     replicated = ReplicatedTree()
     raft = SyncObj(
@@ -91,6 +105,7 @@ def serve(
         upload_lease_s,
         min_write_replicas,
         monitor,
+        lock_lease_s,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
     original_stop = server.stop
@@ -129,7 +144,19 @@ def main() -> None:
     parser.add_argument("--min-write-replicas", type=int, default=DEFAULT_MIN_WRITE_REPLICAS)
     parser.add_argument("--heartbeat-interval-s", type=float, default=DEFAULT_HEARTBEAT_INTERVAL_S)
     parser.add_argument("--datanode-dead-after-s", type=float, default=DEFAULT_DATANODE_DEAD_AFTER_S)
-    parser.add_argument("--upload-lease-s", type=float, default=DEFAULT_UPLOAD_LEASE_S)
+    parser.add_argument(
+        "--upload-lease-s",
+        type=float,
+        default=DEFAULT_UPLOAD_LEASE_S,
+        help="segundos que una subida puede estar sin confirmar un bloque antes de que su "
+        "nombre quede libre (cubre a un cliente que murió a mitad de subida)",
+    )
+    parser.add_argument(
+        "--lock-lease-s",
+        type=float,
+        default=DEFAULT_LOCK_LEASE_S,
+        help="segundos de lease para locks lectores/escritor; el cliente renueva cada tercio",
+    )
     args = parser.parse_args()
 
     cluster = _split_addresses(args.raft_cluster)
@@ -158,6 +185,7 @@ def main() -> None:
         heartbeat_interval_s=args.heartbeat_interval_s,
         datanode_dead_after_s=args.datanode_dead_after_s,
         upload_lease_s=args.upload_lease_s,
+        lock_lease_s=args.lock_lease_s,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")

@@ -94,3 +94,28 @@ def test_snapshot_roundtrip_restores_tree_and_a_usable_lock():
     assert _apply(restored, "op3", "confirm_block", "/docs/f.bin", "c" * 32, "sum", 4) == ("ok", None)
     assert _apply(restored, "op4", "complete_upload", "/docs/f.bin") == ("ok", None)
     assert [b.block_id for b in restored.tree.list_blocks("/docs/f.bin")] == ["c" * 32]
+
+
+
+def test_lock_mutations_are_replicated_and_apply_uses_explicit_leader_time(monkeypatch):
+    repl = ReplicatedTree()
+    _apply(repl, "upload", "begin_upload", "/f.bin", [("a" * 32, ["dn1"])])
+    _apply(repl, "confirm", "confirm_block", "/f.bin", "a" * 32, "sum", 1)
+    _apply(repl, "complete", "complete_upload", "/f.bin")
+
+    import dfsha.control_node.tree as tree_module
+    monkeypatch.setattr(tree_module, "time", None, raising=False)
+    assert _apply(repl, "lock", "acquire_lock", "/f.bin", "lock-1", "client", "r", 100.0, 30.0) == ("ok", "lock-1")
+    assert _apply(repl, "renew", "renew_lock", "/f.bin", "lock-1", 110.0, 30.0) == ("ok", None)
+    assert repl.tree._locks["/f.bin"].holders["lock-1"] == ("client", 140.0)
+
+
+def test_snapshot_without_locks_initializes_empty_lock_state():
+    import pickle
+
+    tree = ReplicatedTree().tree
+    state = tree.__getstate__()
+    state.pop("_locks", None)  # fixture anterior a B1
+    restored = type(tree).__new__(type(tree))
+    restored.__setstate__(pickle.loads(pickle.dumps(state)))
+    assert restored._locks == {}

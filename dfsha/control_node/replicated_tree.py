@@ -21,6 +21,9 @@ MUTATIONS = frozenset(
         "confirm_block",
         "complete_upload",
         "abort_upload",
+        "acquire_lock",
+        "renew_lock",
+        "release_lock",
     }
 )
 

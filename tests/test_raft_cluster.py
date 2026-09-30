@@ -8,6 +8,7 @@ import pytest
 
 from conftest import FAST_RAFT_CONF, free_port, wait_for
 from dfsha.client.distributed_client import DistributedDFShaClient
+from dfsha.common.exceptions import ConflictError
 from dfsha.control_node.main import build_raft_conf
 from dfsha.control_node.main import serve as serve_control_node
 from dfsha.data_node.main import serve as serve_data_node
@@ -281,3 +282,26 @@ def test_log_compaction_never_forks(tmp_path):
     determinística, así que se protege la configuración, incluso contra overrides."""
     assert build_raft_conf(tmp_path / "cn").useFork is False
     assert build_raft_conf(None, {"useFork": True}).useFork is False
+
+
+
+def test_locks_survive_leader_failover_and_followers_reject_lock_rpcs(make_cluster, tmp_path):
+    cluster, client = make_cluster()
+    client.upload(_write(tmp_path, b"lock"), "/lock.bin")
+    held = client.lock("/lock.bin", "r")
+    old_leader = cluster.wait_leader()
+    follower = next(i for i in range(3) if i != old_leader)
+    channel, stub = cluster.stub(follower)
+    try:
+        with pytest.raises(grpc.RpcError) as follower_error:
+            stub.Lock(control_node_pb2.LockRequest(path="/lock.bin", mode="w", op_id=uuid.uuid4().hex))
+        assert follower_error.value.code() == grpc.StatusCode.UNAVAILABLE
+    finally:
+        channel.close()
+    cluster.kill(old_leader)
+    cluster.wait_leader()
+    with pytest.raises(ConflictError):
+        client.lock("/lock.bin", "w")
+    held.release()
+    writer = client.lock("/lock.bin", "w")
+    writer.release()

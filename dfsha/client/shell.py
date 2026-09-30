@@ -15,6 +15,9 @@ _HELP_TEXT = """Comandos disponibles:
   rm <ruta>                   elimina un archivo
   send <local> <remota>       sube un archivo local al DFS
   receive <remota> <local>    descarga un archivo del DFS
+  lock <ruta> r|w             toma un lock con lease
+  unlock <ruta>               libera un lock propio de la ruta
+  locks                       lista los locks propios
   help                        muestra esta ayuda
   exit / quit                 termina la sesión
 
@@ -101,6 +104,23 @@ def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
             local_path = Path(args[1])
             bytes_written = client.download(remote_path, local_path)
             return current_dir, f"{bytes_written} bytes recibidos en {local_path}"
+
+        if cmd == "lock":
+            if len(args) != 2 or args[1] not in {"r", "w"}:
+                return current_dir, "lock: uso: lock <ruta> r|w"
+            held = client.lock(resolve_relative(current_dir, args[0]), args[1])
+            return current_dir, f"lock {held.lock_id} tomado para {held.path} ({held.mode})"
+
+        if cmd == "unlock":
+            if len(args) != 1:
+                return current_dir, "unlock: uso: unlock <ruta>"
+            client.unlock(resolve_relative(current_dir, args[0]))
+            return current_dir, ""
+
+        if cmd == "locks":
+            return current_dir, "\n".join(
+                f"{held.mode} {held.path} {held.lock_id}" for held in client.locks()
+            )
 
         if cmd == "help":
             return current_dir, _HELP_TEXT

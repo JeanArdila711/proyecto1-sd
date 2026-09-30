@@ -238,3 +238,130 @@ def test_pending_upload_without_lease_never_expires():
     tree.begin_upload("/archivo.txt", [("b1", ["dn1"])])
     with pytest.raises(PathExistsError):
         tree.begin_upload("/archivo.txt", [("b2", ["dn1"])], now=10_000.0, lease_s=1.0)
+
+
+# ── locks lectores/escritor con lease ───────────────────────────────────────
+
+
+def _committed_file(tree: ControlTree, path: str = "/archivo.txt") -> str:
+    tree.begin_upload(path, [("b1", ["dn1"])])
+    tree.confirm_block(path, "b1", "sum", 1)
+    tree.complete_upload(path)
+    return path
+
+
+def test_two_readers_coexist_and_writer_conflicts():
+    from dfsha.common.exceptions import ConflictError
+
+    tree = ControlTree()
+    path = _committed_file(tree)
+    tree.acquire_lock(path, "reader-1", "client-1", "r", now=100.0, lease_s=60.0)
+    tree.acquire_lock(path, "reader-2", "client-2", "r", now=101.0, lease_s=60.0)
+
+    assert tree._locks[path].mode == "r"
+    assert set(tree._locks[path].holders) == {"reader-1", "reader-2"}
+    with pytest.raises(ConflictError):
+        tree.acquire_lock(path, "writer", "client-3", "w", now=102.0, lease_s=60.0)
+
+
+def test_writer_blocks_reader_and_release_makes_lock_available():
+    from dfsha.common.exceptions import ConflictError
+
+    tree = ControlTree()
+    path = _committed_file(tree)
+    tree.acquire_lock(path, "writer", "client-1", "w", now=100.0, lease_s=60.0)
+
+    with pytest.raises(ConflictError):
+        tree.acquire_lock(path, "reader", "client-2", "r", now=101.0, lease_s=60.0)
+
+    tree.release_lock(path, "writer")
+    tree.acquire_lock(path, "reader", "client-2", "r", now=102.0, lease_s=60.0)
+
+
+def test_expired_lock_is_reused_and_renewal_extends_lease():
+    tree = ControlTree()
+    path = _committed_file(tree)
+    tree.acquire_lock(path, "old", "client-1", "r", now=100.0, lease_s=10.0)
+    tree.acquire_lock(path, "writer", "client-2", "w", now=110.0, lease_s=10.0)
+    tree.renew_lock(path, "writer", now=115.0, lease_s=10.0)
+
+    assert tree._locks[path].holders["writer"] == ("client-2", 125.0)
+    from dfsha.common.exceptions import ConflictError
+    with pytest.raises(ConflictError):
+        tree.acquire_lock(path, "reader", "client-3", "r", now=124.0, lease_s=10.0)
+
+
+def test_foreign_lock_id_and_remove_with_live_lock_fail():
+    from dfsha.common.exceptions import ConflictError
+
+    tree = ControlTree()
+    path = _committed_file(tree)
+    tree.acquire_lock(path, "reader", "client-1", "r", now=100.0, lease_s=60.0)
+
+    with pytest.raises(ConflictError):
+        tree.renew_lock(path, "other", now=101.0, lease_s=60.0)
+    with pytest.raises(ConflictError):
+        tree.release_lock(path, "other")
+    with pytest.raises(ConflictError):
+        tree.remove_file(path, now=101.0)
+
+
+def test_lock_operations_require_a_committed_file():
+    tree = ControlTree()
+    tree.begin_upload("/pending.txt", [("b1", ["dn1"])])
+
+    with pytest.raises(PathNotFoundError):
+        tree.acquire_lock("/pending.txt", "reader", "client", "r", now=1.0, lease_s=1.0)
+    with pytest.raises(InvalidPathError):
+        tree.acquire_lock("/", "reader", "client", "bad", now=1.0, lease_s=1.0)
+
+
+# ── regresiones de claves canónicas de locks ─────────────────────────────────
+
+
+def test_lock_path_variants_conflict_on_the_same_committed_file():
+    from dfsha.common.exceptions import ConflictError
+
+    tree = ControlTree()
+    _committed_file(tree, "/docs/a.txt")
+    tree.acquire_lock("/docs/a.txt", "reader", "client-1", "r", now=100.0, lease_s=60.0)
+
+    with pytest.raises(ConflictError):
+        tree.acquire_lock("docs//a.txt", "writer", "client-2", "w", now=101.0, lease_s=60.0)
+
+    assert set(tree._locks) == {"/docs/a.txt"}
+
+
+def test_remove_path_variant_respects_live_lock():
+    from dfsha.common.exceptions import ConflictError
+
+    tree = ControlTree()
+    _committed_file(tree, "/docs/a.txt")
+    tree.acquire_lock("docs/a.txt", "reader", "client-1", "r", now=100.0, lease_s=60.0)
+
+    with pytest.raises(ConflictError):
+        tree.remove_file("/docs//a.txt", now=101.0)
+
+
+
+def test_renew_and_release_path_variants_use_the_canonical_lock_key():
+    tree = ControlTree()
+    _committed_file(tree, "/docs/a.txt")
+    tree.acquire_lock("/docs//a.txt", "reader", "client-1", "r", now=100.0, lease_s=10.0)
+
+    tree.renew_lock("docs/a.txt", "reader", now=105.0, lease_s=10.0)
+    assert tree._locks["/docs/a.txt"].holders["reader"] == ("client-1", 115.0)
+
+    tree.release_lock("/docs//a.txt", "reader")
+    assert tree._locks == {}
+
+
+def test_release_of_expired_lock_is_idempotent_with_leader_time():
+    tree = ControlTree()
+    path = _committed_file(tree)
+    tree.acquire_lock(path, "reader", "client-1", "r", now=100.0, lease_s=10.0)
+
+    tree.release_lock(path, "reader", now=110.0)
+    tree.release_lock(path, "reader", now=111.0)
+
+    assert tree._locks == {}
