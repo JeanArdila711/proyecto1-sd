@@ -124,9 +124,10 @@ respuesta:  { checksum: <SHA-256 hex>, bytes_written }
 - `block_id` debe ser exactamente 32 hexadecimales en minúscula (se valida antes de tocar el disco).
 - La respuesta llega cuando **las 3 réplicas** terminaron (quórum 3 de 3). El checksum devuelto es el que el cliente reporta en `ConfirmBlock`.
 
-### Lectura: `ReadBlock(block_id) → stream ReadBlockChunk`
+### Lectura: `ReadBlock(block_id, offset, length) → stream ReadBlockChunk`
 
-- El DataNode recalcula el SHA-256 del bloque **antes** de enviar el primer byte. Si no coincide con el guardado: `DATA_LOSS`, sin enviar datos.
+- `offset` y `length` (Hito 3, B2) piden un rango dentro del bloque; `length` 0 significa hasta el final, así que un cliente que no los manda lee el bloque completo. Un rango negativo: `INVALID_ARGUMENT`.
+- El DataNode recalcula el SHA-256 del bloque **completo** antes de enviar el primer byte, aunque se pida solo un rango. Si no coincide con el guardado: `DATA_LOSS`, sin enviar datos.
 - Trozos de 1 MiB.
 - **Failover en el cliente:** prueba las réplicas en orden; ante `UNAVAILABLE` o `DATA_LOSS` descarta los bytes parciales de ese bloque (`seek` + `truncate`) y pasa a la siguiente. Solo falla si fallan todas.
 
@@ -136,7 +137,7 @@ respuesta:  { checksum: <SHA-256 hex>, bytes_written }
 | `DATA_LOSS` | Checksum no coincide (lectura), o réplicas con checksum distinto (escritura) |
 | `UNAVAILABLE` | DataNode caído, o falló una réplica aguas abajo del pipeline |
 
-**Limitación conocida:** estas llamadas no tienen deadline en el cliente; un DataNode colgado (no caído) bloquearía la operación.
+**Deadlines (desde Hito 3, A1):** cada `ReadBlock` y `WriteBlock` lleva un deadline calculado por la cantidad de bytes que mueve (base más tamaño sobre un throughput mínimo), así que un DataNode colgado no bloquea la operación y una transferencia lenta pero activa no se corta. *(Antes decía: "Limitación conocida: estas llamadas no tienen deadline en el cliente; un DataNode colgado (no caído) bloquearía la operación".)*
 
 ---
 

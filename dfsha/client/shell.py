@@ -15,6 +15,9 @@ _HELP_TEXT = """Comandos disponibles:
   rm <ruta>                   elimina un archivo
   send <local> <remota>       sube un archivo local al DFS
   receive <remota> <local>    descarga un archivo del DFS
+  cat <ruta> [offset] [largo] muestra el archivo, o un rango de bytes, como texto
+  read <ruta> <offset> <largo> <local>
+                              guarda un rango de bytes del archivo en un archivo local
   lock <ruta> r|w             toma un lock con lease
   unlock <ruta>               libera un lock propio de la ruta
   locks                       lista los locks propios
@@ -22,6 +25,28 @@ _HELP_TEXT = """Comandos disponibles:
   exit / quit                 termina la sesión
 
 Las rutas con espacios van entre comillas: send "C:\\mis docs\\a.pdf" a.pdf"""
+
+# Comandos de RF3 y el método que necesitan. La shell es compartida con el cliente
+# monolítico de Hito 1, que no los tiene: sin este chequeo, el AttributeError
+# tumbaría la shell en vez de avisar.
+_RF3_COMMANDS = {
+    "cat": "read",
+    "read": "read_to_file",
+    "lock": "lock",
+    "unlock": "unlock",
+    "locks": "locks",
+}
+
+
+def _parse_range(values: list[str]) -> tuple[int, int | None] | None:
+    """offset y largo opcionales de `cat`; None si alguno no es un entero."""
+    try:
+        numbers = [int(v) for v in values]
+    except ValueError:
+        return None
+    offset = numbers[0] if numbers else 0
+    length = numbers[1] if len(numbers) > 1 else None
+    return offset, length
 
 
 def resolve_relative(current_dir: str, target: str) -> str:
@@ -104,6 +129,28 @@ def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
             local_path = Path(args[1])
             bytes_written = client.download(remote_path, local_path)
             return current_dir, f"{bytes_written} bytes recibidos en {local_path}"
+
+        if cmd in _RF3_COMMANDS and not hasattr(client, _RF3_COMMANDS[cmd]):
+            return current_dir, f"{cmd}: no disponible con este cliente (RF3 requiere el cliente distribuido)"
+
+        if cmd == "cat":
+            parsed = _parse_range(args[1:]) if 1 <= len(args) <= 3 else None
+            if parsed is None:
+                return current_dir, "cat: uso: cat <ruta> [offset] [largo]"
+            offset, length = parsed
+            data = client.read(resolve_relative(current_dir, args[0]), offset, length)
+            return current_dir, data.decode("utf-8", errors="replace")
+
+        if cmd == "read":
+            parsed = _parse_range(args[1:3]) if len(args) == 4 else None
+            if parsed is None:
+                return current_dir, "read: uso: read <ruta> <offset> <largo> <local>"
+            offset, length = parsed
+            local_path = Path(args[3])
+            bytes_read = client.read_to_file(
+                resolve_relative(current_dir, args[0]), offset, length, local_path
+            )
+            return current_dir, f"{bytes_read} bytes leídos en {local_path}"
 
         if cmd == "lock":
             if len(args) != 2 or args[1] not in {"r", "w"}:

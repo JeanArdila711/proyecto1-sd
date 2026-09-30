@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import random
 import threading
@@ -443,15 +444,72 @@ class DistributedDFShaClient:
                 pass
         return bytes_written
 
-    def _read_block_with_failover(self, block, fh) -> int:
-        """Prueba otra réplica solo cuando una falla recuperable invalida este bloque."""
+    def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        """RF3 `read`: `length` bytes desde `offset` (None: hasta el final del archivo)."""
+        buffer = io.BytesIO()
+        self._read_range(path, offset, length, buffer)
+        return buffer.getvalue()
+
+    def read_to_file(self, path: str, offset: int, length: int | None, local_path: Path) -> int:
+        """Como `read`, pero escribe a un archivo local: para rangos grandes. Mismo
+        patrón atómico que `download`: nunca deja el destino a medias."""
+        tmp_path = local_path.parent / f"{local_path.name}.part-{uuid.uuid4().hex}"
+        try:
+            with tmp_path.open("wb") as fh:
+                bytes_written = self._read_range(path, offset, length, fh)
+            os.replace(tmp_path, local_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        return bytes_written
+
+    def _read_range(self, path: str, offset: int, length: int | None, fh) -> int:
+        if offset < 0 or (length is not None and length < 0):
+            raise InvalidPathError(f"rango inválido: offset={offset}, length={length}")
+        # D-P3: el lock compartido se toma antes de ListBlocks y dura toda la lectura,
+        # igual que en download: un writer o el GC no pueden cambiar la versión leída.
+        held = self.lock(path, "r")
+        try:
+            blocks = self._call("ListBlocks", control_node_pb2.ListBlocksRequest(path=path)).blocks
+            size = sum(block.size_bytes for block in blocks)
+            if offset > size:
+                raise InvalidPathError(f"offset {offset} fuera del archivo ({size} bytes)")
+            end = size if length is None else min(size, offset + length)
+            bytes_written = 0
+            block_start = 0
+            # Los bloques se ubican sumando tamaños: solo el último puede ser más corto (D-P4).
+            for block in blocks:
+                block_end = block_start + block.size_bytes
+                if block_start < end and block_end > offset:
+                    start_in_block = max(offset, block_start) - block_start
+                    count = min(end, block_end) - block_start - start_in_block
+                    bytes_written += self._read_block_with_failover(block, fh, start_in_block, count)
+                block_start = block_end
+            return bytes_written
+        except grpc.RpcError as exc:
+            raise _translate(exc) from exc
+        finally:
+            try:
+                held.release()
+            except DFShaError:
+                # Un Unlock fallido no cambia el resultado de la lectura; el lease lo
+                # libera después.
+                pass
+
+    def _read_block_with_failover(self, block, fh, offset: int = 0, length: int = 0) -> int:
+        """Prueba otra réplica solo cuando una falla recuperable invalida este bloque.
+
+        offset y length piden un rango dentro del bloque; length 0 = hasta el final."""
         start = fh.tell()
         last_error: grpc.RpcError | None = None
         for address in block.datanode_addresses:
             try:
-                request = data_node_pb2.ReadBlockRequest(block_id=block.block_id)
+                request = data_node_pb2.ReadBlockRequest(
+                    block_id=block.block_id, offset=offset, length=length
+                )
                 for chunk in self._datanode_stub(address).ReadBlock(
-                    request, timeout=self._block_transfer_timeout(getattr(block, "size_bytes", 0))
+                    request,
+                    timeout=self._block_transfer_timeout(length or getattr(block, "size_bytes", 0)),
                 ):
                     fh.write(chunk.data)
                 return fh.tell() - start

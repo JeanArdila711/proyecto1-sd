@@ -31,7 +31,14 @@ message WriteBlockResponse {
 message PingRequest {}
 message PingResponse {}
 
-message ReadBlockRequest { string block_id = 1; }
+// offset y length recortan la lectura dentro del bloque (RF3 `read`). length 0 = hasta
+// el final del bloque, así un cliente que no manda los campos sigue leyendo el bloque
+// completo.
+message ReadBlockRequest {
+  string block_id = 1;
+  int64 offset = 2;
+  int64 length = 3;
+}
 message ReadBlockChunk { bytes data = 1; }
 
 message DeleteBlockRequest { string block_id = 1; }

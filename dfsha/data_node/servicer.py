@@ -154,8 +154,17 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
         return data_node_pb2.WriteBlockResponse(checksum=checksum, bytes_written=bytes_written)
 
     def ReadBlock(self, request, context):
+        # offset y length llegan de la red: se validan acá, antes de tocar el disco.
+        if request.offset < 0 or request.length < 0:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"rango inválido: offset={request.offset}, length={request.length}",
+            )
+        length = request.length or None  # 0 = hasta el final del bloque
         try:
-            for chunk in block_store.read_block(self._root, request.block_id, CHUNK_SIZE_BYTES):
+            for chunk in block_store.read_block(
+                self._root, request.block_id, CHUNK_SIZE_BYTES, request.offset, length
+            ):
                 yield data_node_pb2.ReadBlockChunk(data=chunk)
         except (BlockNotFoundError, BlockCorruptedError) as exc:
             _abort_on_domain_error(context, exc)

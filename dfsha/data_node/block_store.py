@@ -48,7 +48,15 @@ def write_block(root: Path, block_id: str, chunks: Iterable[bytes]) -> tuple[str
     return checksum, bytes_written
 
 
-def read_block(root: Path, block_id: str, chunk_size: int) -> Iterator[bytes]:
+def read_block(
+    root: Path, block_id: str, chunk_size: int, offset: int = 0, length: int | None = None
+) -> Iterator[bytes]:
+    """Entrega el bloque, o solo `length` bytes desde `offset` (None: hasta el final).
+
+    ponytail: verificar todo el bloque para leer un rango cuesta leerlo entero;
+    checksums por chunk si llega a importar."""
+    if offset < 0 or (length is not None and length < 0):
+        raise ValueError(f"rango inválido: offset={offset}, length={length}")
     target = _block_path(root, block_id)
     checksum_path = _checksum_path(root, block_id)
     if not target.exists() or not checksum_path.exists():
@@ -67,7 +75,15 @@ def read_block(root: Path, block_id: str, chunk_size: int) -> Iterator[bytes]:
         )
 
     with target.open("rb") as fh:
-        yield from iter(lambda: fh.read(chunk_size), b"")
+        fh.seek(offset)
+        remaining = length
+        while remaining is None or remaining > 0:
+            chunk = fh.read(chunk_size if remaining is None else min(chunk_size, remaining))
+            if not chunk:
+                return
+            if remaining is not None:
+                remaining -= len(chunk)
+            yield chunk
 
 
 def delete_block(root: Path, block_id: str) -> None:

@@ -19,6 +19,9 @@ cambios. Sobre eso, Hito 2 agrega la arquitectura distribuida:
   para no cargar archivos grandes en memoria.
 - **RF3 parcial (B1)** — locks lectores/escritor con lease: varios lectores
   conviven, un escritor es exclusivo y los leases vencidos se liberan solos.
+- **RF3 parcial (B2)** — `read` por rangos de bytes: `cat <ruta> [offset] [largo]`
+  y `read <ruta> <offset> <largo> <local>` en la shell. Cada DataNode sirve solo
+  la parte pedida de cada bloque, y la lectura toma un lock compartido mientras dura.
 - **Hito 2 / sub-proyecto 1** — ControlNode (metadatos del árbol) separado
   de un DataNode (bloques), particionamiento de archivos en bloques (128 MB
   por defecto) y un cliente/shell distribuida que habla con ambos.
@@ -148,6 +151,6 @@ Los binarios legacy versionados y su procedimiento de regeneración están en
 
 ## Fuera de alcance por ahora
 
-RF3 parcial: B1 incorpora `lock` lectores/escritor con lease; `open` y `write`
-copy-on-write completos se incorporan con B3. Detección automática de DataNodes
+RF3 parcial: B1 incorpora `lock` lectores/escritor con lease y B2 `read` por
+rangos; `open` y `write` copy-on-write completos se incorporan con B3. Detección automática de DataNodes
 caídos, re-replicación y autenticación siguen en el roadmap.

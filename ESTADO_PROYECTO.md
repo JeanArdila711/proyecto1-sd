@@ -204,3 +204,12 @@ python -m pytest tests/ -v
 - **Delay:** se repara una réplica caída solo cuando lleva más de `--rereplication-delay-s` muerta (según `DataNodeMonitor.dead_for`), y el ciclo nunca duerme. Antes dormía el delay antes de cada reparación y después actuaba con una foto vieja: un nodo que revivía durante la espera igual se sacaba de la metadata. Un bloque escrito con menos copias (D-P2), sin réplicas muertas, se completa en el siguiente ciclo.
 - **Origen corrupto:** `ReplicateBlock` verifica el bloque local antes de abrir el stream al destino, así un origen corrupto responde `DATA_LOSS` y uno sin el bloque `NOT_FOUND` (antes salían como `UNAVAILABLE`). El re-replicador prueba el siguiente origen vivo en vez de insistir con el primero, que dejaba un bloque sin reparar para siempre.
 - **Límite conocido:** el re-replicador decide por liveness, no por integridad. Una réplica corrupta en un nodo vivo sigue contando como copia: la lectura la esquiva por failover, pero nadie la repone. Detectarla requiere un escaneo periódico de checksums, que no está en el plan.
+
+## Hito 3 — B2: lectura por rangos
+
+- `ReadBlockRequest` suma `offset` y `length` (0 = hasta el final del bloque, compatible con clientes viejos). El DataNode valida el rango antes de tocar el disco (`INVALID_ARGUMENT` si es negativo) y `block_store.read_block` conserva su firma anterior.
+- La verificación del SHA-256 sigue siendo del bloque completo, aunque se pida un rango: nunca se sirve un pedazo de un bloque podrido. El costo es leer el bloque entero para servir un rango chico; está anotado con `ponytail:` y se resuelve con checksums por chunk si llega a importar.
+- Cliente: `read(path, offset, length)` devuelve bytes y `read_to_file` escribe a un archivo local de forma atómica. Ubica los bloques sumando sus tamaños, pide a cada DataNode solo su parte, con un deadline calculado por esos bytes, y hace failover entre réplicas descartando bytes parciales, como `download`.
+- Por D-P3, la lectura toma el lock compartido antes de `ListBlocks` y lo mantiene hasta terminar; un `Unlock` fallido al final no convierte en error una lectura exitosa.
+- Shell: `cat <ruta> [offset] [largo]` y `read <ruta> <offset> <largo> <local>`. Los comandos de RF3 (`cat`, `read`, `lock`, `unlock`, `locks`) ahora avisan "no disponible" con el cliente de Hito 1 en vez de tumbar la shell con `AttributeError`, un bug de B1 corregido de paso.
+- Implementado por Claude fuera de Kiro, en paralelo con A2, para ahorrar créditos.
