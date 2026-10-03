@@ -1,6 +1,6 @@
-# DFSha — Especificación de comunicaciones (Hito 2)
+# DFSha — Especificación de comunicaciones
 
-> **Estado:** BORRADOR para revisión del equipo. Describe lo implementado en `main`.
+> **Estado:** describe lo implementado en `main` al cierre de la parte de alta disponibilidad, consistencia y cifrado en reposo del Hito 3. TLS, usuarios y permisos (C1–C3) todavía no están: §10 dice qué cambia cuando entren.
 > **Qué cubre:** los cinco enlaces que pide el enunciado — Cliente↔ControlNode, Cliente↔DataNode, ControlNode↔ControlNode, ControlNode↔DataNode, DataNode↔DataNode —, con protocolo, contrato, semántica de fallos y justificación de cada decisión.
 > **Contratos fuente:** `proto/control_node.proto`, `proto/data_node.proto`. Consenso: `pysyncobj==0.3.17`.
 
@@ -26,20 +26,20 @@ flowchart LR
     C == "② gRPC streaming<br/>WriteBlock / ReadBlock" ==> DN1
     CN0 <-- "③ TCP pysyncobj (Raft)" --> CN1
     CN1 <-- "③" --> CN2
-    CN0 -- "④ gRPC unario<br/>DeleteBlock" --> DN2
+    CN0 -- "④ Ping, ReplicateBlock,<br/>ListStoredBlocks, DeleteBlock" --> DN2
     DN1 == "⑤ gRPC streaming<br/>WriteBlock (pipeline)" ==> DN2
     DN2 == "⑤" ==> DN3
 ```
 
 | # | Enlace | Protocolo | Estilo | Qué transporta | Puerto (Docker) |
 |:---:|---|---|---|---|---|
-| ① | Cliente → ControlNode | gRPC sobre HTTP/2 | Unario, petición-respuesta | Metadatos (KB) | `50051` |
-| ② | Cliente → DataNode | gRPC sobre HTTP/2 | *Client streaming* (escritura), *server streaming* (lectura) | Bloques (MB) | `50061` |
+| ① | Cliente → ControlNode | gRPC sobre HTTP/2 | Unario, petición-respuesta | Metadatos, locks, reservas de escritura (KB) | `50051` |
+| ② | Cliente → DataNode | gRPC sobre HTTP/2 | *Client streaming* (escritura), *server streaming* (lectura) | Bloques o rangos de bloque (MB) | `50061` |
 | ③ | ControlNode ↔ ControlNode | TCP propio de `pysyncobj` | Mensajes asíncronos de Raft | Log replicado, votos, heartbeats | `6000` |
-| ④ | ControlNode → DataNode | gRPC sobre HTTP/2 | Unario, *best-effort* | Órdenes de borrado | `50061` |
-| ⑤ | DataNode → DataNode | gRPC sobre HTTP/2 | *Client streaming* encadenado | Réplicas de bloques | `50061` |
+| ④ | ControlNode → DataNode | gRPC sobre HTTP/2 | Unario y *server streaming* | Liveness, órdenes de copia y de borrado, inventario | `50061` |
+| ⑤ | DataNode → DataNode | gRPC sobre HTTP/2 | *Client streaming* encadenado | Réplicas de bloques (pipeline y re-replicación) | `50061` |
 
-**Principio que gobierna el diseño: separación de planos.** Por el ControlNode solo pasan metadatos; los bytes de los archivos van siempre directo entre cliente y DataNodes, o entre DataNodes. La carga del ControlNode crece con el número de operaciones, no con el volumen de datos.
+**Principio que gobierna el diseño: separación de planos.** Por el ControlNode solo pasan metadatos; los bytes de los archivos van siempre directo entre cliente y DataNodes, o entre DataNodes. La carga del ControlNode crece con el número de operaciones, no con el volumen de datos. Esto se mantiene también en la re-replicación: el ControlNode ordena la copia, pero los bytes van de un DataNode a otro.
 
 ---
 
@@ -61,22 +61,25 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 
 ## 3. Enlace ① — Cliente → ControlNode
 
-**Servicio:** `dfsha.control_node.ControlNodeService` (9 RPC, todos unarios).
+**Servicio:** `dfsha.control_node.ControlNodeService` (15 RPC, todos unarios).
 
 | RPC | Muta | Descripción |
 |---|:---:|---|
 | `ListDir(path)` | — | Hijos de un directorio. Solo archivos `committed`. |
 | `MakeDir(path, op_id)` | ✓ | El padre debe existir. |
 | `RemoveDir(path, op_id)` | ✓ | Solo directorios vacíos. |
-| `Remove(path, op_id)` | ✓ | Borra el archivo; dispara ④ para sus bloques. |
-| `BeginUpload(path, size_bytes, op_id)` | ✓ | Reserva `⌈size / block_size⌉` bloques y elige su pipeline. El archivo queda `pending` con un lease. |
+| `Remove(path, op_id)` | ✓ | Borra el archivo si nadie tiene un lock vigente; dispara `DeleteBlock` (④) para sus bloques. |
+| `BeginUpload(path, size_bytes, op_id)` | ✓ | Reserva `⌈size / block_size⌉` bloques y elige el pipeline de cada uno entre los DataNodes vivos. El archivo queda `pending` con un lease. |
 | `ConfirmBlock(path, block_id, checksum, size_bytes, op_id)` | ✓ | Marca un bloque escrito y renueva el lease. |
 | `CompleteUpload(path, op_id)` | ✓ | `pending → committed` si todos los bloques están confirmados. |
-| `AbortUpload(path, op_id)` | ✓ | Descarta una subida pendiente. |
-| `ListBlocks(path)` | — | Bloques en orden, con réplicas en orden de pipeline y checksum. |
-| `Lock(path, mode, op_id)` | ✓ | Toma lock compartido (`r`) o exclusivo (`w`) con lease. |
+| `AbortUpload(path, op_id)` | ✓ | Descarta una subida pendiente y borra al instante los bloques ya escritos. |
+| `ListBlocks(path)` | — | Bloques en orden, con réplicas en orden de pipeline, tamaño y checksum. |
+| `Lock(path, mode, op_id)` | ✓ | Toma un lock compartido (`r`) o exclusivo (`w`) con lease. Devuelve `lock_id` y `lease_s`. |
 | `RenewLock(path, lock_id, op_id)` | ✓ | Renueva el lease de un lock propio. |
 | `Unlock(path, lock_id, op_id)` | ✓ | Libera un lock propio. |
+| `BeginWrite(path, offset, length, lock_id, op_id)` | ✓ | Reserva bloques nuevos para los bloques que toca una escritura (copy-on-write). |
+| `CommitWrite(path, write_id, base_version, lock_id, slots, op_id)` | ✓ | Publica los bloques nuevos si la versión del archivo no cambió. |
+| `AbortWrite(path, write_id, lock_id, op_id)` | ✓ | Descarta la reserva y borra los bloques nuevos. |
 
 **Descubrimiento del líder.** El cliente recibe la lista de los 3 ControlNodes. Solo el líder atiende; los seguidores responden `UNAVAILABLE`. El cliente empieza por el último líder conocido y rota ante `UNAVAILABLE` o `DEADLINE_EXCEEDED`.
 
@@ -86,24 +89,47 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 | Presupuesto total de reintentos | 15 s | `DEFAULT_FAILOVER_BUDGET_S` (cliente) |
 | Espera entre vueltas | 0,2 s | `_RETRY_BACKOFF_S` (cliente) |
 | Espera del líder por la mayoría | 3 s | `DEFAULT_COMMIT_TIMEOUT_S` (servidor, < timeout del cliente) |
-| Lease de subida pendiente | 600 s | `--upload-lease-s` (servidor) |
+| Lease de subida pendiente y de reserva de escritura | 600 s | `--upload-lease-s` (servidor) |
+| Lease de lock | 30 s; el cliente renueva cada tercio | `--lock-lease-s` (servidor) |
 
 **Semántica de las escrituras.** Cada mutación se replica por Raft y se responde **después** de que la mayoría la confirma. Si el commit no se confirma a tiempo, el resultado es **desconocido** y el servidor responde `UNAVAILABLE`.
 
-**Idempotencia.** Toda mutación lleva `op_id`, generado por el cliente una sola vez por operación lógica y reutilizado en cada reintento. El ControlNode deduplica por `op_id` dentro del estado replicado (últimas 10.000 operaciones), así que un nuevo líder también reconoce lo ya aplicado. Un `op_id` vacío se rechaza con `INVALID_ARGUMENT`.
+**Idempotencia.** Toda mutación lleva `op_id`, generado por el cliente una sola vez por operación lógica y reutilizado en cada reintento. El ControlNode deduplica por `op_id` dentro del estado replicado (últimas 10.000 operaciones), así que un nuevo líder también reconoce lo ya aplicado y devuelve el resultado original. Un `op_id` vacío se rechaza con `INVALID_ARGUMENT`.
 
 **Semántica de las lecturas.** Linealizables: antes de leer, el líder confirma por Raft una entrada vacía (`read_barrier`). Un líder aislado de la mayoría no puede confirmarla y responde `UNAVAILABLE` en vez de servir datos viejos.
 
-**Errores.**
+**Determinismo.** Todo lo que no es determinista lo decide el líder **antes** del commit y viaja en los argumentos del comando replicado: la hora (`now`) para leases, los `block_id` nuevos y las réplicas vivas. La máquina de estados solo valida y aplica.
+
+### Locks (RF3)
+
+- Varios lectores (`r`) o un escritor (`w`) por archivo. Las rutas se canonizan: `/docs/a.txt`, `docs/a.txt` y `/docs//a.txt` compiten por el mismo lock.
+- Un lock vence si no se renueva en `lease_s`; los vencidos se limpian en la siguiente mutación. Así, un cliente que muere no deja un archivo bloqueado para siempre.
+- `receive`, `cat` y `read` toman un lock compartido mientras leen; `write` toma el exclusivo si el cliente no tiene ya un handle abierto con `open`.
+- `Remove` sobre un archivo con un lock vigente y `Lock` en conflicto responden `ABORTED` (`ConflictError`).
+
+### Escritura por rangos (copy-on-write)
+
+Los bloques son inmutables. `write` reserva bloques nuevos, el cliente los escribe por el pipeline normal (② y ⑤) y el commit los publica juntos. Hasta el commit, quien lea ve el archivo anterior.
+
+| RPC | Qué hace | Errores |
+|---|---|---|
+| `BeginWrite` | Pasa la barrera de lectura, arma la propuesta (IDs y réplicas vivas) y la reserva por Raft; la máquina de estados la vuelve a validar. Devuelve `write_id`, `base_version`, `block_size` y un `WriteSlot` por bloque tocado (bloque viejo y bloque nuevo) | `ABORTED` sin lock exclusivo vigente o si el archivo cambió; `PERMISSION_DENIED` (`InvalidPathError`) si `offset` > tamaño o `length` ≤ 0 |
+| `CommitWrite` | Compare-and-set de `FileNode.version`: si sigue siendo `base_version`, la reserva sigue vigente y el lock sigue siendo del writer, publica y suma 1 a la versión. Después del commit, el líder borra los bloques viejos | `ABORTED` si algo de lo anterior no se cumple; no publica nada |
+| `AbortWrite` | Descarta la reserva y borra los bloques nuevos. Abortar una reserva que ya no existe no es error | `ABORTED` si la reserva es de otro lock |
+
+Cuando la escritura toca un bloque solo en parte, el cliente primero lee el bloque viejo con `ReadBlock` para completarlo. Si `CommitWrite` queda con resultado incierto, el `AbortWrite` posterior es inofensivo: una reserva ya publicada no existe y no se borra nada.
+
+### Errores
 
 | `StatusCode` | Excepción de dominio | Cuándo |
 |---|---|---|
 | `NOT_FOUND` | `PathNotFoundError` | Ruta inexistente, o subida pendiente que no existe |
 | `ALREADY_EXISTS` | `PathExistsError` | Nombre ocupado (incluida una subida pendiente con lease vivo) |
 | `FAILED_PRECONDITION` | `NotEmptyError` | `rmdir` de un directorio con contenido |
-| `PERMISSION_DENIED` | `InvalidPathError` | Ruta con `..`, borrar la raíz, tamaño ≤ 0 |
+| `PERMISSION_DENIED` | `InvalidPathError` | Ruta con `..`, borrar la raíz, tamaño ≤ 0, rango de escritura inválido |
 | `INVALID_ARGUMENT` | `NotAFileError`, `NotADirectoryError` | Tipo de nodo equivocado; `op_id` vacío |
-| `UNAVAILABLE` | — (el cliente reintenta) | Nodo seguidor, nodo caído, commit o barrera sin confirmar |
+| `ABORTED` | `ConflictError` | Lock en conflicto, archivo con locks al borrarlo, escritura sobre una versión vieja |
+| `UNAVAILABLE` | — (el cliente reintenta) | Nodo seguidor, nodo caído, commit o barrera sin confirmar, menos DataNodes vivos que `--min-write-replicas` |
 
 ---
 
@@ -116,29 +142,40 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 ```
 mensaje 1:  WriteBlockChunk{ header: { block_id, downstream: [dn2:50061, dn3:50061] } }
 mensaje 2…: WriteBlockChunk{ data: <≤ 1 MiB> }
-respuesta:  { checksum: <SHA-256 hex>, bytes_written }
+respuesta:  { checksum: <SHA-256 hex del texto plano>, bytes_written }
 ```
 
-- El cliente escribe **solo a la cabeza** del pipeline (`datanode_addresses[0]` de `BeginUpload`); `downstream` es el resto de la lista. La replicación es responsabilidad del clúster (enlace ⑤).
+- El cliente escribe **solo a la cabeza** del pipeline (`datanode_addresses[0]` de `BeginUpload` o del `WriteSlot`); `downstream` es el resto de la lista. La replicación es responsabilidad del clúster (enlace ⑤).
 - El primer mensaje **debe** ser el header; si no, `INVALID_ARGUMENT`.
-- `block_id` debe ser exactamente 32 hexadecimales en minúscula (se valida antes de tocar el disco).
-- La respuesta llega cuando **las 3 réplicas** terminaron (quórum 3 de 3). El checksum devuelto es el que el cliente reporta en `ConfirmBlock`.
+- `block_id` debe ser exactamente 32 hexadecimales en minúscula (se valida antes de tocar el disco y antes de reenviar).
+- La respuesta llega cuando **todas las réplicas del pipeline** terminaron: 3, o 2 si el ControlNode armó el pipeline con un DataNode caído. El checksum devuelto es el que el cliente reporta en `ConfirmBlock`.
 
 ### Lectura: `ReadBlock(block_id, offset, length) → stream ReadBlockChunk`
 
-- `offset` y `length` (Hito 3, B2) piden un rango dentro del bloque; `length` 0 significa hasta el final, así que un cliente que no los manda lee el bloque completo. Un rango negativo: `INVALID_ARGUMENT`.
-- Cada DataNode guarda un único contenedor cifrado autocontenido `DFSE1` por `block_id`: AES-256-GCM por chunks de 1 MiB, nonce de prefijo aleatorio más contador y AAD con `block_id`, índice y marca final. No hay sidecar `.sha256` ni archivos plaintext.
-- La metadata final autenticada fija tamaño lógico, cantidad de chunks y SHA-256 del plaintext. `ReadBlock` autentica primero esa metadata y después solo los chunks requeridos por el rango; magic ausente, framing legacy/plaintext, truncación o tag inválido producen `DATA_LOSS` sin migración silenciosa.
-- El checksum de `WriteBlock` sigue siendo SHA-256 hexadecimal del plaintext y se compara entre réplicas.
-- **Failover en el cliente:** prueba las réplicas en orden; ante `UNAVAILABLE` o `DATA_LOSS` descarta los bytes parciales de ese bloque (`seek` + `truncate`) y pasa a la siguiente. Solo falla si fallan todas.
+- `offset` y `length` piden un rango dentro del bloque; `length` 0 significa hasta el final, así que un cliente que no los manda lee el bloque completo. Un rango negativo: `INVALID_ARGUMENT`.
+- El cliente traduce un rango del archivo (`cat`, `read`) a rangos de bloque sumando los tamaños que devuelve `ListBlocks`, y pide a cada DataNode solo su parte.
+- **Failover:** prueba las réplicas en orden; ante `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` marcado como `BlockNotFoundError`, descarta los bytes parciales de ese bloque (`seek` + `truncate`) y pasa a la siguiente. Solo falla si fallan todas.
+
+### Almacenamiento cifrado
+
+Cada DataNode guarda un único contenedor `DFSE1` por `block_id`:
+
+| Parte | Contenido |
+|---|---|
+| Header | Magic `DFSE1`, versión y prefijo aleatorio de nonce (8 bytes) |
+| Chunks | Hasta 1 MiB de texto plano cada uno, cifrado con AES-256-GCM. Nonce = prefijo + contador de 4 bytes; AAD = `block_id`, índice y marca de último |
+| Metadata final | Tamaño lógico, número de chunks y SHA-256 del texto plano, también autenticada (contador 2³²−1) |
+
+`ReadBlock` autentica primero la metadata y después solo los chunks del rango pedido. Magic ausente, un archivo en texto plano, truncación o un tag inválido producen `DATA_LOSS`. La llave es de 32 bytes, distinta por DataNode, y se pasa con `--encryption-key-file`.
 
 | `StatusCode` | Significado |
 |---|---|
 | `NOT_FOUND` | El DataNode no tiene ese bloque, o el `block_id` es inválido |
-| `DATA_LOSS` | Checksum no coincide (lectura), o réplicas con checksum distinto (escritura) |
+| `DATA_LOSS` | Bloque corrupto, truncado o cifrado con otra llave (lectura); réplicas con checksum distinto (escritura) |
 | `UNAVAILABLE` | DataNode caído, o falló una réplica aguas abajo del pipeline |
+| `INVALID_ARGUMENT` | Stream sin header, rango negativo |
 
-**Deadlines (desde Hito 3, A1):** cada `ReadBlock` y `WriteBlock` lleva un deadline calculado por la cantidad de bytes que mueve (base más tamaño sobre un throughput mínimo), así que un DataNode colgado no bloquea la operación y una transferencia lenta pero activa no se corta. *(Antes decía: "Limitación conocida: estas llamadas no tienen deadline en el cliente; un DataNode colgado (no caído) bloquearía la operación".)*
+**Deadlines.** Cada `ReadBlock` y `WriteBlock` lleva un deadline calculado por los bytes que mueve: 5 s más el tamaño a 1 MiB/s. Un DataNode colgado no bloquea la operación y una transferencia lenta pero activa no se corta.
 
 ---
 
@@ -156,32 +193,66 @@ respuesta:  { checksum: <SHA-256 hex>, bytes_written }
 | Conexión considerada muerta | Tras 3,5 s sin datos |
 | Reintento de conexión | Cada 5 s |
 | Persistencia | `raft.journal` (log) y `raft.dump` (snapshot) en `--data-dir`; compactación cada 5.000 entradas, sin `fork()` |
-| Comando replicado | Uno genérico, `apply(op_id, method, args)`, con lista blanca de 7 mutaciones; nunca lanza excepciones ni tiene efectos secundarios |
+| Comando replicado | Uno genérico, `apply(op_id, method, args)`, con lista blanca de 14 mutaciones; nunca lanza excepciones ni tiene efectos secundarios |
+
+**Qué se replica y qué no.** Se replican el árbol, los bloques de cada archivo con sus réplicas, las subidas pendientes, los locks, las reservas de escritura y los `op_id` aplicados. **No** se replica qué DataNodes están vivos: cada ControlNode lo mide por su cuenta (§6), porque es una observación local y cambia cada segundo.
 
 **Direccionamiento.** `pysyncobj` escucha en la misma dirección que anuncia a los demás, así que la dirección de Raft debe ser resoluble por los otros nodos: nombres de servicio en Docker (`cn0:6000`), IPs o DNS privados en despliegue real. `localhost` solo sirve con los 3 nodos en la misma máquina.
 
-> ⚠️ **Seguridad:** este enlace no está cifrado ni autenticado, y deserializar `pickle` de la red permite ejecutar código arbitrario. **El puerto de Raft nunca debe exponerse fuera de la red privada.** En Docker Compose no se publica. Para el Hito 3, `pysyncobj` permite cifrado y autenticación del canal configurando `password` (usa Fernet con clave derivada por PBKDF2; requiere el paquete `cryptography`).
+> ⚠️ **Seguridad:** este enlace no está cifrado ni autenticado, y deserializar `pickle` de la red permite ejecutar código arbitrario. **El puerto de Raft nunca debe exponerse fuera de la red privada.** En Docker Compose no se publica. `pysyncobj` cifra y autentica el canal con `password` (Fernet, clave derivada por PBKDF2): el spike S2 lo probó con tres nodos, reinicio y un nodo con otra password, pero todavía no está activado en el ControlNode.
 
 ---
 
 ## 6. Enlace ④ — ControlNode → DataNode
 
-**RPC:** `DeleteBlock(block_id) → DeleteBlockResponse`, unario.
+Cuatro RPC de `DataNodeService` que solo usa el ControlNode.
 
-| Cuándo se envía | Semántica |
-|---|---|
-| Tras confirmar un `Remove` | *Best-effort*: la metadata ya se borró; un fallo no revierte la operación ni se reporta al cliente |
-| Tras un `BeginUpload` que reemplazó una subida pendiente con lease vencido | Ídem, para los bloques de la subida abandonada |
+| RPC | Estilo | Quién y cuándo | Semántica |
+|---|---|---|---|
+| `Ping()` | Unario | Cada ControlNode, cada `--heartbeat-interval-s` (2 s), deadline de 1 s | Un DataNode sin respuesta durante `--datanode-dead-after-s` (6 s) sale de los pipelines de **ese** ControlNode. Vuelve en cuanto responde |
+| `ReplicateBlock(block_id, target)` | Unario | El líder, cuando un bloque tiene menos copias que el factor | El DataNode origen verifica su copia y la envía completa a `target` con `WriteBlock` (enlace ⑤). Responde con el checksum |
+| `ListStoredBlocks()` | *Server streaming* | El líder, cada `--gc-interval-s` (60 s) | Inventario: `block_id`, tamaño y **edad** calculada con el reloj del DataNode |
+| `DeleteBlock(block_id)` | Unario | El líder, después de un commit | *Best-effort*. `NOT_FOUND` cuenta como éxito |
 
-Se envía **solo desde el líder y después del commit**, nunca dentro de la máquina de estados: `apply()` se ejecuta en los 3 nodos y se reproduce en cada reinicio.
+Todos llevan deadline. Ninguno se envía desde dentro de la máquina de estados: `apply()` corre en los 3 nodos y se reproduce en cada reinicio.
 
-**Lo que este enlace todavía no tiene** (Hito 3): *heartbeats* y *block reports* del DataNode al ControlNode. Sin ellos, el ControlNode no detecta DataNodes caídos, no re-replica y no limpia bloques huérfanos; la lista de DataNodes es estática (`--datanode-addresses`).
+### Detección de fallos (liveness)
+
+Es *pull*: el ControlNode pregunta y el DataNode solo responde. Así un DataNode no necesita saber quién es el líder, y un ControlNode recién elegido ya tiene su propia vista. `BeginUpload` y `BeginWrite` arman cada pipeline con `min(factor, vivos)` DataNodes en round-robin; con menos de `--min-write-replicas` (2) vivos responden `UNAVAILABLE` antes de reservar nada.
+
+### Re-replicación
+
+```mermaid
+sequenceDiagram
+    participant L as ControlNode líder
+    participant F as Seguidores
+    participant O as DataNode origen
+    participant D as DataNode destino
+    L->>L: read_barrier y foto de bloques confirmados
+    L->>L: réplica caída hace más de --rereplication-delay-s
+    L->>O: ReplicateBlock(block_id, target=D)
+    O->>O: verifica su copia
+    O->>D: WriteBlock (stream, downstream vacío)
+    D-->>O: checksum
+    O-->>L: checksum
+    L->>F: apply(update_block_replicas, esperadas, nuevas)
+    F-->>L: mayoría confirma
+```
+
+- Solo corre en el líder, cada `--rereplication-interval-s` (10 s), con hasta `--rereplication-max-per-cycle` (4) copias por ciclo.
+- Repara una réplica caída solo si lleva más de `--rereplication-delay-s` (30 s) muerta: un reinicio corto no dispara copias de bloques enteros. Un bloque escrito con 2 copias se completa en el siguiente ciclo.
+- `update_block_replicas` es un compare-and-set: si las réplicas cambiaron mientras se copiaba, o el archivo se borró, no publica nada y la copia queda para el recolector.
+- Un origen corrupto responde `DATA_LOSS`; el líder prueba el siguiente origen vivo.
+
+### Recolector de huérfanos
+
+Solo en el líder. Primero pide `ListStoredBlocks` a cada DataNode vivo y **después** pasa la barrera y toma la foto de la metadata: con ese orden, un bloque reservado entre las dos lecturas ya figura en la foto. Borra un bloque que ningún archivo, subida pendiente ni reserva de escritura usa, o una réplica que la metadata ya no asigna a ese nodo, si tiene más de `--gc-grace-s` (1200 s) de edad. La gracia cubre lo que un líder recién elegido no ve, como copias en vuelo del líder anterior.
 
 ---
 
 ## 7. Enlace ⑤ — DataNode → DataNode (pipeline de replicación)
 
-**RPC:** el mismo `WriteBlock` del enlace ②. Un DataNode que reenvía es, para el siguiente, un cliente más.
+**RPC:** el mismo `WriteBlock` del enlace ②. Un DataNode que reenvía es, para el siguiente, un cliente más. `ReplicateBlock` (§6) también usa este enlace, con `downstream` vacío.
 
 ```mermaid
 sequenceDiagram
@@ -194,8 +265,8 @@ sequenceDiagram
     B->>D: header{block_id, downstream:[]}
     loop por cada chunk de 1 MiB
         C->>A: data
-        A->>B: data (mientras escribe a disco)
-        B->>D: data (mientras escribe a disco)
+        A->>B: data (mientras cifra y escribe a disco)
+        B->>D: data (mientras cifra y escribe a disco)
     end
     D-->>B: checksum
     B-->>A: checksum (si coincide con el suyo)
@@ -204,15 +275,16 @@ sequenceDiagram
 
 | Aspecto | Comportamiento |
 |---|---|
-| Orden del pipeline | Round-robin en el ControlNode: cada bloque empieza un DataNode más adelante |
+| Orden del pipeline | Round-robin entre los DataNodes vivos: cada bloque empieza un DataNode más adelante |
 | Escritura y reenvío | Simultáneos: cada chunk va a disco y a una cola hacia el siguiente |
 | Memoria | Cola acotada a 4 chunks (4 MiB): si el siguiente va lento, el anterior se bloquea (*backpressure*) |
 | Hilos | Pool propio de 10 para reenviar, separado del del servidor gRPC, para que el pipeline no se bloquee a sí mismo |
-| Quórum | 3 de 3. Si falla un eslabón, cada nodo anterior borra su copia y responde `UNAVAILABLE`; el cliente aborta la subida |
+| Fallo de un eslabón | Cada nodo anterior borra su copia y responde `UNAVAILABLE`; el cliente aborta la subida. La protección contra un DataNode caído está antes: el ControlNode no lo incluye en el pipeline |
 | Integridad | Cada eslabón compara su SHA-256 con el del siguiente; si difieren, `DATA_LOSS` |
-| Factor | `--replication-factor` (3). Con menos DataNodes que el factor, se replica en todos los disponibles |
+| Cifrado | Cada DataNode cifra con su propia llave: el mismo bloque es distinto en cada disco, con el mismo checksum de texto plano |
+| Deadline | El reenvío usa el tiempo restante del deadline entrante |
 
-**Consecuencia a tener presente:** con exactamente 3 DataNodes y factor 3, un solo DataNode caído hace fallar **todas** las escrituras (las lecturas siguen funcionando). Es el costo de la escritura síncrona 3 de 3 con lista estática; se resuelve con detección de fallos por heartbeats (Hito 3).
+**Ventana conocida:** entre que un DataNode cae y el monitor lo da por muerto (`--datanode-dead-after-s`), una subida cuyo pipeline lo incluya falla. Pasada esa ventana, las subidas funcionan con 2 réplicas.
 
 ---
 
@@ -227,6 +299,7 @@ sequenceDiagram
     participant F as Seguidores
     participant P as Pipeline DN
     C->>L: BeginUpload(path, size, op_id)
+    L->>L: elige pipelines entre DataNodes vivos
     L->>F: apply(begin_upload) por Raft
     F-->>L: mayoría confirma
     L-->>C: bloques + pipelines
@@ -249,17 +322,39 @@ sequenceDiagram
     participant C as Cliente
     participant L as ControlNode líder
     participant R as Réplicas DN
+    C->>L: Lock(path, r)
     C->>L: ListBlocks(path)
     L->>L: read_barrier por Raft
     L-->>C: bloques en orden + réplicas + checksums
     loop por bloque
         C->>R: ReadBlock a la 1ª réplica
-        alt UNAVAILABLE o DATA_LOSS
+        alt UNAVAILABLE, DEADLINE_EXCEEDED o DATA_LOSS
             C->>R: ReadBlock a la siguiente réplica
         end
         R-->>C: bytes verificados
     end
     C->>C: os.replace(.part → destino)
+    C->>L: Unlock(path)
+```
+
+### Escritura (`write`)
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant L as ControlNode líder
+    participant P as Pipeline DN
+    C->>L: Lock(path, w)
+    C->>L: BeginWrite(path, offset, length, lock_id)
+    L-->>C: write_id, base_version, slots (bloque viejo → bloque nuevo)
+    loop por slot
+        C->>P: ReadBlock del bloque viejo (si se toca en parte)
+        C->>P: WriteBlock del bloque nuevo
+    end
+    C->>L: CommitWrite(write_id, base_version, slots)
+    L->>L: CAS de versión por Raft
+    L->>P: DeleteBlock de los bloques viejos
+    C->>L: Unlock(path)
 ```
 
 ---
@@ -270,23 +365,27 @@ sequenceDiagram
 |---|---|---|
 | **Docker Compose** | Red bridge `dfsha`: `cn0..cn2`, `dn1..dn3` | Nada. El cliente corre dentro de la red (`docker compose run shell`) |
 | **Procesos locales** | `localhost` con puertos distintos por nodo | — |
-| **AWS (Hito 3)** | IPs o DNS privados de la VPC | Solo lo que usen los clientes; nunca el puerto de Raft |
+| **AWS** | IPs o DNS privados de la VPC | Solo lo que usen los clientes; nunca el puerto de Raft |
 
-**Dirección anunciada.** El ControlNode entrega al cliente las direcciones de los DataNodes **tal como están configuradas** en `--datanode-addresses`. Deben ser resolubles y alcanzables **desde el cliente**. Es la razón por la que, en Docker, la shell corre dentro de la red: `dn1:50061` no resuelve desde el host.
+**Dirección anunciada.** El ControlNode entrega al cliente las direcciones de los DataNodes **tal como están configuradas** en `--datanode-addresses`. Deben ser resolubles y alcanzables **desde el cliente**. Es la razón por la que, en Docker, la shell corre dentro de la red: `dn1:50061` no resuelve desde el host. Las mismas direcciones usa el ControlNode para `Ping`, re-replicación y recolector, así que también deben ser alcanzables desde los ControlNodes.
 
 ---
 
-## 10. Seguridad (estado actual y plan para Hito 3)
+## 10. Seguridad
 
-| Enlace | Hoy | Hito 3 |
+| Enlace | Hoy | Plan (C1–C3) |
 |---|---|---|
-| ① Cliente ↔ ControlNode | `insecure_channel`, sin autenticación | TLS + autenticación de usuario (token) + ACL por ruta |
-| ② Cliente ↔ DataNode | `insecure_channel` | TLS + token de acceso al bloque emitido por el ControlNode |
-| ③ ControlNode ↔ ControlNode | Sin cifrar, `pickle` en el cable | `password` de `pysyncobj` (Fernet) y puerto solo en red privada |
-| ④ ControlNode → DataNode | `insecure_channel` | mTLS |
-| ⑤ DataNode ↔ DataNode | `insecure_channel` | mTLS |
+| ① Cliente ↔ ControlNode | `insecure_channel`, sin autenticación | TLS + token de usuario en la metadata de cada RPC + permisos por ruta |
+| ② Cliente ↔ DataNode | `insecure_channel` | TLS + capability por bloque, firmada por el ControlNode |
+| ③ ControlNode ↔ ControlNode | Sin cifrar, `pickle` en el cable; puerto solo en la red privada | `password` de `pysyncobj` (Fernet), ya probado en el spike S2 |
+| ④ ControlNode → DataNode | `insecure_channel` | TLS + capability administrativa firmada (HMAC) |
+| ⑤ DataNode ↔ DataNode | `insecure_channel` | TLS + la capability del bloque, reenviada por el pipeline |
 
-Ya implementado a favor de la seguridad: validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco y cifrado autenticado en reposo `DFSE1` (AES-256-GCM por chunk). Cada DataNode recibe una llave cruda distinta de 32 bytes mediante `--encryption-key-file`; `secrets/` queda fuera del repo y se monta solo lectura en Docker. No hay rotación ni migración: al pasar a C4 se crean volúmenes nuevos con `docker compose down -v`.
+**Por qué capabilities y no mTLS en ④ y ⑤:** el DataNode atiende a clientes y a nodos internos en el mismo puerto. El spike S1 mostró que grpcio no permite mTLS *opcional*: con `require_client_auth=False` el servidor ni pide el certificado, y con `True` rechaza a los clientes. Una capability firmada con una llave que comparten ControlNodes y DataNodes autoriza cada operación sin depender del transporte.
+
+**Ya implementado:** validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco, y cifrado autenticado en reposo `DFSE1` (§4). Cada DataNode recibe una llave distinta en `secrets/dnX.key`, fuera del repo y montada en solo lectura. No hay rotación ni migración: al pasar al formato cifrado hay que crear volúmenes nuevos con `docker compose down -v`.
+
+---
 
 ## 11. Matriz de errores de dominio
 
@@ -312,12 +411,18 @@ Los errores de forma del protocolo que no nacen de una excepción de dominio (po
 | `ListDir` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
 | `MakeDir` | `PathExistsError` → `ALREADY_EXISTS`; `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
 | `RemoveDir` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `NotEmptyError` → `FAILED_PRECONDITION`; `InvalidPathError` → `PERMISSION_DENIED` |
-| `Remove` | `PathNotFoundError` → `NOT_FOUND`; `NotAFileError` → `INVALID_ARGUMENT`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `Remove` | `PathNotFoundError` → `NOT_FOUND`; `NotAFileError` → `INVALID_ARGUMENT`; `NotADirectoryError` → `INVALID_ARGUMENT`; `ConflictError` → `ABORTED`; `InvalidPathError` → `PERMISSION_DENIED` |
 | `BeginUpload` | `PathExistsError` → `ALREADY_EXISTS`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` (ruta o tamaño no positivo) |
 | `ConfirmBlock` | `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` |
 | `CompleteUpload` | `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` |
 | `AbortUpload` | `PathNotFoundError` → `NOT_FOUND`; `NotADirectoryError` → `INVALID_ARGUMENT`; `InvalidPathError` → `PERMISSION_DENIED` |
 | `ListBlocks` | `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` |
+| `Lock` | `PathNotFoundError` → `NOT_FOUND`; `ConflictError` → `ABORTED`; `InvalidPathError` → `PERMISSION_DENIED` (modo inválido) |
+| `RenewLock` | `ConflictError` → `ABORTED` (lock vencido o ajeno) |
+| `Unlock` | `ConflictError` → `ABORTED` (lock ajeno) |
+| `BeginWrite` | `PathNotFoundError` → `NOT_FOUND`; `ConflictError` → `ABORTED`; `InvalidPathError` → `PERMISSION_DENIED` (rango inválido) |
+| `CommitWrite` | `ConflictError` → `ABORTED` |
+| `AbortWrite` | `ConflictError` → `ABORTED` |
 
 ### DataNode — `DataNodeService`
 
@@ -326,39 +431,7 @@ Los errores de forma del protocolo que no nacen de una excepción de dominio (po
 | `WriteBlock` | `BlockNotFoundError` → `NOT_FOUND` cuando `block_id` no cumple el formato; se valida antes de iniciar el forwarding |
 | `ReadBlock` | `BlockNotFoundError` → `NOT_FOUND`; `BlockCorruptedError` → `DATA_LOSS` |
 | `DeleteBlock` | `BlockNotFoundError` → `NOT_FOUND` |
+| `ReplicateBlock` | `BlockNotFoundError` → `NOT_FOUND`; `BlockCorruptedError` → `DATA_LOSS`; si falla el destino, `UNAVAILABLE` o `DEADLINE_EXCEEDED` sin `dfsha-error` |
+| `Ping`, `ListStoredBlocks` | No lanzan errores de dominio |
 
-`ConflictError` → `ABORTED`, `AccessDeniedError` → `PERMISSION_DENIED` y `AuthError` → `UNAUTHENTICATED` quedan registrados en los tres traductores de dominio para los RPC de locks, permisos y autenticación que los introduzcan en Hito 3. En lectura de bloques, el cliente solo prueba la siguiente réplica ante `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` cuya metadata sea exactamente `BlockNotFoundError`; cualquier error permanente falla de inmediato.
-
-
-## 12. Actualización Hito 3 A1 — liveness y escritura degradada
-
-`DataNodeService` añade `Ping(PingRequest) → PingResponse`, un RPC unario idempotente sin datos de aplicación. Cada ControlNode lo invoca contra las direcciones **internas** configuradas, con deadline corto, cada `--heartbeat-interval-s`; tras `--datanode-dead-after-s` sin respuesta, la dirección se excluye solo de la vista local de ese ControlNode. No se replica por Raft ni se anuncia al cliente.
-
-`BeginUpload` arma cada pipeline únicamente con los DataNodes que su monitor local ve vivos. Selecciona `min(replication_factor, vivos)` direcciones internas con round-robin. Si hay menos de `--min-write-replicas` (default 2), devuelve `UNAVAILABLE` antes de crear la subida; con el mínimo pero menos que el factor, confirma el bloque sub-replicado. Los RPC de datos `Ping`, `ReadBlock`, `WriteBlock`, `DeleteBlock` y el forwarding usan deadlines explícitos. Solo los pasos idempotentes se reintentan con backoff exponencial y jitter; `WriteBlock` no se reintenta tras haber empezado su stream.
-
-
-## 13. Actualización Hito 3 A2 — re-replicación
-
-`ReplicateBlock(ReplicateBlockRequest{block_id, target})` es un RPC unario interno de `DataNodeService`. El DataNode origen verifica su copia con la misma lectura con checksum de `ReadBlock` y la envía completa al destino mediante `WriteBlock` con `downstream` vacío. El deadline cubre toda la transferencia y el forwarding usa el tiempo restante del contexto entrante.
-
-Solo el líder del ControlNode ejecuta el re-replicador. Antes de cada fotografía de bloques confirmados confirma una barrera Raft; identifica direcciones caídas y vivas exclusivamente mediante el monitor local de A1. Al terminar una copia, publica la nueva lista con el CAS replicado `update_block_replicas(path, block_id, expected, new)` y un `op_id` estable por decisión. Un timeout conserva resultado desconocido para reintentar de forma idempotente; un CAS obsoleto o un archivo que ya fue borrado se ignoran. Esta última copia queda como huérfana hasta A3.
-
-Por ahora `ReplicateBlock` no lleva token: C3 agregará la capability administrativa de la orden y la capability de bloque del destino.
-
-## 14. Actualización Hito 3 B3 — escritura copy-on-write
-
-`write` de RF3 son tres RPC unarios nuevos de `ControlNodeService`, todos con `op_id`:
-
-| RPC | Qué hace | Errores |
-|---|---|---|
-| `BeginWrite(path, offset, length, lock_id)` | Pasa la barrera de lectura, arma la propuesta de bloques nuevos (IDs y réplicas vivas) y la reserva por Raft. Devuelve `write_id`, `base_version`, `block_size` y un `WriteSlot` por bloque tocado (bloque viejo y bloque nuevo) | `ABORTED` sin lock exclusivo vigente o si el archivo cambió; `PERMISSION_DENIED` (`InvalidPathError`) si `offset` > tamaño o `length` <= 0; `UNAVAILABLE` en un follower o un líder sin mayoría |
-| `CommitWrite(path, write_id, base_version, lock_id, slots)` | Compare-and-set de la versión: si sigue siendo `base_version`, la reserva sigue vigente y el lock sigue siendo del writer, publica los bloques nuevos y suma 1 a la versión. Después del commit, el líder borra los bloques viejos | `ABORTED` si algo de lo anterior no se cumple; no publica nada |
-| `AbortWrite(path, write_id, lock_id)` | Descarta la reserva y borra los bloques nuevos. Abortar una reserva que ya no existe no es error | `ABORTED` si la reserva es de otro lock |
-
-El cliente escribe cada bloque nuevo con el mismo `WriteBlock` del pipeline de subida (enlaces ② y ⑤), y cuando la escritura toca un bloque solo en parte, primero lee el bloque viejo con `ReadBlock` para completarlo. Un reintento de `BeginWrite` o `CommitWrite` con el mismo `op_id` devuelve el resultado original: no reserva dos veces ni publica dos veces. Si el `CommitWrite` queda con resultado incierto, el `AbortWrite` posterior es inofensivo, porque una reserva ya publicada no existe y no se borra nada.
-
-## 15. Actualización Hito 3 A3 — recolector de huérfanos
-
-`ListStoredBlocks(ListStoredBlocksRequest) → stream StoredBlock{block_id, size_bytes, age_s}` es un RPC interno nuevo de `DataNodeService` (enlace ④): el inventario de bloques en disco, sin checksums ni temporales. Va como stream porque puede haber muchos. `age_s` la calcula el DataNode con su propio reloj, así el ControlNode nunca compara relojes de máquinas distintas. *(El plan decía `mtime_unix`; se cambió por esa razón.)*
-
-El recolector corre solo en el líder, cada `--gc-interval-s`. Primero lista cada DataNode vivo y **después** pasa la barrera de lectura y toma la foto de la metadata: con ese orden, un bloque reservado entre las dos lecturas ya figura en la foto. Borra con `DeleteBlock` (enlace ④) un bloque que ningún archivo, subida pendiente ni reserva COW vigente usa, o una réplica que la metadata ya no le asigna a ese nodo, siempre que tenga más de `--gc-grace-s` de edad y no sea una copia en vuelo del re-replicador. `NOT_FOUND` al borrar cuenta como éxito. `AbortUpload` además borra al instante los bloques de la subida descartada.
+`AccessDeniedError` → `PERMISSION_DENIED` y `AuthError` → `UNAUTHENTICATED` ya están registrados en los tres traductores, para cuando entren usuarios y permisos (C2, C3). En lectura de bloques, el cliente solo prueba la siguiente réplica ante `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` cuya metadata sea exactamente `BlockNotFoundError`; cualquier error permanente falla de inmediato.

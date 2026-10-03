@@ -1,26 +1,23 @@
 # Guía de uso
 
-Todo se hace con `docker compose` desde la raíz del repo. Los comandos son los mismos en Windows, macOS y Linux.
+Todo se hace desde la raíz del repo. Los comandos son los mismos en Windows (PowerShell), macOS y Linux.
 
-**Requisitos:** Docker Desktop (o Docker Engine con Compose v2) y git.
+**Requisitos:** Docker Desktop (o Docker Engine con Compose v2), git y Python 3 (solo para generar las llaves).
 
 ---
 
-## 1. Generar secretos y levantar el clúster
-
-Los DataNodes no tienen modo plaintext: cada uno exige una llave AES-256-GCM **cruda** de exactamente 32 bytes. El script crea `secrets/dn1.key`, `secrets/dn2.key` y `secrets/dn3.key` con modo `0600`; `secrets/` no se versiona y Compose lo monta solo lectura. No hay rotación automática.
+## 1. Levantar el clúster
 
 ```bash
 git pull
-python scripts/generate_secrets.py
-docker compose down -v   # obligatorio al venir de bloques legacy/plaintext o cambiar llave
+python scripts/generate_secrets.py      # solo la primera vez: crea secrets/dn1.key, dn2.key, dn3.key
 docker compose up -d --build
 docker compose ps
 ```
 
-Si falta una llave o no mide 32 bytes, el DataNode falla al arrancar. C4 no migra volúmenes ni lee bloques plaintext/legacy: para comenzar de cero se usa `docker compose down -v`.
-
 Tienen que aparecer 6 servicios `healthy`: `dn1`, `dn2`, `dn3` (DataNodes) y `cn0`, `cn1`, `cn2` (ControlNodes).
+
+Si vienes de una versión anterior a la del cifrado en reposo, borra los datos viejos antes del `up`: `docker compose down -v`. Los DataNodes no leen bloques sin cifrar.
 
 ---
 
@@ -30,31 +27,29 @@ Tienen que aparecer 6 servicios `healthy`: `dn1`, `dn2`, `dn3` (DataNodes) y `cn
 docker compose run --rm shell
 ```
 
-La carpeta `intercambio/` del repo se ve dentro de la shell como `/intercambio`. Pon ahí los archivos que quieras subir.
+La carpeta `intercambio/` del repo es `/intercambio` dentro de la shell.
 
 ```
 dfsha:/$ mkdir /docs
 dfsha:/$ send /intercambio/tesis.pdf /docs/tesis.pdf
-dfsha:/$ ls /docs
 dfsha:/$ receive /docs/tesis.pdf /intercambio/copia.pdf
 dfsha:/$ exit
 ```
 
 | Comando | Qué hace |
 |---|---|
-| `ls [ruta]` | Lista un directorio |
-| `cd <ruta>` · `pwd` | Cambia / muestra el directorio actual |
-| `mkdir <ruta>` · `rmdir <ruta>` | Crea / borra un directorio vacío |
-| `send <local> <remota>` | Sube un archivo |
-| `receive <remota> <local>` | Descarga un archivo |
-| `rm <ruta>` | Borra un archivo (falla mientras tenga un lock vigente) |
-| `cat <ruta> [offset] [largo]` | Muestra el archivo, o un rango de bytes, como texto |
-| `read <ruta> <offset> <largo> <local>` | Guarda un rango de bytes del archivo en un archivo local |
-| `write <ruta> <offset> <local>` | Escribe el contenido de un archivo local desde un offset (sobrescribe o extiende) |
-| `open <ruta> r|w` · `close <ruta>` | Abre un handle tomando el lock compartido o exclusivo, y lo cierra |
-| `lock <ruta> r|w` · `unlock <ruta>` · `locks` | Toma, libera o lista locks propios con lease |
+| `ls [ruta]` · `cd <ruta>` · `pwd` | Navegar |
+| `mkdir <ruta>` · `rmdir <ruta>` | Crear / borrar un directorio vacío |
+| `send <local> <remota>` | Subir un archivo |
+| `receive <remota> <local>` | Bajar un archivo |
+| `rm <ruta>` | Borrar un archivo (falla si alguien tiene un lock sobre él) |
+| `cat <ruta> [offset] [largo]` | Mostrar el archivo, o un rango de bytes |
+| `read <ruta> <offset> <largo> <local>` | Guardar un rango de bytes en un archivo local |
+| `write <ruta> <offset> <local>` | Escribir el contenido de un archivo local desde un offset |
+| `open <ruta> r\|w` · `close <ruta>` | Abrir y cerrar un archivo (toma y suelta el lock) |
+| `lock <ruta> r\|w` · `unlock <ruta>` · `locks` | Tomar, soltar y listar locks |
 
-Las rutas con espacios van entre comillas: `send "/intercambio/mi tesis.pdf" /docs/tesis.pdf`.
+`r` = lock compartido (varios lectores), `w` = lock exclusivo (un escritor). Las rutas con espacios van entre comillas: `send "/intercambio/mi tesis.pdf" /docs/tesis.pdf`.
 
 ---
 
@@ -65,31 +60,63 @@ docker compose run --rm inspect estado                     # quién es el líder
 docker compose run --rm inspect lider                      # solo el nombre del líder: cn0, cn1 o cn2
 docker compose run --rm inspect arbol                      # todos los directorios y archivos
 docker compose run --rm inspect mapa                       # en qué DataNode está cada bloque
-docker compose run --rm inspect bloques /docs/tesis.pdf    # réplicas de un archivo, verificando su SHA-256
-docker compose run --rm inspect huerfanos                  # bloques sin uso: jóvenes y a borrar por el recolector
+docker compose run --rm inspect bloques /docs/tesis.pdf    # réplicas de un archivo y su estado real
+docker compose run --rm inspect huerfanos                  # bloques sin uso y cuáles va a borrar el recolector
 ```
 
-Ejemplo del mapa con bloques de 1 MB y factor 2:
-
-```
-  archivo / bloque                  dn1         dn2         dn3
-  /docs/tesis.pdf
-    b0  61ea2704     1.0 MB          C           r           ·
-    b1  13be893a     1.0 MB          ·           C           r
-    b2  abfda713     1.0 MB          r           ·           C
-    b3  793ab22b   512.0 KB          C           r           ·
-  bloques por DataNode               3           3           2
-```
-
-`C` = cabeza del pipeline de escritura, `r` = réplica, `·` = ese nodo no tiene el bloque. Cada entrada física es un contenedor cifrado DFSE1; el checksum lógico de los bloques sigue siendo SHA-256 de plaintext y se verifica al autenticar sus chunks.
+En Git Bash de Windows, antepón `MSYS_NO_PATHCONV=1` a los comandos que llevan una ruta como `/docs/...`.
 
 ---
 
-## 4. Probar fallos
+## 4. Configurar
 
-Deja la shell abierta en otra terminal (`docker compose run --rm shell`) para los pasos que dicen *en la shell*.
+Los parámetros están en `.env`. Después de cambiarlos: `docker compose up -d`.
 
-**Cae un DataNode** — el archivo baja completo desde otra réplica:
+Para una demo, cambia estas líneas: los archivos se parten en bloques de 1 MB y los fallos se detectan y reparan en segundos.
+
+```
+DFSHA_BLOCK_MB=1
+DFSHA_HEARTBEAT_INTERVAL_S=0.5
+DFSHA_DATANODE_DEAD_AFTER_S=2
+DFSHA_REREPLICATION_INTERVAL_S=1
+DFSHA_REREPLICATION_DELAY_S=2
+DFSHA_GC_INTERVAL_S=5
+DFSHA_GC_GRACE_S=5
+DFSHA_UPLOAD_LEASE_S=15
+```
+
+| Variable | Normal | Qué controla |
+|---|---|---|
+| `DFSHA_BLOCK_MB` | 128 | Tamaño de bloque |
+| `DFSHA_REPLICATION` | 3 | Copias de cada bloque |
+| `DFSHA_MIN_WRITE_REPLICAS` | 2 | Copias vivas mínimas para aceptar una subida |
+| `DFSHA_HEARTBEAT_INTERVAL_S` | 2 | Cada cuánto los ControlNodes hacen `Ping` a los DataNodes |
+| `DFSHA_DATANODE_DEAD_AFTER_S` | 6 | Segundos sin respuesta para dar un DataNode por caído |
+| `DFSHA_REREPLICATION_INTERVAL_S` | 10 | Cada cuánto el líder busca bloques con copias de menos |
+| `DFSHA_REREPLICATION_DELAY_S` | 30 | Cuánto tiene que llevar caído un nodo para reponer sus copias en otro |
+| `DFSHA_REREPLICATION_MAX_PER_CYCLE` | 4 | Copias por ciclo |
+| `DFSHA_GC_INTERVAL_S` | 60 | Cada cuánto el líder busca bloques huérfanos |
+| `DFSHA_GC_GRACE_S` | 1200 | Edad mínima de un bloque sin uso para borrarlo |
+| `DFSHA_UPLOAD_LEASE_S` | 600 | Segundos para liberar una subida o escritura abandonada |
+
+---
+
+## 5. Probar cada funcionalidad
+
+Con los valores de demo del paso 4. Deja una shell abierta en otra terminal para los pasos que dicen *en la shell*.
+
+### Particionamiento y replicación
+
+```bash
+# en la shell: mkdir /docs
+# en la shell: send /intercambio/tesis.pdf /docs/tesis.pdf
+docker compose run --rm inspect mapa
+docker compose run --rm inspect bloques /docs/tesis.pdf
+```
+
+Cada bloque aparece en 3 DataNodes y cada réplica sale `ok`.
+
+### Cae un DataNode al bajar
 
 ```bash
 docker compose kill dn1
@@ -97,37 +124,100 @@ docker compose kill dn1
 docker compose start dn1
 ```
 
-**Cae el líder** — otro ControlNode es líder en ~2 s y la shell sigue funcionando:
+El archivo baja completo desde otra réplica.
+
+### Cae un DataNode al subir, y se repara solo
 
 ```bash
-docker compose run --rm inspect lider      # por ejemplo: cn1
-docker compose kill cn1                    # el nombre que salió
-docker compose run --rm inspect estado
+docker compose kill dn3
+docker compose run --rm inspect estado                     # esperar a que dn3 salga CAÍDO
+# en la shell: send /intercambio/tesis.pdf /docs/otro.pdf
+docker compose run --rm inspect bloques /docs/otro.pdf     # 2 réplicas por bloque
+docker compose start dn3
+docker compose run --rm inspect bloques /docs/otro.pdf     # a los pocos segundos: 3 réplicas
+```
+
+### Bloque corrupto
+
+```bash
+docker compose exec dn2 sh -c 'f=$(ls /data | head -1); printf "\377" | dd of=/data/$f bs=1 seek=100 count=1 conv=notrunc 2>/dev/null; echo corrompido $f'
+docker compose run --rm inspect mapa                       # para saber de qué archivo es ese bloque
+docker compose run --rm inspect bloques /docs/tesis.pdf    # la réplica de dn2 sale CORRUPTO
+# en la shell: receive /docs/tesis.pdf /intercambio/copia2.pdf
+```
+
+El archivo baja bien desde otra réplica.
+
+### Cifrado en reposo
+
+```bash
+docker compose exec dn1 sh -c 'f=$(ls /data | head -1); head -c 5 /data/$f; echo'
+```
+
+Imprime `DFSE1`: lo que hay en disco es un contenedor cifrado con AES-256-GCM, no el archivo.
+
+### Cae el líder
+
+```bash
+docker compose run --rm inspect lider                      # por ejemplo: cn1
+docker compose kill cn1
+docker compose run --rm inspect estado                     # otro ControlNode es LIDER
 # en la shell: ls /docs
 docker compose start cn1
 ```
 
-**Caen 2 ControlNodes** — no responde, porque Raft necesita mayoría (2 de 3):
+### Caen 2 ControlNodes
 
 ```bash
 docker compose kill cn0 cn1
-# en la shell: ls /docs   → falla tras unos segundos
+# en la shell: ls /docs                                    # falla: no hay mayoría
 docker compose start cn0 cn1
 ```
 
-**Subida con un DataNode caído y re-replicación** — esperá al menos 6 s tras la caída para que el sondeo pull lo declare muerto. Con los defaults (factor 3, mínimo 2), `send` confirma dos réplicas y el archivo queda sub-replicado. Al levantar el nodo, esperá un ciclo de 10 s: el re-replicador agrega la tercera copia. Las copias de un nodo que sigue caído se reponen en otro nodo recién cuando lleva más de 30 s muerto. Con menos de dos nodos vivos responde `UNAVAILABLE` y no hace visible el archivo:
+### Lectura y escritura por rangos
+
+Pon en `intercambio/` un `nota.txt` con algunas líneas y un `parche.txt` corto.
 
 ```bash
-docker compose kill dn3
-sleep 7
-# en la shell: send /intercambio/tesis.pdf /docs/otro.pdf
-docker compose run --rm inspect bloques /docs/otro.pdf
-docker compose start dn3
-sleep 41
-docker compose run --rm inspect bloques /docs/otro.pdf
+# en la shell: send /intercambio/nota.txt /docs/nota.txt
+# en la shell: cat /docs/nota.txt 0 10
+# en la shell: read /docs/tesis.pdf 1048000 5000 /intercambio/rango.bin
+# en la shell: write /docs/nota.txt 0 /intercambio/parche.txt
+# en la shell: cat /docs/nota.txt
 ```
 
-**Apagar todo** — los archivos siguen ahí:
+`write` escribe bloques nuevos y los publica juntos al final: si algo falla a mitad, el archivo queda como estaba.
+
+### Locks
+
+En una shell:
+
+```
+dfsha:/$ lock /docs/nota.txt r
+```
+
+En otra shell:
+
+```
+dfsha:/$ write /docs/nota.txt 0 /intercambio/parche.txt     → lock en conflicto
+dfsha:/$ rm /docs/nota.txt                                   → el archivo tiene locks vigentes
+```
+
+Después de `unlock /docs/nota.txt` en la primera, las dos operaciones funcionan.
+
+### Cliente que muere a mitad de subida
+
+En la shell, empieza un `send` de un archivo grande y cierra esa terminal a mitad. Pasados `DFSHA_UPLOAD_LEASE_S` segundos, el mismo `send` desde otra shell funciona.
+
+### Recolector de huérfanos
+
+```bash
+docker compose run --rm inspect huerfanos
+```
+
+Muestra, por DataNode, los bloques en uso, los que no tienen uso pero son recientes, y los que el recolector va a borrar en su próximo ciclo.
+
+### Apagar todo y volver a levantar
 
 ```bash
 docker compose down
@@ -135,35 +225,7 @@ docker compose up -d
 docker compose run --rm inspect arbol
 ```
 
-**Cliente que muere a mitad de subida** — pon `DFSHA_UPLOAD_LEASE_S=15` en `.env` y `docker compose up -d`. En la shell empieza un `send` de un archivo grande y cierra esa terminal a mitad. Espera 15 s, abre otra shell y repite el mismo `send`: funciona, y los bloques abandonados se borran.
-
-**Bloque corrupto** — la réplica aparece `CORRUPTO` y el archivo baja bien desde otra:
-
-```bash
-docker compose exec dn2 sh -c 'f=$(ls /data | head -1); printf "\\377" | dd of=/data/$f bs=1 seek=100 count=1 conv=notrunc 2>/dev/null; echo corrompido $f'
-docker compose run --rm inspect bloques /docs/tesis.pdf
-# en la shell: receive /docs/tesis.pdf /intercambio/copia2.pdf
-```
-
----
-
-## 5. Configurar
-
-Los parámetros están en `.env`. Después de cambiarlos: `docker compose up -d`.
-
-| Variable | Normal | Para la demo | Efecto |
-|---|---|---|---|
-| `DFSHA_BLOCK_MB` | 128 | 1 | Tamaño de bloque. Con 1, un archivo de pocos MB se parte en varios bloques |
-| `DFSHA_REPLICATION` | 3 | 2 | Réplicas objetivo por bloque |
-| `DFSHA_MIN_WRITE_REPLICAS` | 2 | 2 | Copias vivas mínimas para confirmar una subida; debe estar entre 1 y el factor |
-| `DFSHA_HEARTBEAT_INTERVAL_S` | 2 | 0.5 | Período de sondeo `Ping` de cada ControlNode |
-| `DFSHA_DATANODE_DEAD_AFTER_S` | 6 | 2 | Sin respuesta acumulada antes de excluir un DataNode del pipeline |
-| `DFSHA_REREPLICATION_INTERVAL_S` | 10 | 1 | Período de búsqueda de bloques sub-replicados por el líder |
-| `DFSHA_REREPLICATION_DELAY_S` | 30 | 2 | Cuánto tiene que llevar muerta una réplica antes de reponerla en otro nodo |
-| `DFSHA_REREPLICATION_MAX_PER_CYCLE` | 4 | 4 | Máximo de copias que hace cada ciclo |
-| `DFSHA_GC_INTERVAL_S` | 60 | 5 | Cada cuánto el líder busca bloques huérfanos en los DataNodes |
-| `DFSHA_GC_GRACE_S` | 1200 | 5 | Edad mínima de un bloque sin uso antes de borrarlo |
-| `DFSHA_UPLOAD_LEASE_S` | 600 | 15 | Segundos hasta liberar una subida abandonada |
+Los archivos siguen ahí.
 
 ---
 
@@ -182,34 +244,11 @@ docker compose down -v     # apaga y borra los datos
 docker compose run --rm tests
 ```
 
-### Spike S2: Raft con password y upgrade legacy
-
-Fuera de Docker, el spike usa solo puertos efímeros y un directorio temporal;
-comprueba un clúster Raft de tres nodos, reinicio desde snapshot+journal y que
-un nodo con password distinta no afecta a la mayoría:
-
-```bash
-python scripts/spikes/raft_password_spike.py --workdir "$(mktemp -d)"
-python -m pytest tests/test_raft_upgrade.py -q
-```
-
-Los `raft.dump`/`raft.journal` reales de `9985c6d`, sus hashes y la reproducción
-controlada están en `tests/fixtures/README.md`.
-
 ---
 
 ## Ver también
 
 - `docs/arquitectura-y-flujos.excalidraw` — arquitectura y cada flujo paso a paso (abrir en [excalidraw.com](https://excalidraw.com) o con la extensión de VS Code)
-- `docs/especificacion-comunicaciones.md` — protocolos y contratos entre los componentes
-- `ESTADO_PROYECTO.md` — qué está hecho, decisiones y detalles de implementación
+- `docs/especificacion-comunicaciones.md` — protocolos, mensajes y errores entre componentes
+- `ESTADO_PROYECTO.md` — qué está hecho, qué falta y detalles de implementación
 - `docker compose logs -f cn0` — salida de un nodo
-
-
-### Locks con lease (B1)
-
-En una shell, `lock /docs/tesis.pdf r` toma un lock compartido y `lock /docs/tesis.pdf w` uno exclusivo; `locks` muestra los propios y `unlock /docs/tesis.pdf` libera uno. `receive` toma y renueva automáticamente un lock compartido hasta terminar, por lo que un escritor recibe conflicto mientras la descarga sigue activa. El ControlNode usa `--lock-lease-s` (30 s por defecto); el cliente renueva cada tercio.
-
-`cat /docs/nota.txt 30 30` muestra 30 bytes desde el byte 30, y `read /docs/tesis.pdf 1048000 5000 /intercambio/rango.bin` guarda 5000 bytes en un archivo local, aunque crucen el borde entre dos bloques. Igual que `receive`, una lectura toma un lock compartido mientras dura. Un offset más allá del final del archivo da un error explícito; justo en el final devuelve vacío.
-
-`write /docs/nota.txt 5 /intercambio/parche.txt` escribe el contenido de `parche.txt` desde el byte 5: sobrescribe lo que había ahí y, si se pasa del final, extiende el archivo. Un offset mayor al tamaño se rechaza (no hay archivos con huecos). La escritura es copy-on-write: los bloques tocados se escriben como bloques nuevos por el pipeline de siempre y se publican juntos en un solo commit; si algo falla antes, el archivo sigue siendo el de antes y los bloques nuevos se descartan. Necesita el lock exclusivo, así que falla con "lock en conflicto" mientras alguien lo tenga abierto para leer. `open /docs/nota.txt w` lo toma y lo mantiene hasta `close /docs/nota.txt`; mientras tanto, `write` y `cat` sobre esa ruta usan ese mismo handle.

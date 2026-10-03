@@ -1,174 +1,70 @@
 # DFSha
 
-Sistema de archivos distribuido con alta disponibilidad, rendimiento y
-seguridad. Proyecto de Sistemas Distribuidos (ST0263/SI3007, EAFIT).
+Sistema de archivos distribuido con alta disponibilidad, rendimiento y seguridad. Proyecto 1 de Sistemas Distribuidos (ST0263/SI3007, EAFIT).
 
-Un cliente sube y baja archivos grandes que quedan distribuidos entre
-varios nodos, tanto en lectura como en escritura. Arquitectura elegida:
-Opción 1, Cliente/Servidor con composición y distribución del servicio
-(S2S) — el servicio corre como un sistema autónomo dentro de una red
-propia, con mecanismos abiertos para el acceso cliente-servidor.
+Un cliente sube y baja archivos que quedan partidos en bloques y replicados entre varios nodos. Arquitectura: **Opción 1**, Cliente/Servidor con composición y distribución del servicio (S2S).
 
-## Estado actual: Hito 2 (sub-proyectos 1, 2, 3 y 4)
+## Arquitectura
 
-Hito 1 (versión monolítica, un cliente y un servidor) sigue disponible sin
-cambios. Sobre eso, Hito 2 agrega la arquitectura distribuida:
+```
+                 ┌──────────── plano de control (metadatos) ────────────┐
+   shell ──gRPC──►  cn0 ◄─Raft─► cn1 ◄─Raft─► cn2     (un líder, mayoría 2 de 3)
+     │           └──────────────────────────────────────────────────────┘
+     │                    │ Ping, re-replicación, recolector
+     │           ┌────────▼──────── plano de datos (bloques) ───────────┐
+     └──gRPC────►  dn1 ──pipeline──► dn2 ──pipeline──► dn3            │
+                 │  bloques cifrados con AES-256-GCM en cada disco      │
+                 └──────────────────────────────────────────────────────┘
+```
 
-- **RF1** — gestión del sistema de archivos: `ls`, `cd`, `mkdir`, `rmdir`, `rm`.
-- **RF2** — transferencia de archivos: `send`/`receive`, con streaming gRPC
-  para no cargar archivos grandes en memoria.
-- **RF3 parcial (B1)** — locks lectores/escritor con lease: varios lectores
-  conviven, un escritor es exclusivo y los leases vencidos se liberan solos.
-- **RF3 parcial (B2)** — `read` por rangos de bytes: `cat <ruta> [offset] [largo]`
-  y `read <ruta> <offset> <largo> <local>` en la shell. Cada DataNode sirve solo
-  la parte pedida de cada bloque, y la lectura toma un lock compartido mientras dura.
-- **RF3 (B3)** — `write` en cualquier posición, con copy-on-write: `write <ruta>
-  <offset> <local>`, y `open <ruta> r|w` / `close <ruta>` en la shell. Los bloques
-  tocados se reescriben como bloques nuevos y se publican juntos en un solo commit
-  de Raft; hasta entonces el archivo visible es el anterior. Exige el lock exclusivo.
-- **Hito 2 / sub-proyecto 1** — ControlNode (metadatos del árbol) separado
-  de un DataNode (bloques), particionamiento de archivos en bloques (128 MB
-  por defecto) y un cliente/shell distribuida que habla con ambos.
-- **Hito 2 / sub-proyecto 2** — replicación de bloques con factor 3 mediante
-  un pipeline DN1→DN2→DN3: el cliente sube una sola copia y los DataNodes
-  encadenan las réplicas. La descarga hace failover a la siguiente réplica si
-  una está caída o corrupta.
-- **Hito 2 / sub-proyecto 3** — clúster de 3 ControlNodes con consenso Raft
-  (`pysyncobj`): elección de líder, failover automático, metadata replicada y
-  persistida en disco. El cliente conoce los 3 nodos y sigue al líder solo; los
-  reintentos son seguros porque cada operación lleva un `op_id`.
-- **Hito 2 / sub-proyecto 4** — contenerización: una imagen para todos los roles y
-  un `docker-compose.yml` con los 3 DataNodes, los 3 ControlNodes, la shell y los
-  tests. Ver [docs/GUIA.md](docs/GUIA.md).
+- **ControlNodes:** árbol de directorios, qué bloques tiene cada archivo y dónde está cada réplica. Replicado con Raft (`pysyncobj`) y persistido en disco.
+- **DataNodes:** guardan bloques cifrados. Replican en cascada (pipeline) y verifican la integridad al leer.
+- **Cliente:** parte los archivos en bloques, los sube y los reensambla. Sigue al líder solo.
 
-Todo el transporte va sobre gRPC.
+Todo el transporte es gRPC. Diagrama completo con cada flujo: [docs/arquitectura-y-flujos.excalidraw](docs/arquitectura-y-flujos.excalidraw).
 
-## Roadmap
+## Estado
 
-- **Hito 3** — alta disponibilidad, replicación, consistencia de datos y
-  seguridad (TLS entre nodos, autenticación, control de acceso).
+| Hito | Contenido | Estado |
+|---|---|---|
+| 1 | Versión monolítica C/S con RF1 (`ls cd mkdir rmdir rm`) y RF2 (`send receive`) | ✅ |
+| 2 | Arquitectura distribuida: ControlNode + DataNodes, bloques, replicación en pipeline, 3 ControlNodes con Raft, Docker, especificación de comunicaciones | ✅ |
+| 3 | Alta disponibilidad: detección de DataNodes caídos, escritura con 2 de 3 réplicas, re-replicación, recolector de huérfanos | ✅ |
+| 3 | Consistencia y RF3: locks lectores/escritor con lease, `read` por rangos, `write` copy-on-write | ✅ |
+| 3 | Seguridad: cifrado en reposo (AES-256-GCM) | ✅ |
+| 3 | Seguridad: TLS en las comunicaciones, autenticación de usuarios, permisos por archivo | ⬜ |
+| Final | Despliegue en AWS, informe, video | ⬜ |
 
-## Instalación
+Detalle de cada parte, decisiones y límites conocidos: [ESTADO_PROYECTO.md](ESTADO_PROYECTO.md).
+
+## Uso rápido
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/generate_proto.py
+python scripts/generate_secrets.py        # solo la primera vez: llaves de cifrado de los DataNodes
+docker compose up -d --build              # 3 DataNodes + 3 ControlNodes
+docker compose run --rm shell             # shell distribuida
+docker compose run --rm inspect mapa      # dónde quedó cada bloque
+docker compose down                       # apagar
 ```
 
-## Correr con Docker (recomendado)
+Guía completa (comandos de la shell, inspector, prueba de cada funcionalidad, configuración): **[docs/GUIA.md](docs/GUIA.md)**.
 
-Cada DataNode exige una llave AES-256-GCM **cruda** de 32 bytes. Se generan fuera del repo, con permiso `0600`; no hay rotación automática ni modo plaintext. Como C4 cambió el formato de los volúmenes, el primer arranque y cualquier reinicio desde cero requieren `down -v`:
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| [docs/GUIA.md](docs/GUIA.md) | Cómo levantarlo, usarlo y probar cada funcionalidad |
+| [docs/arquitectura-y-flujos.excalidraw](docs/arquitectura-y-flujos.excalidraw) | Arquitectura y cada flujo paso a paso |
+| [docs/especificacion-comunicaciones.md](docs/especificacion-comunicaciones.md) | Protocolos, RPC, mensajes y errores de los 5 enlaces |
+| [ESTADO_PROYECTO.md](ESTADO_PROYECTO.md) | Qué está hecho, decisiones, límites conocidos y qué falta |
+
+## Desarrollo sin Docker
 
 ```bash
-python scripts/generate_secrets.py   # crea secrets/dn1.key, dn2.key y dn3.key
-# si cambias llaves o vienes de bloques plaintext/legacy:
-docker compose down -v
-docker compose up -d --build         # 3 DataNodes + 3 ControlNodes
-docker compose run --rm shell        # shell distribuida
-docker compose run --rm inspect mapa # dónde quedó cada bloque
-docker compose down                  # apagar (con -v borra también los bloques)
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt           # Windows: .venv\Scripts\pip
+.venv/bin/python scripts/generate_proto.py           # hay que repetirlo si cambia un .proto
+.venv/bin/python -m pytest tests/ -q
 ```
 
-Las llaves se montan como solo lectura en los DataNodes. Si falta una o no mide exactamente 32 bytes, el DataNode falla al arrancar; no migra ni intenta leer bloques legacy/plaintext.
-
-Guía completa (shell, inspector, pruebas de fallo, configuración): **[docs/GUIA.md](docs/GUIA.md)**.
-
-## Correr el servidor
-
-```bash
-python -m dfsha.server.main --root ./dfsha-data --port 50051
-```
-
-## Correr el cliente (shell interactiva)
-
-```bash
-python -m dfsha.client.shell --host localhost --port 50051
-```
-
-Dentro del shell:
-
-```
-dfsha:/$ mkdir documentos
-dfsha:/$ cd documentos
-dfsha:/documentos$ send ./local.txt remoto.txt
-dfsha:/documentos$ ls
-dfsha:/documentos$ receive remoto.txt ./descargado.txt
-```
-
-Las rutas con espacios van entre comillas: `send "C:\mis docs\a.pdf" a.pdf`.
-
-## Correr Hito 2 sin Docker (3 ControlNodes + DataNodes + shell distribuida)
-
-Orden de arranque: primero los DataNodes, después los ControlNodes (necesitan
-saber sus direcciones al arrancar).
-
-```bash
-# 1. Generá una llave cruda distinta de 32 bytes por DataNode, con modo 0600.
-python scripts/generate_secrets.py
-
-# 2. Tres DataNodes, cada uno con su raíz, llave y puerto.
-python -m dfsha.data_node.main --root ./dn1 --port 50061 --encryption-key-file ./secrets/dn1.key
-python -m dfsha.data_node.main --root ./dn2 --port 50062 --encryption-key-file ./secrets/dn2.key
-python -m dfsha.data_node.main --root ./dn3 --port 50063 --encryption-key-file ./secrets/dn3.key
-
-# 3. Tres ControlNodes. --raft-cluster es la MISMA lista, en el mismo orden,
-#    en los 3; --node-id es la posición de cada uno en esa lista. Cada nodo
-#    necesita su propio --data-dir (journal y snapshots de Raft).
-for i in 0 1 2; do
-  python -m dfsha.control_node.main --node-id $i --port 5005$((i+1)) \
-    --raft-cluster localhost:6051,localhost:6052,localhost:6053 \
-    --data-dir ./cn$i \
-    --datanode-addresses localhost:50061,localhost:50062,localhost:50063 &
-done
-
-# 3. Shell distribuida: se le pasan los 3 ControlNodes, busca al líder sola
-python -m dfsha.client.distributed_shell_main \
-  --control-nodes localhost:50051,localhost:50052,localhost:50053
-```
-
-`--replication-factor` (default 3) controla cuántas réplicas intenta el pipeline. `--min-write-replicas` (default 2) controla cuántas copias vivas debe confirmar una subida: con al menos ese mínimo, el bloque puede quedar sub-replicado hasta que el re-replicador lo complete. Cada ControlNode sondea los DataNodes con `--heartbeat-interval-s` (2 s) y los excluye del pipeline después de `--datanode-dead-after-s` (6 s) sin respuesta. El re-replicador corre cada `--rereplication-interval-s` (10 s), espera `--rereplication-delay-s` (30 s) antes de copiar y limita cada ciclo con `--rereplication-max-per-cycle` (4). Las direcciones configuradas siguen siendo internas.
-
-**Para ver la re-replicación funcionando:** bajá un DataNode, esperá el umbral de liveness y subí un archivo: se confirma con dos copias. Volvé a levantar el nodo: en el siguiente ciclo, `inspect bloques` muestra la tercera réplica. Si en cambio el nodo sigue caído, sus copias se reponen en otro nodo recién cuando lleva más de `--rereplication-delay-s` muerto, para no copiar en cada reinicio. La descarga sigue funcionando durante toda la caída.
-
-**Para ver el clúster de ControlNodes funcionando:** con la shell abierta,
-matá con `kill -9` al ControlNode líder (el que responde; los demás devuelven
-`UNAVAILABLE`). La shell sigue funcionando sin reiniciarse: en unos 2 segundos
-el clúster elige otro líder. Si matás los 3 y los volvés a levantar con los
-mismos `--data-dir`, los archivos siguen ahí. Con 2 de 3 caídos el clúster
-deja de atender: Raft necesita mayoría.
-
-**Nota importante:** el puerto por defecto del ControlNode (50051) es el
-mismo que el default del servidor de Hito 1 — si vas a correr ambos hitos
-a la vez, usá `--port` para separarlos.
-
-## Tests
-
-```bash
-python -m pytest tests/ -v
-```
-
-### Verificar el spike de Raft cifrado y fixtures legacy
-
-El spike S2 usa tres nodos Raft con puertos efímeros, verifica elección, réplica,
-reinicio desde `raft.dump` + `raft.journal` y aislamiento de un nodo con password
-distinta. No modifica el clúster de desarrollo:
-
-```bash
-python scripts/spikes/raft_password_spike.py --workdir "$(mktemp -d)"
-python -m pytest tests/test_raft_upgrade.py -q
-```
-
-Los binarios legacy versionados y su procedimiento de regeneración están en
-[`tests/fixtures/README.md`](tests/fixtures/README.md).
-
-## Fuera de alcance por ahora
-
-RF3 está completo: `lock` (B1), `read` por rangos (B2) y `open`/`write`/`close`
-con copy-on-write (B3). La alta disponibilidad de datos también: detección de
-DataNodes caídos (A1), re-replicación (A2) y recolector de bloques huérfanos (A3).
-Siguen en el roadmap la seguridad (TLS, autenticación, permisos, cifrado en reposo)
-y el despliegue en AWS. *(Antes decía: "RF3 parcial: B1 incorpora `lock` [...] y B2 `read` por rangos;
-`open` y `write` copy-on-write completos se incorporan con B3. Detección automática
-de DataNodes caídos, re-replicación y autenticación siguen en el roadmap".)*
+Los componentes se arrancan con `python -m dfsha.data_node.main`, `python -m dfsha.control_node.main` y `python -m dfsha.client.distributed_shell_main`; `--help` lista sus parámetros. El servidor monolítico del Hito 1 sigue disponible en `python -m dfsha.server.main`.

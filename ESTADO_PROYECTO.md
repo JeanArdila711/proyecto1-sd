@@ -1,12 +1,48 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-09-16, tras cerrar el sub-proyecto 3 de Hito 2.
+Última actualización: 2026-10-03, tras cerrar la alta disponibilidad, la consistencia (RF3) y el cifrado en reposo del Hito 3.
 
-Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. El `README.md` tiene las instrucciones de instalación y de cómo correr cada pieza — acá está el panorama completo.
+Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
 ## Qué es DFSha
 
-Sistema de archivos distribuido: un cliente sube y baja archivos que quedan repartidos entre varios nodos, tanto en lectura como en escritura. Arquitectura elegida desde el principio: Cliente/Servidor con composición y distribución del servicio (el servicio corre como un sistema autónomo en su propia red, con una puerta de entrada abierta para clientes). Todo el transporte es gRPC — no hay HTTP REST ni sockets crudos en ningún punto.
+Sistema de archivos distribuido: un cliente sube y baja archivos que quedan repartidos entre varios nodos, tanto en lectura como en escritura. Arquitectura elegida desde el principio: Cliente/Servidor con composición y distribución del servicio (el servicio corre como un sistema autónomo en su propia red, con una puerta de entrada abierta para clientes). Todo el transporte es gRPC — no hay HTTP REST ni sockets crudos en ningún punto, salvo el canal de Raft entre ControlNodes, que impone la librería.
+
+## Resumen
+
+Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8), Hito 2 arquitectura distribuida y especificación de comunicaciones (semana 10), Hito 3 alta disponibilidad, replicación, consistencia y seguridad (semana 12), entrega final con informe, repo y video (semana 13).
+
+| Hito | Parte | Estado |
+|---|---|---|
+| 1 | RF1 (`ls cd mkdir rmdir rm`) y RF2 (`send receive`), cliente/servidor monolítico | ✅ |
+| 2 | ControlNode + DataNodes + cliente particionado, replicación en pipeline, 3 ControlNodes con Raft, Docker | ✅ |
+| 2 | Especificación de comunicaciones de los 5 enlaces | ✅ (`docs/especificacion-comunicaciones.md`) |
+| 3 | P0 — errores de dominio con tipo exacto | ✅ |
+| 3 | A1 — detección de DataNodes caídos, subida con 2 de 3 réplicas | ✅ |
+| 3 | A2 — re-replicación automática | ✅ |
+| 3 | A3 — recolector de bloques huérfanos | ✅ |
+| 3 | B1 — locks lectores/escritor con lease | ✅ |
+| 3 | B2 — `read` por rangos | ✅ |
+| 3 | B3 — `write` copy-on-write | ✅ |
+| 3 | C4 — cifrado en reposo AES-256-GCM | ✅ |
+| 3 | S1, S2 — spikes de mTLS y de Raft cifrado | ✅ (mTLS opcional: resultado negativo) |
+| 3 | C1 — TLS en los enlaces gRPC | ⬜ |
+| 3 | C2 — usuarios y autenticación | ⬜ |
+| 3 | C3 — permisos por archivo y autorización de operaciones internas | ⬜ |
+| Final | Despliegue en AWS, informe, video de 10–15 min | ⬜ |
+
+412 tests en verde, en Windows y dentro de la imagen de Docker.
+
+## Qué falta
+
+1. **Seguridad en tránsito y de acceso (Hito 3).**
+   - **C1 — TLS** en los enlaces gRPC ①②④⑤. Según el spike S1, grpcio no permite mTLS *opcional* en un mismo puerto: con `require_client_auth=False` el servidor ni pide el certificado del cliente. Plan: TLS de servidor para todos, y las operaciones internas del DataNode (`ReplicateBlock`, `DeleteBlock`, `ListStoredBlocks`) autorizadas con capabilities firmadas con HMAC que emite el ControlNode.
+   - **Raft cifrado:** el spike S2 probó `SyncObjConf(password=...)` (Fernet) con tres nodos, reinicio y aislamiento de un nodo con otra password, pero **no está activado** en el ControlNode. Falta la flag, el secreto en `secrets/` y su entrada en Compose.
+   - **C2 — usuarios:** registro/login, token en la metadata de cada RPC y `_users` en el estado replicado. El test de upgrade de S2 ya deja el gancho (`extension_checks`) para verificarlo sobre un journal viejo.
+   - **C3 — permisos:** dueño y ACL por ruta, y capability por bloque para que un cliente solo lea o escriba los bloques que el ControlNode le autorizó.
+2. **Rendimiento:** las transferencias son en serie, bloque por bloque. El enunciado pide *"lectura y escritura paralela de bloques"*; falta un pool de hilos en el cliente para `send`/`receive`.
+3. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada), informe técnico y video.
+4. **Documentación:** la especificación de comunicaciones está consolidada con lo del Hito 3; hay que actualizarla otra vez cuando entren C1–C3.
 
 ## Qué está implementado
 
@@ -19,7 +55,7 @@ Un cliente y un servidor, cada uno un solo proceso.
 - Escritura atómica en disco (temp file + `os.replace()`) en los dos lados — una descarga o subida que falla a mitad de camino nunca deja un archivo a medias con el nombre final.
 - 54 tests, código en `dfsha/server/` y `dfsha/client/dfsha_client.py` + `dfsha/client/shell.py`.
 
-### Hito 2, sub-proyecto 1 — completo, mergeado a `main`
+### Hito 2, sub-proyecto 1 — completo
 
 Reemplaza el par cliente/servidor único por tres roles separados, todavía sobre un solo nodo por rol (sin réplicas, sin clúster):
 
@@ -36,7 +72,7 @@ Reemplaza el par cliente/servidor único por tres roles separados, todavía sobr
 Replicación de bloques con **factor 3**, el default real de HDFS, sobre el mismo protocolo de subida (no cambió ningún RPC del ControlNode, solo la forma de sus mensajes):
 
 - **Pipeline de escritura DN1→DN2→DN3** (`dfsha/data_node/servicer.py`). El cliente sube **una sola copia**, a la cabeza del pipeline. El primer mensaje del stream es un `WriteBlockHeader` con el `block_id` y la lista `downstream` de los DataNodes que siguen; cada DataNode escribe el bloque en disco y **al mismo tiempo** lo reenvía al siguiente, chunk por chunk, pasándole la cola de la lista. El último recibe `downstream` vacío.
-- **Quórum 3 de 3.** Si cualquier réplica del pipeline falla, falla la escritura entera y la subida se aborta. Además, cada eslabón compara su checksum con el del siguiente: si no coinciden, `DATA_LOSS`. No existen bloques sub-replicados, así que no hace falta re-replicador.
+- **Quórum 3 de 3 dentro del pipeline.** Si cualquier réplica del pipeline falla, falla la escritura entera y la subida se aborta. Además, cada eslabón compara su checksum con el del siguiente: si no coinciden, `DATA_LOSS`. *(Desde Hito 3 A1 el ControlNode arma el pipeline solo con los DataNodes vivos y acepta 2 de 3; las copias que faltan las repone el re-replicador de A2.)*
 - **Selección de réplicas round-robin** en el ControlNode: cada bloque arranca el pipeline un nodo más adelante que el anterior, así los bloques de un archivo se reparten entre todos los DataNodes. Los DataNodes se configuran con una lista estática (`--datanode-addresses a,b,c`) y el factor con `--replication-factor` (default 3; con menos nodos que el factor, se replica en todos los que haya).
 - **Failover en lectura** (`distributed_client.py::_read_block_with_failover`). La descarga prueba las réplicas en orden: una caída (`UNAVAILABLE`) o podrida (`DATA_LOSS`) hace caer a la siguiente. Solo falla si fallan todas.
 - `Remove` borra el bloque de **todas** sus réplicas (best-effort, igual que antes).
@@ -57,17 +93,6 @@ El ControlNode deja de ser punto único de falla: **clúster de 3 ControlNodes c
 - 141 tests al cerrar el sub-proyecto 3 (16 nuevos: `tests/test_replicated_tree.py`, `tests/test_raft_cluster.py` y uno en `test_control_node_servicer.py`); 150 tras las correcciones posteriores. Los tests que ya existían corren contra un clúster Raft de 1 nodo con timeouts cortos (`conftest.py::start_control_node`): hay un solo camino de código, sin modo "sin Raft". La suite pasó de 0.5 s a ~10 s.
 - Verificado con procesos reales y timeouts por defecto: tras `kill -9` al líder, el cliente vuelve a responder en ~2 s y `send`/`receive` siguen funcionando; con `kill -9` a los 3 y relevantándolos, todo se recupera desde el journal.
 
-## Qué falta en Hito 2
-
-Hito 2 completo (según el enunciado) es un clúster de 3 ControlNodes con Raft más réplica de bloques. Eso se partió en 4 sub-proyectos independientes; los tres primeros están hechos:
-
-| # | Sub-proyecto | Estado |
-|---|---|---|
-| 1 | ControlNode + DataNode + cliente particionado (single-node) | ✅ Hecho |
-| 2 | Replicación de bloques, factor 3 (pipeline DataNode1→2→3) | ✅ Hecho |
-| 3 | Clúster de 3 ControlNodes con Raft (consenso, elección de líder) | ✅ Hecho |
-| 4 | Contenerización (Docker) | ✅ Hecho |
-
 ### Hito 2, sub-proyecto 4 — completo
 
 - **Una sola imagen** (`Dockerfile`, `python:3.12-slim`, usuario sin root) para todos los roles: DataNode, ControlNode, shell y tests. Los stubs gRPC se generan dentro de la imagen.
@@ -83,129 +108,75 @@ Hito 2 completo (según el enunciado) es un clúster de 3 ControlNodes con Raft 
 - **La shell acepta comillas** para rutas con espacios. Se separa con `shlex` **sin** carácter de escape: `shlex.split` normal destruye las rutas de Windows (`..\datos\a.pdf` → `..datosa.pdf`).
 - **`.gitignore`** ahora ignora las carpetas `dn*/` y `cn*/` que crean los comandos del README, `intercambio/` y el archivo `nul` que aparece al correr `comando 2>nul` desde bash en Windows.
 
-Con esto, **el Hito 2 queda completo en código**. Ojo con el alcance según el enunciado: ahí el Hito 2 es *"arquitectura distribuida + especificación de comunicaciones"*, y la replicación, la alta disponibilidad y la consistencia son del Hito 3. Buena parte del Hito 3 ya está adelantada; lo que falta del Hito 2 es **el documento de especificación de los 5 enlaces** (Cliente↔ControlNode, Cliente↔DataNode, ControlNode↔ControlNode, ControlNode↔DataNode, DataNode↔DataNode).
-
-**Decisiones ya tomadas para lo que falta** (para no volver a discutirlas):
+**Decisiones tomadas en Hito 2** (para no volver a discutirlas):
 
 - **Consenso del clúster:** `pysyncobj` embebida en el proceso del ControlNode — implementado en el sub-proyecto 3, validada con un spike antes de integrarla (Python 3.14, failover, persistencia). Nada de implementar Raft desde el paper, nada de etcd/ZooKeeper como sistema externo aparte — el costo operativo de correr y mantener un sistema externo, más el riesgo de reimplementar consenso a mano, no se justifican para el alcance de este proyecto.
 - **`op_id` (idempotencia de escrituras):** se genera una sola vez por operación lógica, del lado del cliente, antes del primer intento de red, y se reutiliza sin cambiar en cada reintento gRPC de esa misma operación (nunca un UUID nuevo por intento — eso anularía la idempotencia). Implementado en el sub-proyecto 3.
-- **Heartbeats ControlNode↔DataNode:** se decidió dejarlos fuera del sub-proyecto 3 para mantenerlo enfocado en Raft. Siguen pendientes (ver "3 DataNodes y uno caído" abajo).
+- **Liveness de DataNodes:** quedó fuera del sub-proyecto 3 para mantenerlo enfocado en Raft. Se resolvió en Hito 3 A1 con `Ping` iniciado por cada ControlNode (no con heartbeats del DataNode).
 
-## Cosas a tener en cuenta si vas a seguir sobre este código
-
-Cosas que costó descubrir y que no vale la pena redescubrir:
-
-- **Un identificador "opaco" sigue siendo una ruta si se une con `/`.** El DataNode valida `block_id` contra el formato exacto que genera el ControlNode (`uuid4().hex`, 32 hex minúsculas) antes de tocar el filesystem, en `dfsha/data_node/block_store.py::_block_path`. Esto no era así originalmente — se pensaba que un `block_id` "no es una ruta" y no necesitaba protección, hasta que una revisión encontró que sí se unía a una con `Path(root) / block_id`, y el operador `/` de `pathlib` descarta el lado izquierdo si el derecho es una ruta absoluta. Cualquier RPC nuevo que reciba un identificador de la red y lo use para armar una ruta en disco necesita la misma validación.
-- **`ControlTree` tiene un lock global** (`dfsha/control_node/tree.py`) porque corre detrás de un `ThreadPoolExecutor` con varios workers gRPC simultáneos, y sin lock hay una condición de carrera real y reproducible en operaciones como `begin_upload`. Es un lock único y grueso sobre todo el árbol (a propósito — las operaciones son en memoria, del orden de microsegundos). Si en algún momento se vuelve un cuello de botella real, pasar a locks por subárbol, no antes.
-- **El checksum del DataNode se escribe en un archivo `.sha256` aparte del bloque**, y esa escritura no es atómica como la del bloque en sí (el bloque sí usa temp-file + rename). No hay ningún camino hoy que reintente escribir el mismo bloque, así que la ventana no es alcanzable en la práctica — pero si el sub-proyecto de idempotencia agrega reintentos de bloque, hay que revisar esto primero.
-- **El ControlNode confía en el checksum que le reporta el cliente en `ConfirmBlock`**, sin volver a preguntarle al DataNode. Es una decisión de diseño del sub-proyecto 1, no un descuido — pero significa que hoy es posible (aunque nadie lo hace) confirmar y completar una subida sin haber escrito el bloque de verdad; recién falla al intentar descargarlo. Raft replica esta metadata tal cual, sin verificarla contra el almacenamiento real.
-- **Bloques huérfanos tras un `AbortUpload` parcial no se limpian todavía**, y con replicación el problema se multiplica por 3. Si el cliente ya confirmó 2 de 3 bloques y el tercero falla, el `abort` borra la metadata del ControlNode pero los 2 bloques ya escritos quedan en sus 3 réplicas cada uno, sin que nada los borre. (Lo que sí se limpia: si un pipeline falla aguas abajo, cada eslabón descarta su copia local de *ese* bloque antes de devolver el error.) Con Raft se sumó otra fuente: si el líder muere después de confirmar un `Remove` pero antes de mandar los `DeleteBlock`, la metadata ya no está y los bloques quedan. Resolverlo requiere un recolector que compare lo que tienen los DataNodes contra la metadata; sigue pendiente.
-- **Con exactamente 3 DataNodes y uno caído, fallan TODAS las subidas.** Quórum 3 de 3 + lista estática: el ControlNode no sabe que un nodo murió, y con 3 nodos y factor 3 todo pipeline incluye a los 3. Las **lecturas** siguen funcionando (failover), las **escrituras** no. Con 4+ nodos solo fallan los bloques cuyo pipeline caiga en el nodo muerto. Lo resuelven los heartbeats, que quedaron fuera del sub-proyecto 3 y siguen pendientes. Tenerlo presente al demostrar tolerancia a fallos: se demuestra bajando un nodo **después** de subir.
-- **El forwarding del pipeline usa un `ThreadPoolExecutor` propio**, separado del del servidor gRPC. No es por prolijidad: si compartiera el pool del servidor, N escrituras simultáneas podrían ocupar todos los workers esperando a que el siguiente DataNode responda, sin dejar ninguno libre para reenviar, y el pipeline se auto-bloquea.
-- **La cola del forwarding está acotada a 4 chunks (4 MiB)** a propósito — es lo que impide que un bloque de 128 MB se acumule entero en RAM si el siguiente nodo va más lento. El productor se bloquea hasta que haya lugar. `tests/test_replication.py::test_pipeline_with_block_larger_than_forwarding_queue` cubre que no se cuelgue.
-- **El failover de lectura tiene que descartar bytes parciales.** Una réplica puede caerse a mitad de bloque con bytes ya escritos al archivo local; `_read_block_with_failover` hace `seek` + `truncate` a la posición donde arrancó el bloque antes de probar la siguiente réplica. Sin eso el archivo final sale corrupto **en silencio**. Ojo: ni un nodo caído ni un bloque podrido ejercitan ese camino (los dos fallan antes del primer byte), por eso hay un test específico que corta el stream a mitad.
-- **Un comando replicado nunca puede lanzar una excepción.** `pysyncobj` no las atrapa al aplicar el log: la entrada queda sin aplicar y el nodo la reintenta para siempre. Como los 3 nodos aplican el mismo log, **un solo `mkdir` de una ruta existente bloquearía el clúster entero** (verificado en el spike: después de un comando que lanza, la siguiente escritura normal también se queda en timeout). Por eso `ReplicatedTree.apply` convierte todo en `("error", clase, mensaje)`, incluso excepciones inesperadas, y el servicer la vuelve a lanzar del lado del líder.
-- **`apply` no puede tener efectos secundarios** (red, disco, DataNodes). Corre en los 3 nodos, y otra vez cada vez que un nodo reinicia y reproduce el journal. Los `DeleteBlock` de `Remove` están en el servicer del líder, después del commit, a propósito.
-- **Nunca guardarse una referencia a `ReplicatedTree.tree`.** Restaurar un snapshot reemplaza el objeto árbol entero; una referencia vieja seguiría leyendo un árbol muerto. Siempre acceder vía `self._replicated.tree`.
-- **Un líder recién elegido NO tiene su árbol al día, aunque `_isLeader()` diga True.** Esto fue un bug real, encontrado corriendo los tests con la CPU cargada: tras matar al líder, `ls` no mostraba un archivo cuya subida ya se le había confirmado al cliente. El nuevo líder tiene la entrada en su log, pero no la aplicó hasta confirmar un no-op de su propio término. Por eso cada lectura pasa por `read_barrier`. De paso resuelve que un líder aislado de la mayoría sirva lecturas viejas: no logra confirmar la barrera y responde `UNAVAILABLE`. Costo: una entrada de log por lectura. **Cualquier RPC nuevo que lea el árbol tiene que pasar por `_read_barrier`**, no solo por `_require_leader`.
-- **Dos reglas en el servicer que no se ven fuera de contexto:** la respuesta de `BeginUpload` se arma con lo que *devuelve* el commit, no con los block_ids que el líder acaba de proponer (si el `op_id` ya se había aplicado, el resultado guardado trae los originales; con los propuestos, el cliente escribiría bloques que nadie conoce). Y un `op_id` vacío se rechaza en vez de inventar uno: vacío deduplicaría todas las requests entre sí.
-- **`useFork=False` es obligatorio** (`control_node/main.py::build_raft_conf`, y pisa cualquier override). Con el default, la compactación del log hace `fork()` del proceso con los hilos de gRPC y Raft corriendo; Python mismo advierte que el hijo puede quedar bloqueado. No se pudo reproducir un fallo determinístico — la regla se apoya en esa advertencia — así que hay un test que protege la configuración. La compactación ocurre recién cada 5000 entradas: **nunca corre sola en los tests**, por eso `test_full_cluster_restart_...` la fuerza.
-- **Durabilidad del journal:** `pysyncobj` escribe el journal por `mmap` sin `fsync` por entrada. Sobrevive a que se caiga el *proceso* (`kill -9`: lo escrito ya está en el page cache del SO), pero no garantiza durabilidad ante un corte de luz o caída del SO de un nodo — ahí depende de que la mayoría del clúster siga viva. Tenerlo presente al escribir el informe: no afirmar más que eso.
-- **Config de `pysyncobj`:** exige `raftMinTimeout > 3 × appendEntriesPeriod` y `connectionTimeout >= raftMaxTimeout`, validado con `assert` (con `python -O` esas validaciones desaparecen en silencio). Los tests usan timeouts cortos (`conftest.py::FAST_RAFT_CONF`); con valores más agresivos que esos, las elecciones se vuelven inestables bajo carga.
-
-### Hito 3, S2 — Spike Raft cifrado y upgrade de estado legacy
+### Hito 3 — S2: spike de Raft cifrado y upgrade de estado legacy
 
 - `scripts/spikes/raft_password_spike.py` verifica con `SyncObjConf(password=...)` un clúster de tres nodos: líder único, réplica, reinicio desde `raft.dump` + `raft.journal` y aislamiento de un tercer nodo con password distinta. Usa puertos efímeros y no toca el clúster de desarrollo.
 - `tests/fixtures/raft_legacy_9985c6d/` versiona los tres directorios persistidos reales generados con `HEAD=9985c6d`; el manifiesto fija los hashes, las firmas legacy y el outcome histórico `abort_upload -> None`.
 - `tests/test_raft_upgrade.py` restaura los binarios en tres nodos con direcciones nuevas, reproduce el journal, exige convergencia y rechaza outcomes que contengan `TypeError`. Deja `assert_legacy_upgrade(..., extension_checks=...)` para B1 (`_locks`), B3 (`version`/`block_size`), C2 (`_users`) y C3 (permisos).
 - Revisión 1: antes de ejecutar comandos nuevos, el upgrade compara en cada réplica una proyección canónica del árbol y `applied_ops`: conserva `/snapshot/file.bin` con sus bloques y metadata, no expone los uploads abortados y deja el journal en su estado final idéntico en los tres nodos.
 
-## Convenciones del repo
+### Hito 3 — S1: spike de mTLS opcional en un solo puerto
 
-- **Autor de todo commit:** `Jean Ardila <jardilaa@eafit.edu.co>` — es el identificador que reconoce GitHub para este repo, no usar un correo personal.
-- **Mensajes de commit:** una línea, cortos, naturales — nada de listas exhaustivas entre paréntesis.
-- **Tamaño de bloque:** 128 MB por defecto, siempre inyectable/configurable — nunca una constante hardcodeada suelta en el medio de una función.
-- **Checksums:** SHA-256 en cada bloque, calculado al escribir y reverificado al leer, sin excepciones.
-- **Excepciones de dominio:** viven en `dfsha/common/exceptions.py` y se reutilizan igual en todos los componentes (servidor de Hito 1, ControlNode, DataNode, ambos clientes) — no crear un código de error nuevo para algo que ya tiene uno.
+- `scripts/spikes/mtls_optional_spike.py` levanta un servidor gRPC con una CA de juguete y prueba sin certificado, con certificado válido y con uno de otra CA.
+- **Resultado negativo (grpcio 1.83.1):** con `require_client_auth=False` el servidor no pide el certificado del cliente, así que el servicer nunca ve quién llama. Con `require_client_auth=True` sí lo verifica, pero rechaza a los clientes sin certificado, y el puerto del DataNode es compartido con ellos.
+- Consecuencia para C1/C3: TLS de servidor en todos los enlaces y, para autorizar las operaciones internas del DataNode, capabilities firmadas por el ControlNode en vez de mTLS.
 
-## Estructura del código
-
-```
-dfsha/
-  server/            Hito 1 — servidor monolítico
-  client/
-    dfsha_client.py         Hito 1 — cliente monolítico
-    shell.py                shell interactiva (compartida por Hito 1 y Hito 2)
-    distributed_client.py   Hito 2 — cliente que habla con ControlNode + DataNode
-    distributed_shell_main.py
-  control_node/      Hito 2 — árbol de directorios + metadata de bloques + selección de réplicas, replicado con Raft
-  data_node/         Hito 2 — almacenamiento de bloques con checksum + pipeline de replicación
-  common/            Excepciones de dominio, compartidas por todo
-  generated/         Código gRPC generado (no se versiona, se regenera con scripts/generate_proto.py)
-proto/               Definiciones .proto (dfsha, control_node, data_node)
-tests/               150 tests, un archivo por componente
-Dockerfile           imagen única para todos los roles
-docker-compose.yml   clúster completo + shell + tests
-```
-
-## Cómo correr y probar
-
-Ver `README.md` para los comandos exactos de instalación y de arranque de cada proceso (servidor de Hito 1, o los 3 DataNodes + 3 ControlNodes + shell distribuida de Hito 2). Para correr todos los tests:
-
-```bash
-python -m pytest tests/ -v
-```
-
-## Hito 3 — P0: errores con tipo exacto
+### Hito 3 — P0: errores con tipo exacto
 
 - Los servicers de Hito 1, ControlNode y DataNode adjuntan `dfsha-error` en la metadata final de cada excepción de dominio; la matriz completa vive en `docs/especificacion-comunicaciones.md`.
 - El cliente distribuido acepta únicamente nombres de una lista explícita de excepciones de dominio y conserva un fallback seguro por `StatusCode` si la metadata falta o es inválida.
 - La lectura solo intenta otra réplica para `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `DATA_LOSS` o un `NOT_FOUND` de bloque identificado por metadata. `WriteBlock` valida el identificador antes de iniciar forwarding.
 - Verificado con 196 pruebas en verde (`python -m pytest tests/ -q`).
 
-### Correcciones de revisión, iteración 1 (P0)
+#### Correcciones de revisión, iteración 1 (P0)
 
 - `filesystem._require_directory_parent` valida cada ancestro para que `MakeDir` y `Upload` anidados bajo un archivo traduzcan a `NotADirectoryError`, sin exponer `UNKNOWN`.
 - `_translate` conserva el fallback seguro si `dfsha-error` aparece duplicado, incluso con valores iguales o conflictivos.
 - Verificado con 200 pruebas en verde (`python -m pytest tests/ -q`).
 
-### Correcciones de revisión, iteración 3 (P0)
+#### Correcciones de revisión, iteración 3 (P0)
 
 - `NOT_FOUND` sin `dfsha-error` o con un tipo desconocido no activa failover: se relanza el error y no se consulta la siguiente réplica.
 - Verificado con 202 pruebas en verde (`python -m pytest tests/ -q`).
 
-
-## Hito 3 — A1: liveness de DataNodes y pipeline degradado
+### Hito 3 — A1: liveness de DataNodes y pipeline degradado
 
 - Cada ControlNode sondea `Ping` localmente y excluye del pipeline las direcciones internas que no responden durante `--datanode-dead-after-s`; el estado de liveness no se replica por Raft.
 - Las subidas requieren `--min-write-replicas` (2 por defecto), no necesariamente el factor completo. Con menos del mínimo responden `UNAVAILABLE` antes de reservar metadata; con el mínimo, el bloque queda sub-replicado para la reposición de A2.
 - Los monitores, sus canales y los recursos de forwarding se cierran al detener los servidores; el cliente y los RPC del plano de datos usan deadlines explícitos.
 - Corrección de revisión: `ReadBlock` y `WriteBlock` calculan su deadline por bloque (`base + tamaño/throughput mínimo`, 1 MiB/s por defecto); el forwarding conserva el tiempo restante del deadline entrante, evitando cortar streams activos con el timeout corto de ControlNode.
 
-## Hito 3 — B1: locks lectores/escritor con lease
+### Hito 3 — B1: locks lectores/escritor con lease
 
 - `ControlTree` replica por Raft locks compartidos (`r`) y exclusivos (`w`) con holders, dueño y vencimiento; el líder decide `now` antes del commit y los leases vencidos se limpian en las mutaciones.
 - `Lock`, `RenewLock` y `Unlock` usan `op_id`; `Remove` rechaza archivos con holders vigentes mediante `ConflictError`/`ABORTED` y metadata `dfsha-error`.
 - El cliente renueva locks cada tercio del lease, los libera al cerrar y mantiene un lock compartido durante `receive`; la shell expone `lock`, `unlock` y `locks`.
 - El upgrade S2 verifica que snapshots legacy inicializan `_locks` sin alterar los outcomes históricos de `applied_ops`.
 
-### Correcciones de revisión B1 — rutas canónicas y lease perdido
+#### Correcciones de revisión B1 — rutas canónicas y lease perdido
 
 - Los locks se indexan con la ruta canónica derivada de sus partes, por lo que variantes como `/docs/a.txt`, `docs/a.txt` y `/docs//a.txt` compiten por el mismo holder; `Remove` aplica la misma clave.
 - El cliente guarda y libera rutas canónicas. Si `RenewLock` informa `ConflictError`, marca el `LeaseLock` como perdido, lo elimina de sus locks propios y detiene el renovador cuando corresponde; una liberación tardía limpia estado local sin alterar el resultado de una descarga exitosa.
-## Hito 3 — A2: re-replicación
+
+### Hito 3 — A2: re-replicación
 
 - El líder toma fotografías copiadas de bloques confirmados, identifica réplicas vivas únicamente con el monitor A1 y ordena `ReplicateBlock` desde una copia sana a un DataNode vivo que falte.
 - La metadata se publica con `update_block_replicas` compare-and-set y `op_id`; conflictos, timeouts y archivos borrados durante la copia no detienen el hilo. La copia de ese último caso queda huérfana para que A3 la recoja.
 - El re-replicador tiene barrera Raft, límites por ciclo, deadlines por tamaño, reintentos idempotentes con backoff+jitter y cierre coordinado con el ControlNode.
 
-### Correcciones de revisión A2
+#### Correcciones de revisión A2
 
 - **Delay:** se repara una réplica caída solo cuando lleva más de `--rereplication-delay-s` muerta (según `DataNodeMonitor.dead_for`), y el ciclo nunca duerme. Antes dormía el delay antes de cada reparación y después actuaba con una foto vieja: un nodo que revivía durante la espera igual se sacaba de la metadata. Un bloque escrito con menos copias (D-P2), sin réplicas muertas, se completa en el siguiente ciclo.
 - **Origen corrupto:** `ReplicateBlock` verifica el bloque local antes de abrir el stream al destino, así un origen corrupto responde `DATA_LOSS` y uno sin el bloque `NOT_FOUND` (antes salían como `UNAVAILABLE`). El re-replicador prueba el siguiente origen vivo en vez de insistir con el primero, que dejaba un bloque sin reparar para siempre.
 - **Límite conocido:** el re-replicador decide por liveness, no por integridad. Una réplica corrupta en un nodo vivo sigue contando como copia: la lectura la esquiva por failover, pero nadie la repone. Detectarla requiere un escaneo periódico de checksums, que no está en el plan.
 
-## Hito 3 — B2: lectura por rangos
+### Hito 3 — B2: lectura por rangos
 
 - `ReadBlockRequest` suma `offset` y `length` (0 = hasta el final del bloque, compatible con clientes viejos). El DataNode valida el rango antes de tocar el disco (`INVALID_ARGUMENT` si es negativo) y `block_store.read_block` conserva su firma anterior.
 - La verificación del SHA-256 sigue siendo del bloque completo, aunque se pida un rango: nunca se sirve un pedazo de un bloque podrido. El costo es leer el bloque entero para servir un rango chico; está anotado con `ponytail:` y se resuelve con checksums por chunk si llega a importar.
@@ -214,7 +185,7 @@ python -m pytest tests/ -v
 - Shell: `cat <ruta> [offset] [largo]` y `read <ruta> <offset> <largo> <local>`. Los comandos de RF3 (`cat`, `read`, `lock`, `unlock`, `locks`) ahora avisan "no disponible" con el cliente de Hito 1 en vez de tumbar la shell con `AttributeError`, un bug de B1 corregido de paso.
 - Implementado por Claude fuera de Kiro, en paralelo con A2, para ahorrar créditos.
 
-## Hito 3 — B3: escritura copy-on-write (`write` de RF3)
+### Hito 3 — B3: escritura copy-on-write (`write` de RF3)
 
 - Tres RPC nuevos (`BeginWrite`, `CommitWrite`, `AbortWrite`) y tres mutaciones replicadas (`begin_write`, `commit_write`, `abort_write`). Los bloques siguen siendo inmutables: una escritura reserva bloques nuevos, el cliente los escribe por el pipeline normal y el commit los publica juntos. Hasta el commit, el archivo visible es el anterior.
 - **Determinismo:** el líder arma la propuesta (block_ids y réplicas vivas) leyendo el árbol después de la barrera, y `begin_write` la vuelve a validar dentro de `apply()`. Si el archivo cambió entre medio, `ConflictError`. La cuenta de qué bloques toca una escritura vive en una sola función pura, `tree.plan_write_slots`, que usan las dos puntas.
@@ -227,7 +198,7 @@ python -m pytest tests/ -v
 - Probado en Docker: escritura en el medio de un archivo, un lector que bloquea al escritor, una escritura de 20 bytes que cruza el borde de un bloque de 1 MiB (coincide byte a byte), 0 huérfanos después de los commits, y una escritura exitosa después de matar al líder.
 - Implementado por Claude fuera de Kiro, para ahorrar créditos.
 
-## Hito 3 — A3: recolector de bloques huérfanos y réplicas sobrantes
+### Hito 3 — A3: recolector de bloques huérfanos y réplicas sobrantes
 
 - `dfsha/control_node/garbage_collector.py`: hilo del líder, cada `--gc-interval-s` (60 s). Con lifecycle completo: `stop_event`, `join` y cierre de canales junto con el servidor. No guarda estado entre ciclos, así que tras un failover el líder nuevo parte de cero.
 - **Qué está en uso** (`ControlTree.referenced_blocks`): archivos confirmados, TODAS las subidas pendientes y las reservas COW vigentes, más las copias en vuelo del re-replicador. Las subidas pendientes cuentan aunque su lease haya vencido, porque `complete_upload` las acepta mientras nadie reemplace el nombre, y borrarles los bloques perdería datos. *(Desvío del plan, que decía "con lease vigente".)*
@@ -237,9 +208,100 @@ python -m pytest tests/ -v
 - **`AbortUpload`** borra al instante: el servicer lee los bloques de la subida (`pending_blocks`) antes del commit y los borra si sale bien. `abort_upload` sigue sin devolver nada A PROPÓSITO: la primera versión los devolvía, y el test de upgrade de S2 la rechazó. El resultado de un comando replicado queda guardado en `applied_ops`, y reproducir un journal viejo con un retorno distinto da otro estado. Cambiar el valor de retorno de un método replicado es tan riesgoso como cambiarle la firma.
 - **`inspect huerfanos`** ahora pide el inventario por RPC en vez de leer los volúmenes, y separa los bloques en uso, los que no tienen uso visible pero son jóvenes, y los que el recolector va a borrar. El servicio `inspect` de compose ya no monta los volúmenes de los DataNodes.
 - Implementado por Claude fuera de Kiro, para ahorrar créditos.
-## Hito 3 — C4: cifrado en reposo del DataNode
+
+### Hito 3 — C4: cifrado en reposo del DataNode
 
 - Cada bloque físico es un único contenedor `DFSE1` en `dfsha/data_node/block_store.py`: header con versión y prefijo aleatorio, chunks de 1 MiB AES-256-GCM y metadata final autenticada con tamaño lógico, conteo y SHA-256 del plaintext. Ya no existe sidecar `.sha256`.
 - `ReadBlock` autentica primero la metadata y luego únicamente los chunks requeridos para el rango; corrupción, truncación, llave incorrecta o un archivo legacy/plaintext producen `BlockCorruptedError`/`DATA_LOSS` sin migración silenciosa. `list_blocks` informa tamaño lógico y edad calculada por el reloj del DataNode.
 - `--encryption-key-file` es obligatorio: lee una llave cruda de exactamente 32 bytes. `scripts/generate_secrets.py` crea solo `secrets/dn1.key`, `dn2.key` y `dn3.key`, con modo 0600 y sin sobrescribir salvo `--force`; Compose los monta como solo lectura. No hay rotación de llaves.
 - El formato cambió sin migración: usar `docker compose down -v` antes de crear volúmenes cifrados nuevos; un volumen previo falla explícitamente al leerse.
+
+### Revisión de cierre del Hito 3 (2026-10-03)
+
+Revisión de las diez entregas de Jean (P0, S2, A1, B1, A2, B2, B3, A3, S1, C4) con la suite completa y una demo de punta a punta sobre los 6 contenedores.
+
+- **Correcto:** las mutaciones replicadas de `tree.py` siguen siendo deterministas (sin reloj, `uuid`, azar ni E/S dentro de `apply`); el CAS de versión de B3 y los leases de B1 son consistentes; el nonce de C4 (prefijo aleatorio de 8 bytes + contador de 4, metadata en el contador 2^32−1) no se repite dentro de un bloque y la llave es distinta por DataNode.
+- **Verificado en Docker** con tiempos cortos: mapa de particionamiento, 0 apariciones del texto plano en los discos, `cat` por rango, `read` que cruza un borde de bloque (idéntico al original), `write` COW, un lector que bloquea `write` y `rm`, subida con un DataNode caído (2 réplicas) y re-replicación a 3 al volver, réplica corrupta → `CORRUPTO` y descarga idéntica desde otra, caída del líder, 2 ControlNodes caídos sin servicio, `down`/`up` conservando el árbol, y el recolector borrando un bloque huérfano inyectado.
+- **Corregido:**
+  - Tres tests de liveness dormían un tiempo fijo (`time.sleep(0.12)` / `1.2`) esperando que el monitor diera por muerto un DataNode. En Linux un connect a un puerto cerrado falla al instante; en Windows tarda ~2 s, así que fallaban. Ahora esperan la condición con `conftest.py::wait_until_datanode_excluded`.
+  - `test_encrypted_block_store.py` simulaba un `FileNotFoundError` sin `errno`; en Python 3.12 `Path.exists()` solo ignora errores con `ENOENT`, así que el test fallaba dentro de la imagen.
+  - `scripts/generate_secrets.py` llamaba `os.fchmod`, que no existe en Windows con Python < 3.13.
+  - `inspect huerfanos` usaba una gracia fija de 1200 s; ahora toma `DFSHA_GC_GRACE_S` del `.env`, igual que los ControlNodes.
+- Guía (`docs/GUIA.md`), README y diagrama (`docs/arquitectura-y-flujos.excalidraw`) reescritos con el estado actual.
+
+## Cosas a tener en cuenta si vas a seguir sobre este código
+
+Cosas que costó descubrir y que no vale la pena redescubrir:
+
+- **Un identificador "opaco" sigue siendo una ruta si se une con `/`.** El DataNode valida `block_id` contra el formato exacto que genera el ControlNode (`uuid4().hex`, 32 hex minúsculas) antes de tocar el filesystem, en `dfsha/data_node/block_store.py::_block_path`. Esto no era así originalmente — se pensaba que un `block_id` "no es una ruta" y no necesitaba protección, hasta que una revisión encontró que sí se unía a una con `Path(root) / block_id`, y el operador `/` de `pathlib` descarta el lado izquierdo si el derecho es una ruta absoluta. Cualquier RPC nuevo que reciba un identificador de la red y lo use para armar una ruta en disco necesita la misma validación.
+- **`ControlTree` tiene un lock global** (`dfsha/control_node/tree.py`) porque corre detrás de un `ThreadPoolExecutor` con varios workers gRPC simultáneos, y sin lock hay una condición de carrera real y reproducible en operaciones como `begin_upload`. Es un lock único y grueso sobre todo el árbol (a propósito — las operaciones son en memoria, del orden de microsegundos). Si en algún momento se vuelve un cuello de botella real, pasar a locks por subárbol, no antes.
+- **El checksum del DataNode vive dentro del contenedor cifrado** (Hito 3 C4): la metadata final autenticada del archivo `DFSE1` lleva el tamaño, el número de chunks y el SHA-256 del texto plano. Antes iba en un `.sha256` aparte cuya escritura no era atómica; ese sidecar ya no existe y el bloque completo se escribe con temp-file + rename.
+- **El ControlNode confía en el checksum que le reporta el cliente en `ConfirmBlock`**, sin volver a preguntarle al DataNode. Es una decisión de diseño del sub-proyecto 1, no un descuido — pero significa que hoy es posible (aunque nadie lo hace) confirmar y completar una subida sin haber escrito el bloque de verdad; recién falla al intentar descargarlo. Raft replica esta metadata tal cual, sin verificarla contra el almacenamiento real.
+- **Bloques huérfanos.** Aparecen por varias vías: un `AbortUpload` parcial, un líder que muere entre el commit de un `Remove` y sus `DeleteBlock`, una copia del re-replicador sobre un archivo que se borró mientras tanto, o los bloques viejos de un `write` COW cuyo borrado falló. Desde Hito 3 A3 los limpia el recolector del líder, con una gracia (`--gc-grace-s`) que cubre lo que un líder recién elegido no ve; además `AbortUpload` borra al instante los bloques de la subida descartada.
+- **Con 3 DataNodes y uno caído las subidas siguen funcionando**, con 2 réplicas por bloque (Hito 3 A1, `--min-write-replicas 2`). Pero hay una ventana: el monitor tarda `--datanode-dead-after-s` en dar el nodo por muerto, y una subida que empiece en ese intervalo falla porque el pipeline todavía lo incluye. Con dos DataNodes caídos, `BeginUpload` responde `UNAVAILABLE` sin reservar nada. El re-replicador repara solo lo que lleva caído más de `--rereplication-delay-s`, para no copiar bloques enteros por un reinicio corto.
+- **El forwarding del pipeline usa un `ThreadPoolExecutor` propio**, separado del del servidor gRPC. No es por prolijidad: si compartiera el pool del servidor, N escrituras simultáneas podrían ocupar todos los workers esperando a que el siguiente DataNode responda, sin dejar ninguno libre para reenviar, y el pipeline se auto-bloquea.
+- **La cola del forwarding está acotada a 4 chunks (4 MiB)** a propósito — es lo que impide que un bloque de 128 MB se acumule entero en RAM si el siguiente nodo va más lento. El productor se bloquea hasta que haya lugar. `tests/test_replication.py::test_pipeline_with_block_larger_than_forwarding_queue` cubre que no se cuelgue.
+- **El failover de lectura tiene que descartar bytes parciales.** Una réplica puede caerse a mitad de bloque con bytes ya escritos al archivo local; `_read_block_with_failover` hace `seek` + `truncate` a la posición donde arrancó el bloque antes de probar la siguiente réplica. Sin eso el archivo final sale corrupto **en silencio**. Ojo: ni un nodo caído ni un bloque podrido ejercitan ese camino (los dos fallan antes del primer byte), por eso hay un test específico que corta el stream a mitad.
+- **Un comando replicado nunca puede lanzar una excepción.** `pysyncobj` no las atrapa al aplicar el log: la entrada queda sin aplicar y el nodo la reintenta para siempre. Como los 3 nodos aplican el mismo log, **un solo `mkdir` de una ruta existente bloquearía el clúster entero** (verificado en el spike: después de un comando que lanza, la siguiente escritura normal también se queda en timeout). Por eso `ReplicatedTree.apply` convierte todo en `("error", clase, mensaje)`, incluso excepciones inesperadas, y el servicer la vuelve a lanzar del lado del líder.
+- **`apply` no puede tener efectos secundarios** (red, disco, DataNodes). Corre en los 3 nodos, y otra vez cada vez que un nodo reinicia y reproduce el journal. Los `DeleteBlock` de `Remove` están en el servicer del líder, después del commit, a propósito.
+- **Nunca guardarse una referencia a `ReplicatedTree.tree`.** Restaurar un snapshot reemplaza el objeto árbol entero; una referencia vieja seguiría leyendo un árbol muerto. Siempre acceder vía `self._replicated.tree`.
+- **Un líder recién elegido NO tiene su árbol al día, aunque `_isLeader()` diga True.** Esto fue un bug real, encontrado corriendo los tests con la CPU cargada: tras matar al líder, `ls` no mostraba un archivo cuya subida ya se le había confirmado al cliente. El nuevo líder tiene la entrada en su log, pero no la aplicó hasta confirmar un no-op de su propio término. Por eso cada lectura pasa por `read_barrier`. De paso resuelve que un líder aislado de la mayoría sirva lecturas viejas: no logra confirmar la barrera y responde `UNAVAILABLE`. Costo: una entrada de log por lectura. **Cualquier RPC nuevo que lea el árbol tiene que pasar por `_read_barrier`**, no solo por `_require_leader`.
+- **Dos reglas en el servicer que no se ven fuera de contexto:** la respuesta de `BeginUpload` se arma con lo que *devuelve* el commit, no con los block_ids que el líder acaba de proponer (si el `op_id` ya se había aplicado, el resultado guardado trae los originales; con los propuestos, el cliente escribiría bloques que nadie conoce). Y un `op_id` vacío se rechaza en vez de inventar uno: vacío deduplicaría todas las requests entre sí.
+- **`useFork=False` es obligatorio** (`control_node/main.py::build_raft_conf`, y pisa cualquier override). Con el default, la compactación del log hace `fork()` del proceso con los hilos de gRPC y Raft corriendo; Python mismo advierte que el hijo puede quedar bloqueado. No se pudo reproducir un fallo determinístico — la regla se apoya en esa advertencia — así que hay un test que protege la configuración. La compactación ocurre recién cada 5000 entradas: **nunca corre sola en los tests**, por eso `test_full_cluster_restart_...` la fuerza.
+- **Durabilidad del journal:** `pysyncobj` escribe el journal por `mmap` sin `fsync` por entrada. Sobrevive a que se caiga el *proceso* (`kill -9`: lo escrito ya está en el page cache del SO), pero no garantiza durabilidad ante un corte de luz o caída del SO de un nodo — ahí depende de que la mayoría del clúster siga viva. Tenerlo presente al escribir el informe: no afirmar más que eso.
+- **Config de `pysyncobj`:** exige `raftMinTimeout > 3 × appendEntriesPeriod` y `connectionTimeout >= raftMaxTimeout`, validado con `assert` (con `python -O` esas validaciones desaparecen en silencio). Los tests usan timeouts cortos (`conftest.py::FAST_RAFT_CONF`); con valores más agresivos que esos, las elecciones se vuelven inestables bajo carga.
+
+## Convenciones del repo
+
+- **Autor de cada commit:** cada integrante con su cuenta de GitHub; sin líneas `Co-Authored-By`.
+- **Mensajes de commit:** una línea, cortos, naturales — nada de listas exhaustivas entre paréntesis.
+- **Tamaño de bloque:** 128 MB por defecto, siempre inyectable/configurable — nunca una constante hardcodeada suelta en el medio de una función.
+- **Checksums:** SHA-256 en cada bloque, calculado al escribir y reverificado al leer, sin excepciones.
+- **Excepciones de dominio:** viven en `dfsha/common/exceptions.py` y se reutilizan igual en todos los componentes (servidor de Hito 1, ControlNode, DataNode, ambos clientes) — no crear un código de error nuevo para algo que ya tiene uno.
+- **Secretos:** `secrets/` y `*.pem` nunca se versionan.
+
+## Estructura del código
+
+```
+dfsha/
+  server/            Hito 1 — servidor monolítico
+  client/
+    dfsha_client.py         Hito 1 — cliente monolítico
+    shell.py                shell interactiva (Hito 1 y distribuida, con los comandos de RF3)
+    distributed_client.py   cliente distribuido: failover entre ControlNodes y réplicas, locks, rangos, write COW
+    distributed_shell_main.py
+  control_node/
+    tree.py                 árbol, bloques, subidas, locks y escrituras COW (lógica pura, determinista)
+    replicated_tree.py      máquina de estados Raft (pysyncobj), lista blanca de 14 mutaciones
+    servicer.py             RPC del ControlNode; solo el líder atiende
+    datanode_monitor.py     A1 — Ping a cada DataNode, vista local de vivos
+    rereplicator.py         A2 — repone copias de bloques sub-replicados
+    garbage_collector.py    A3 — borra bloques huérfanos y réplicas sobrantes
+    main.py
+  data_node/
+    block_store.py          bloques cifrados DFSE1 (AES-256-GCM)
+    servicer.py             RPC del DataNode y pipeline de replicación
+    main.py
+  common/            excepciones de dominio, compartidas por todo
+  generated/         código gRPC generado (no se versiona, se regenera con scripts/generate_proto.py)
+proto/               definiciones .proto (dfsha, control_node, data_node)
+scripts/
+  generate_proto.py         stubs gRPC
+  generate_secrets.py       llaves de los DataNodes en secrets/
+  inspect_cluster.py        servicio inspect: estado, líder, árbol, mapa, bloques, huérfanos
+  spikes/                   spikes S1 (mTLS) y S2 (Raft cifrado, fixture legacy)
+tests/               412 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
+docs/                GUIA.md, especificacion-comunicaciones.md, arquitectura-y-flujos.excalidraw
+Dockerfile           imagen única para todos los roles
+docker-compose.yml   clúster completo + shell + inspect + tests
+.env                 parámetros del clúster
+```
+
+## Cómo correr y probar
+
+Ver `docs/GUIA.md`. Para correr todos los tests:
+
+```bash
+docker compose run --rm tests        # dentro de la imagen
+python -m pytest tests/ -q           # con el venv local
+```
