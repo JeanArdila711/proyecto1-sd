@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from typing import Callable
 
 import grpc
 from pysyncobj import SyncObj, SyncObjException
@@ -79,6 +80,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         min_write_replicas: int = DEFAULT_MIN_WRITE_REPLICAS,
         datanode_monitor: DataNodeMonitor | None = None,
         lock_lease_s: float = DEFAULT_LOCK_LEASE_S,
+        channel_factory: Callable[[str], grpc.Channel] = grpc.insecure_channel,
     ) -> None:
         if not datanode_addresses:
             raise ValueError("hace falta al menos un DataNode")
@@ -107,6 +109,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         self._next_offset = 0
         self._offset_lock = threading.Lock()
         self._channels: dict[str, grpc.Channel] = {}
+        self._channel_factory = channel_factory
 
     def close(self) -> None:
         for channel in self._channels.values():
@@ -114,7 +117,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
 
     def _datanode_stub(self, address: str):
         if address not in self._channels:
-            self._channels[address] = grpc.insecure_channel(address)
+            self._channels[address] = self._channel_factory(address)
         return data_node_pb2_grpc.DataNodeServiceStub(self._channels[address])
 
     def _require_leader(self, context: grpc.ServicerContext) -> None:

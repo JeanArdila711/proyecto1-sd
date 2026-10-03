@@ -56,11 +56,11 @@ def test_abort_mid_upload_leaves_no_visible_file(cluster, tmp_path, monkeypatch)
     original_write_block = client._write_block
     call_count = {"n": 0}
 
-    def fail_on_second_block(block, fh):
+    def fail_on_second_block(block, fh, *args):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise OSError("disco lleno simulado")
-        return original_write_block(block, fh)
+        return original_write_block(block, fh, *args)
 
     monkeypatch.setattr(client, "_write_block", fail_on_second_block)
 

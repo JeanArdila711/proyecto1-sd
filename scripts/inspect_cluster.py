@@ -32,6 +32,14 @@ def _load_repo(repo: Path):
     sys.path.insert(0, str(repo))
 
 
+# Fábrica de canales: en claro por defecto, TLS con --tls-ca-file (main la configura).
+_new_channel = None
+
+
+def _channel(address: str):
+    return _new_channel(address)
+
+
 def _split(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
@@ -43,7 +51,7 @@ def roles(cn_addresses: list[str]) -> list[str]:
 
     result = []
     for address in cn_addresses:
-        stub = control_node_pb2_grpc.ControlNodeServiceStub(grpc.insecure_channel(address))
+        stub = control_node_pb2_grpc.ControlNodeServiceStub(_channel(address))
         try:
             stub.ListDir(control_node_pb2.ListDirRequest(path="/"), timeout=3)
             result.append("LIDER")
@@ -64,7 +72,7 @@ def leader_stub(cn_addresses: list[str]):
 
     for address, role in zip(cn_addresses, roles(cn_addresses)):
         if role == "LIDER":
-            return address, control_node_pb2_grpc.ControlNodeServiceStub(grpc.insecure_channel(address))
+            return address, control_node_pb2_grpc.ControlNodeServiceStub(_channel(address))
     sys.exit("No hay líder: ¿están caídos 2 de los 3 ControlNodes? Raft necesita mayoría.")
 
 
@@ -93,7 +101,7 @@ def replica_status(address: str, block_id: str, expected_checksum: str) -> str:
     import grpc
     from dfsha.generated import data_node_pb2, data_node_pb2_grpc
 
-    stub = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(address))
+    stub = data_node_pb2_grpc.DataNodeServiceStub(_channel(address))
     hasher = hashlib.sha256()
     try:
         for chunk in stub.ReadBlock(data_node_pb2.ReadBlockRequest(block_id=block_id), timeout=30):
@@ -131,7 +139,7 @@ def cmd_estado(args):
 
     print("\nDATANODES")
     for i, address in enumerate(dns):
-        stub = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(address))
+        stub = data_node_pb2_grpc.DataNodeServiceStub(_channel(address))
         try:
             stub.Ping(data_node_pb2.PingRequest(), timeout=3)
             state = "vivo"
@@ -228,7 +236,7 @@ def cmd_huerfanos(args):
     print(f"\nBloques en uso por archivos visibles: {len(assigned)}   (gracia del recolector: {args.gracia_s:.0f} s)\n")
     total_candidates = 0
     for address in dns:
-        dn = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(address))
+        dn = data_node_pb2_grpc.DataNodeServiceStub(_channel(address))
         try:
             stored = list(dn.ListStoredBlocks(data_node_pb2.ListStoredBlocksRequest(), timeout=30))
         except grpc.RpcError as exc:
@@ -253,6 +261,7 @@ def main() -> None:
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parent.parent), help="raíz del repo")
     parser.add_argument("--control-nodes", default=DEFAULT_CN)
     parser.add_argument("--datanodes", default=DEFAULT_DN)
+    parser.add_argument("--tls-ca-file", help="certificado de la CA si el clúster usa TLS")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("estado", help="rol de cada ControlNode y si cada DataNode está vivo")
     sub.add_parser("lider", help="imprime el nombre del líder (cn0, cn1 o cn2)")
@@ -273,6 +282,10 @@ def main() -> None:
 
     _load_repo(Path(args.repo))
     import grpc
+    from dfsha.common.tls import channel_factory, load_tls
+
+    global _new_channel
+    _new_channel = channel_factory(load_tls(Path(args.tls_ca_file)) if args.tls_ca_file else None)
 
     try:
         {

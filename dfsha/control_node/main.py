@@ -7,6 +7,7 @@ from pathlib import Path
 import grpc
 from pysyncobj import SyncObj, SyncObjConf
 
+from dfsha.common.tls import TlsConfig, add_port, add_tls_arguments, channel_factory, tls_from_args
 from dfsha.control_node.datanode_monitor import (
     DEFAULT_DATANODE_DEAD_AFTER_S,
     DEFAULT_HEARTBEAT_INTERVAL_S,
@@ -37,7 +38,9 @@ from dfsha.generated import control_node_pb2_grpc
 DEFAULT_BLOCK_SIZE_BYTES = 128 * 1024 * 1024
 
 
-def build_raft_conf(data_dir: Path | None, raft_conf_overrides: dict | None = None) -> SyncObjConf:
+def build_raft_conf(
+    data_dir: Path | None, raft_conf_overrides: dict | None = None, raft_password: str | None = None
+) -> SyncObjConf:
     # Timeouts de Raft: los defaults de pysyncobj; los tests los acortan.
     conf = {
         **(raft_conf_overrides or {}),
@@ -45,11 +48,23 @@ def build_raft_conf(data_dir: Path | None, raft_conf_overrides: dict | None = No
         # el snapshot, y fork() con los hilos de gRPC corriendo no está soportado.
         "useFork": False,
     }
+    if raft_password:
+        # pysyncobj cifra y autentica cada mensaje entre ControlNodes con Fernet, con
+        # una llave derivada de la password: un nodo sin ella no entra al clúster. El
+        # journal en disco no cambia de formato.
+        conf["password"] = raft_password
     if data_dir is not None:
         data_dir.mkdir(parents=True, exist_ok=True)
         conf["journalFile"] = str(data_dir / "raft.journal")
         conf["fullDumpFile"] = str(data_dir / "raft.dump")
     return SyncObjConf(**conf)
+
+
+def load_raft_password(path: Path) -> str:
+    password = path.read_text(encoding="utf-8").strip()
+    if len(password) < 32:
+        raise ValueError(f"la password de Raft en {path} es demasiado corta (mínimo 32 caracteres)")
+    return password
 
 
 def validate_datanode_configuration(
@@ -92,6 +107,8 @@ def serve(
     rereplication_max_per_cycle: int = DEFAULT_REREPLICATION_MAX_PER_CYCLE,
     gc_interval_s: float = DEFAULT_GC_INTERVAL_S,
     gc_grace_s: float = DEFAULT_GC_GRACE_S,
+    tls: TlsConfig | None = None,
+    raft_password: str | None = None,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
     DataNodes, que se detiene junto con el servidor.
@@ -103,12 +120,19 @@ def serve(
     validate_datanode_configuration(datanode_addresses, replication_factor, min_write_replicas)
     replicated = ReplicatedTree()
     raft = SyncObj(
-        raft_self, raft_peers, conf=build_raft_conf(data_dir, raft_conf_overrides), consumers=[replicated]
+        raft_self,
+        raft_peers,
+        conf=build_raft_conf(data_dir, raft_conf_overrides, raft_password),
+        consumers=[replicated],
     )
+    # Todos los canales hacia DataNodes (Ping, DeleteBlock, ReplicateBlock, inventario)
+    # usan el mismo TLS que el resto del clúster.
+    datanode_channel = channel_factory(tls)
     monitor = DataNodeMonitor(
         datanode_addresses,
         heartbeat_interval_s=heartbeat_interval_s,
         dead_after_s=datanode_dead_after_s,
+        channel_factory=datanode_channel,
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     servicer = ControlNodeServicer(
@@ -122,6 +146,7 @@ def serve(
         min_write_replicas,
         monitor,
         lock_lease_s,
+        channel_factory=datanode_channel,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
     rereplicator = ReReplicator(
@@ -131,9 +156,15 @@ def serve(
         interval_s=rereplication_interval_s,
         delay_s=rereplication_delay_s,
         max_per_cycle=rereplication_max_per_cycle,
+        channel_factory=datanode_channel,
     )
     garbage_collector = GarbageCollector(
-        servicer, monitor, interval_s=gc_interval_s, grace_s=gc_grace_s, rereplicator=rereplicator
+        servicer,
+        monitor,
+        interval_s=gc_interval_s,
+        grace_s=gc_grace_s,
+        rereplicator=rereplicator,
+        channel_factory=datanode_channel,
     )
     original_stop = server.stop
 
@@ -147,7 +178,7 @@ def serve(
         return termination
 
     server.stop = stop_with_cleanup
-    bound_port = server.add_insecure_port(f"{host}:{port}")
+    bound_port = add_port(server, f"{host}:{port}", tls)
     server.start()
     monitor.start()
     rereplicator.start()
@@ -200,7 +231,21 @@ def main() -> None:
         default=DEFAULT_GC_GRACE_S,
         help="edad mínima de un bloque sin uso antes de borrarlo",
     )
+    parser.add_argument(
+        "--raft-password-file",
+        help="password compartida por los ControlNodes: cifra y autentica el canal Raft",
+    )
+    add_tls_arguments(parser, server=True)
     args = parser.parse_args()
+    tls = tls_from_args(args, server=True)
+    raft_password = None
+    if args.raft_password_file:
+        try:
+            raft_password = load_raft_password(Path(args.raft_password_file))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+    else:
+        print("AVISO: sin --raft-password-file, el canal Raft va en claro (solo para desarrollo)")
 
     cluster = _split_addresses(args.raft_cluster)
     addresses = _split_addresses(args.datanode_addresses)
@@ -234,13 +279,16 @@ def main() -> None:
         lock_lease_s=args.lock_lease_s,
         gc_interval_s=args.gc_interval_s,
         gc_grace_s=args.gc_grace_s,
+        tls=tls,
+        raft_password=raft_password,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")
     print(
         f"ControlNode {args.node_id} escuchando en {args.host}:{bound_port}, "
         f"Raft={raft_self} peers={raft_peers}, DataNodes={addresses}, "
-        f"factor={args.replication_factor}, mínimo escritura={args.min_write_replicas}"
+        f"factor={args.replication_factor}, mínimo escritura={args.min_write_replicas}, "
+        f"TLS={tls is not None}, Raft cifrado={raft_password is not None}"
     )
     try:
         server.wait_for_termination()

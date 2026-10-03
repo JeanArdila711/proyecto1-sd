@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import random
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +27,7 @@ from dfsha.common.exceptions import (
     PathExistsError,
     PathNotFoundError,
 )
+from dfsha.common.tls import TlsConfig, channel_factory
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
 CHUNK_SIZE_BYTES = 1024 * 1024  # 1 MiB
@@ -43,6 +46,10 @@ _MAX_RETRY_BACKOFF_S = 2.0
 # para un bloque de 128 MiB en enlaces lentos sin relajar los RPC cortos de control.
 DEFAULT_BLOCK_TRANSFER_BASE_TIMEOUT_S = 5.0
 DEFAULT_MIN_TRANSFER_THROUGHPUT_BYTES_PER_S = 1024 * 1024
+
+# Bloques que send/receive transfieren a la vez. Cada hilo mueve un bloque completo por
+# streaming (1 MiB en vuelo), así que la memoria no crece con el tamaño del bloque.
+DEFAULT_PARALLEL_TRANSFERS = 4
 
 # "Este nodo no puede atender ahora, probá otro": un follower (UNAVAILABLE), un nodo
 # caído (UNAVAILABLE) o uno que no respondió a tiempo (DEADLINE_EXCEEDED). Reintentar
@@ -136,6 +143,49 @@ def _canonical_lock_path(path: str) -> str:
     return "/" + "/".join(part for part in path.strip("/").split("/") if part)
 
 
+class _TransferCancelled(Exception):
+    """Un bloque no se transfirió, o se cortó, porque otro bloque del mismo archivo ya
+    había fallado. Nunca llega al usuario: se relanza el error original."""
+
+
+class _RegionWriter:
+    """Vista de un archivo abierto limitada a la región de un bloque.
+
+    En una descarga paralela varios hilos escriben bloques distintos del mismo archivo.
+    El failover de lectura descarta lo escrito por una réplica que falló con
+    ``seek(inicio)`` + ``truncate()``; acá ``truncate`` no recorta el archivo, porque
+    borraría los bloques que ya escribieron otros hilos: la réplica siguiente
+    sobrescribe la región desde el principio. Escribir fuera de la región es un error."""
+
+    def __init__(self, fh, size: int) -> None:
+        self._fh = fh
+        self._start = fh.tell()
+        self._size = size
+
+    def tell(self) -> int:
+        return self._fh.tell() - self._start
+
+    def seek(self, position: int) -> None:
+        self._fh.seek(self._start + position)
+
+    def truncate(self) -> None:
+        pass
+
+    def write(self, data: bytes) -> int:
+        if self.tell() + len(data) > self._size:
+            raise BlockCorruptedError("una réplica envió más bytes que el tamaño del bloque")
+        return self._fh.write(data)
+
+
+def _block_starts(blocks) -> list[int]:
+    """Offset de cada bloque dentro del archivo: solo el último puede ser más corto."""
+    starts, position = [], 0
+    for block in blocks:
+        starts.append(position)
+        position += block.size_bytes
+    return starts
+
+
 class LeaseLock:
     """Handle local de un lock durable, y el handle de archivo de RF3 (D-P3): `open`
     lo devuelve, y `read`/`write` operan bajo este mismo lock en vez de tomar otro."""
@@ -178,6 +228,8 @@ class DistributedDFShaClient:
         failover_budget_s: float = DEFAULT_FAILOVER_BUDGET_S,
         transfer_base_timeout_s: float = DEFAULT_BLOCK_TRANSFER_BASE_TIMEOUT_S,
         minimum_transfer_throughput_bytes_per_s: float = DEFAULT_MIN_TRANSFER_THROUGHPUT_BYTES_PER_S,
+        tls: TlsConfig | None = None,
+        parallel_transfers: int = DEFAULT_PARALLEL_TRANSFERS,
     ) -> None:
         if isinstance(control_node_addresses, str):
             # un str se iteraría letra por letra como si fueran direcciones
@@ -191,14 +243,19 @@ class DistributedDFShaClient:
             or minimum_transfer_throughput_bytes_per_s <= 0
         ):
             raise ValueError("los timeouts y throughput del cliente deben ser mayores que cero")
+        if parallel_transfers < 1:
+            raise ValueError(f"parallel_transfers debe ser >= 1, no {parallel_transfers}")
+        self._parallel_transfers = parallel_transfers
+        self._new_channel = channel_factory(tls)
         self._control_addresses = list(control_node_addresses)
-        self._control_channels = {a: grpc.insecure_channel(a) for a in self._control_addresses}
+        self._control_channels = {a: self._new_channel(a) for a in self._control_addresses}
         self._leader_index = 0  # último nodo que respondió: el líder más probable
         self._rpc_timeout_s = rpc_timeout_s
         self._failover_budget_s = failover_budget_s
         self._transfer_base_timeout_s = transfer_base_timeout_s
         self._minimum_transfer_throughput_bytes_per_s = minimum_transfer_throughput_bytes_per_s
         self._datanode_channels: dict[str, grpc.Channel] = {}
+        self._datanode_channels_guard = threading.Lock()  # varios hilos de transferencia
         self._held_locks: dict[str, LeaseLock] = {}
         self._locks_guard = threading.RLock()
         self._lock_renewal_stop = threading.Event()
@@ -250,9 +307,53 @@ class DistributedDFShaClient:
             attempt += 1
 
     def _datanode_stub(self, address: str):
-        if address not in self._datanode_channels:
-            self._datanode_channels[address] = grpc.insecure_channel(address)
-        return data_node_pb2_grpc.DataNodeServiceStub(self._datanode_channels[address])
+        with self._datanode_channels_guard:
+            if address not in self._datanode_channels:
+                self._datanode_channels[address] = self._new_channel(address)
+            channel = self._datanode_channels[address]
+        return data_node_pb2_grpc.DataNodeServiceStub(channel)
+
+    def _in_parallel(self, transfer, items: list[tuple]) -> list:
+        """Corre ``transfer(*item, stop)`` con hasta ``parallel_transfers`` hilos y
+        devuelve los resultados en el orden de ``items``.
+
+        Al primer error se activa ``stop``: los bloques que no empezaron no arrancan y
+        los que están en vuelo se cortan en el siguiente chunk. Se espera a que todos
+        terminen antes de relanzar ese primer error, así quien llama (AbortUpload)
+        limpia con todos los hilos quietos."""
+        stop = threading.Event()
+        if self._parallel_transfers == 1 or len(items) <= 1:
+            return [transfer(*item, stop) for item in items]
+        first_error: list[BaseException] = []
+        guard = threading.Lock()
+
+        def run(item):
+            if stop.is_set():
+                raise _TransferCancelled()
+            try:
+                return transfer(*item, stop)
+            except BaseException as exc:
+                with guard:
+                    if not stop.is_set():
+                        first_error.append(exc)
+                        stop.set()
+                raise
+
+        pool = ThreadPoolExecutor(
+            max_workers=min(self._parallel_transfers, len(items)), thread_name_prefix="dfsha-bloque"
+        )
+        try:
+            futures = [pool.submit(run, item) for item in items]
+            wait(futures)
+        except BaseException:
+            # Ctrl+C mientras se espera: cortar lo que está en vuelo y no esperar.
+            stop.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        if first_error:
+            raise first_error[0]
+        return [future.result() for future in futures]
 
     def _block_transfer_timeout(self, size_bytes: int) -> float:
         return self._transfer_base_timeout_s + (
@@ -393,23 +494,31 @@ class DistributedDFShaClient:
                 path=remote_path, size_bytes=size_bytes, op_id=_new_op_id()
             ),
         )
+        blocks = list(begin_response.blocks)
 
-        total_written = 0
-        try:
+        def send_block(block, start: int, stop: threading.Event) -> int:
+            # cada hilo con su propio descriptor: comparten el archivo, no la posición
             with local_path.open("rb") as fh:
-                for block in begin_response.blocks:
-                    checksum, bytes_written = self._write_block(block, fh)
-                    total_written += bytes_written
-                    self._call(
-                        "ConfirmBlock",
-                        control_node_pb2.ConfirmBlockRequest(
-                            path=remote_path,
-                            block_id=block.block_id,
-                            checksum=checksum,
-                            size_bytes=bytes_written,
-                            op_id=_new_op_id(),
-                        ),
-                    )
+                fh.seek(start)
+                checksum, bytes_written = self._write_block(block, fh, stop)
+            if stop.is_set():
+                raise _TransferCancelled()
+            # El orden de los ConfirmBlock no importa: el archivo se publica recién
+            # con CompleteUpload, cuando están todos.
+            self._call(
+                "ConfirmBlock",
+                control_node_pb2.ConfirmBlockRequest(
+                    path=remote_path,
+                    block_id=block.block_id,
+                    checksum=checksum,
+                    size_bytes=bytes_written,
+                    op_id=_new_op_id(),
+                ),
+            )
+            return bytes_written
+
+        try:
+            total_written = sum(self._in_parallel(send_block, list(zip(blocks, _block_starts(blocks)))))
         except (grpc.RpcError, OSError, DFShaError) as exc:
             try:
                 self._call(
@@ -431,20 +540,37 @@ class DistributedDFShaClient:
     def download(self, remote_path: str, local_path: Path) -> int:
         held = self.lock(remote_path, "r")
         tmp_path = local_path.parent / f"{local_path.name}.part-{uuid.uuid4().hex}"
-        bytes_written = 0
         try:
             # La adquisición ocurre antes de ListBlocks y se conserva durante toda
             # la lectura: un writer/GC no puede publicar/borrar la versión leída.
             list_response = self._call("ListBlocks", control_node_pb2.ListBlocksRequest(path=remote_path))
+            blocks = list(list_response.blocks)
             with tmp_path.open("wb") as fh:
-                for block in list_response.blocks:
-                    bytes_written += self._read_block_with_failover(block, fh)
+                # tamaño final de una vez: cada hilo escribe su bloque en su lugar
+                fh.truncate(sum(block.size_bytes for block in blocks))
+
+            def fetch_block(block, start: int, stop: threading.Event) -> int:
+                with tmp_path.open("r+b") as fh:
+                    fh.seek(start)
+                    bytes_written = self._read_block_with_failover(
+                        block, _RegionWriter(fh, block.size_bytes), stop=stop
+                    )
+                if bytes_written != block.size_bytes:
+                    raise BlockCorruptedError(
+                        f"el bloque {block.block_id} llegó con {bytes_written} bytes, se esperaban {block.size_bytes}"
+                    )
+                return bytes_written
+
+            bytes_written = sum(self._in_parallel(fetch_block, list(zip(blocks, _block_starts(blocks)))))
             os.replace(tmp_path, local_path)
         except grpc.RpcError as exc:
             tmp_path.unlink(missing_ok=True)
             raise _translate(exc) from exc
         except BaseException:
-            tmp_path.unlink(missing_ok=True)
+            # tras un Ctrl+C algún hilo puede tener el archivo abierto todavía (Windows
+            # no deja borrarlo): queda el .part, que no pisa nada
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
             raise
         finally:
             try:
@@ -611,10 +737,13 @@ class DistributedDFShaClient:
         content[write_start - block_start : write_end - block_start] = data[write_start - offset : write_end - offset]
         return bytes(content)
 
-    def _read_block_with_failover(self, block, fh, offset: int = 0, length: int = 0) -> int:
+    def _read_block_with_failover(
+        self, block, fh, offset: int = 0, length: int = 0, stop: threading.Event | None = None
+    ) -> int:
         """Prueba otra réplica solo cuando una falla recuperable invalida este bloque.
 
-        offset y length piden un rango dentro del bloque; length 0 = hasta el final."""
+        offset y length piden un rango dentro del bloque; length 0 = hasta el final.
+        ``stop`` corta la lectura entre chunks (otro bloque de la descarga falló)."""
         start = fh.tell()
         last_error: grpc.RpcError | None = None
         for address in block.datanode_addresses:
@@ -622,10 +751,14 @@ class DistributedDFShaClient:
                 request = data_node_pb2.ReadBlockRequest(
                     block_id=block.block_id, offset=offset, length=length
                 )
-                for chunk in self._datanode_stub(address).ReadBlock(
+                call = self._datanode_stub(address).ReadBlock(
                     request,
                     timeout=self._block_transfer_timeout(length or getattr(block, "size_bytes", 0)),
-                ):
+                )
+                for chunk in call:
+                    if stop is not None and stop.is_set():
+                        call.cancel()
+                        raise _TransferCancelled()
                     fh.write(chunk.data)
                 return fh.tell() - start
             except grpc.RpcError as exc:
@@ -640,7 +773,7 @@ class DistributedDFShaClient:
             raise PathNotFoundError(f"el bloque {block.block_id} no tiene réplicas registradas")
         raise last_error
 
-    def _write_block(self, block, fh) -> tuple[str, int]:
+    def _write_block(self, block, fh, stop: threading.Event | None = None) -> tuple[str, int]:
         remaining = block.size_bytes
 
         def chunks():
@@ -652,6 +785,10 @@ class DistributedDFShaClient:
                 )
             )
             while remaining > 0:
+                if stop is not None and stop.is_set():
+                    # cortar el stream: gRPC cancela la llamada y el DataNode descarta
+                    # el bloque a medias
+                    raise _TransferCancelled()
                 data = fh.read(min(CHUNK_SIZE_BYTES, remaining))
                 if not data:
                     break

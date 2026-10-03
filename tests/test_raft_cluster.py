@@ -31,8 +31,9 @@ def _port_is_free(port):
 
 
 class RaftCluster:
-    def __init__(self, tmp_path, datanode_addresses, persistent, raft_conf=None):
+    def __init__(self, tmp_path, datanode_addresses, persistent, raft_conf=None, raft_passwords=None):
         self._tmp_path = tmp_path
+        self.raft_passwords = list(raft_passwords or [None, None, None])
         self._raft_conf = raft_conf or CLUSTER_RAFT_CONF
         self._datanode_addresses = datanode_addresses
         self._persistent = persistent
@@ -55,6 +56,7 @@ class RaftCluster:
             block_size_bytes=5,
             raft_conf_overrides=self._raft_conf,
             commit_timeout_s=1.0,
+            raft_password=self.raft_passwords[i],
         )
         assert port == self.grpc_ports[i]
         self.nodes[i] = (server, raft)
@@ -105,8 +107,8 @@ def datanodes(tmp_path):
 def make_cluster(tmp_path, datanodes):
     clusters, clients = [], []
 
-    def _make(persistent=False, raft_conf=None):
-        cluster = RaftCluster(tmp_path, datanodes, persistent, raft_conf)
+    def _make(persistent=False, raft_conf=None, raft_passwords=None):
+        cluster = RaftCluster(tmp_path, datanodes, persistent, raft_conf, raft_passwords)
         for i in range(3):
             cluster.start(i)
         cluster.wait_leader()
@@ -236,13 +238,16 @@ def test_retry_with_same_op_id_after_commit_is_not_an_error(make_cluster):
 
 
 def test_mutation_without_op_id_is_rejected(make_cluster):
-    cluster, _ = make_cluster()
+    cluster, client = make_cluster()
     channel, stub = cluster.stub(cluster.wait_leader())
     try:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.MakeDir(control_node_pb2.MakeDirRequest(path="/docs"))
         assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
-        assert list(stub.ListDir(control_node_pb2.ListDirRequest(path="/")).entries) == []
+        # Por el cliente, que sigue al líder: con la CPU cargada (suite completa), los
+        # timeouts cortos de Raft de los tests pueden provocar una reelección entre las
+        # dos llamadas, y el nodo de `stub` respondería UNAVAILABLE a la lectura.
+        assert client.list_dir("/") == []
     finally:
         channel.close()
 
@@ -305,3 +310,59 @@ def test_locks_survive_leader_failover_and_followers_reject_lock_rpcs(make_clust
     held.release()
     writer = client.lock("/lock.bin", "w")
     writer.release()
+
+
+# ── C1: canal Raft cifrado y autenticado con la password de pysyncobj ─────────────────
+RAFT_PASSWORD = "a" * 64
+
+
+def _tree_of(cluster, i):
+    return cluster.nodes[i][0]._dfsha_control_servicer._replicated.tree
+
+
+def test_cluster_with_raft_password_replicates_and_fails_over(make_cluster):
+    cluster, client = make_cluster(raft_passwords=[RAFT_PASSWORD] * 3)
+    client.make_dir("/docs")
+    cluster.kill(cluster.wait_leader())
+    cluster.wait_leader()
+    client.make_dir("/docs/b")
+    assert [e.name for e in client.list_dir("/docs")] == ["b"]
+
+
+def test_node_with_another_password_never_joins(make_cluster):
+    """Un nodo que no conoce la password no recibe el log ni puede votar: el canal Raft
+    está autenticado, no solo cifrado."""
+    cluster, client = make_cluster(raft_passwords=[RAFT_PASSWORD, RAFT_PASSWORD, "b" * 64])
+    leader = cluster.wait_leader()
+    assert leader != 2
+    follower = 1 - leader  # el otro nodo con la password correcta
+    client.make_dir("/docs")
+    assert wait_for(lambda: [e.name for e in _tree_of(cluster, follower).list_dir("/")] == ["docs"])
+    assert not wait_for(lambda: _tree_of(cluster, 2).list_dir("/"), timeout=1.0)
+
+
+def test_enabling_the_password_keeps_the_existing_journal(make_cluster):
+    """La password cambia el canal, no el formato del journal: un clúster que ya tenía
+    datos sin password los conserva al activarla."""
+    cluster, client = make_cluster(persistent=True)
+    client.make_dir("/antes")
+    for i in range(3):
+        cluster.kill(i)
+    cluster.raft_passwords = [RAFT_PASSWORD] * 3
+    for i in range(3):
+        cluster.start(i)
+    cluster.wait_leader()
+    assert [e.name for e in client.list_dir("/")] == ["antes"]
+
+
+def test_raft_password_file_must_be_long_enough(tmp_path):
+    from dfsha.control_node.main import load_raft_password
+
+    short = tmp_path / "corta"
+    short.write_text("corta\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_raft_password(short)
+    ok = tmp_path / "raft.password"
+    ok.write_text(RAFT_PASSWORD + "\n", encoding="utf-8")
+    assert load_raft_password(ok) == RAFT_PASSWORD
+    assert build_raft_conf(None, raft_password=RAFT_PASSWORD).password == RAFT_PASSWORD

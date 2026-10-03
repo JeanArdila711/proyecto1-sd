@@ -270,7 +270,8 @@ def test_a_lock_that_expires_before_the_commit_rejects_the_write(tmp_path, start
         server, port = serve_data_node(tmp_path / f"dn{i}", "localhost", 0, TEST_ENCRYPTION_KEY)
         servers.append(server)
         addresses.append(f"localhost:{port}")
-    control = start_control_node(addresses, block_size_bytes=5, replication_factor=2, lock_lease_s=0.3)
+    # 1 s: el lock tiene que seguir vigente en BeginWrite aunque la CPU esté cargada
+    control = start_control_node(addresses, block_size_bytes=5, replication_factor=2, lock_lease_s=1.0)
     client = DistributedDFShaClient([control])
     channel, stub = _stub(control)
     try:
@@ -281,7 +282,7 @@ def test_a_lock_that_expires_before_the_commit_rejects_the_write(tmp_path, start
         begun = stub.BeginWrite(
             control_node_pb2.BeginWriteRequest(path="/a.bin", offset=0, length=1, lock_id=lock_id, op_id=uuid.uuid4().hex)
         )
-        time.sleep(0.5)  # sin renovador: el lease de 0.3 s vence antes del commit
+        time.sleep(1.3)  # sin renovador: el lease de 1 s vence antes del commit
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.CommitWrite(
                 control_node_pb2.CommitWriteRequest(

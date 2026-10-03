@@ -280,10 +280,10 @@ def test_download_holds_shared_lock_until_slow_read_finishes(client, tmp_path, m
     entered = __import__("threading").Event()
     allow_finish = __import__("threading").Event()
 
-    def slow_read(block, fh):
+    def slow_read(block, fh, *args, **kwargs):
         entered.set()
         assert allow_finish.wait(3)
-        return real_read(block, fh)
+        return real_read(block, fh, *args, **kwargs)
 
     monkeypatch.setattr(client, "_read_block_with_failover", slow_read)
     import threading
@@ -387,10 +387,10 @@ def test_expired_lock_during_slow_download_does_not_mask_success_or_leak_resourc
         finally:
             renewal_finished.set()
 
-    def slow_read(block, fh):
+    def slow_read(block, fh, *args, **kwargs):
         assert renewal_started.wait(1)
         assert renewal_finished.wait(1)
-        return original_read(block, fh)
+        return original_read(block, fh, *args, **kwargs)
 
     monkeypatch.setattr(client, "_renew_held_lock", renew_after_lease_expires)
     monkeypatch.setattr(client, "_read_block_with_failover", slow_read)

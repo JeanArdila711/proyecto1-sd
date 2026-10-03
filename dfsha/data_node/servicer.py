@@ -4,6 +4,7 @@ import contextlib
 import queue
 from concurrent import futures
 from pathlib import Path
+from typing import Callable
 
 import grpc
 
@@ -47,9 +48,16 @@ def _abort_on_domain_error(context: grpc.ServicerContext, exc: Exception) -> Non
 
 
 class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
-    def __init__(self, root: Path, encryption_key: bytes) -> None:
+    def __init__(
+        self,
+        root: Path,
+        encryption_key: bytes,
+        channel_factory: Callable[[str], grpc.Channel] = grpc.insecure_channel,
+    ) -> None:
         self._root = root
         self._encryption_key = encryption_key
+        # canales hacia otros DataNodes (pipeline y ReplicateBlock): TLS si el nodo lo usa
+        self._channel_factory = channel_factory
         # Executor propio para el forwarding del pipeline: si compartiera el del
         # servidor gRPC, N escrituras concurrentes podrían quedarse sin worker
         # para reenviar y el pipeline se auto-bloquearía.
@@ -58,7 +66,7 @@ class DataNodeServicer(data_node_pb2_grpc.DataNodeServiceServicer):
 
     def _peer_stub(self, address: str):
         if address not in self._channels:
-            self._channels[address] = grpc.insecure_channel(address)
+            self._channels[address] = self._channel_factory(address)
         return data_node_pb2_grpc.DataNodeServiceStub(self._channels[address])
 
     def close(self) -> None:

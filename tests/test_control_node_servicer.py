@@ -129,7 +129,7 @@ def test_abandoned_upload_frees_the_name_after_lease_and_deletes_its_blocks(tmp_
 
     dn_server, dn_port = serve_data_node(tmp_path / "dn", "localhost", 0, TEST_ENCRYPTION_KEY)
     datanode = f"localhost:{dn_port}"
-    channel = grpc.insecure_channel(start_control_node([datanode], block_size_bytes=5, upload_lease_s=0.5, min_write_replicas=1))
+    channel = grpc.insecure_channel(start_control_node([datanode], block_size_bytes=5, upload_lease_s=1.5, min_write_replicas=1))
     stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
     dn_stub = data_node_pb2_grpc.DataNodeServiceStub(grpc.insecure_channel(datanode))
     try:
@@ -148,7 +148,7 @@ def test_abandoned_upload_frees_the_name_after_lease_and_deletes_its_blocks(tmp_
             stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/tesis.bin", size_bytes=3, op_id=_op()))
         assert busy.value.code() == grpc.StatusCode.ALREADY_EXISTS
 
-        time.sleep(0.8)
+        time.sleep(1.8)  # el lease de 1.5 s deja margen con la CPU cargada
 
         # vencido: otro cliente puede usar el nombre, y el bloque abandonado se borra
         retry = stub.BeginUpload(control_node_pb2.BeginUploadRequest(path="/tesis.bin", size_bytes=3, op_id=_op()))

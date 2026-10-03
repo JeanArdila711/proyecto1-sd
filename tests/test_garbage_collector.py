@@ -424,7 +424,10 @@ def test_blocks_left_by_a_crash_after_a_cow_commit_are_collected(system, tmp_pat
 
 def test_an_abandoned_cow_reservation_is_kept_while_live_and_collected_after_it_expires(system, tmp_path):
     datanodes, start = system
-    server, client = start(gc_grace_s=0, upload_lease_s=1.0)
+    # Lease de 2 s: con la CPU cargada (suite completa), escribir el bloque y correr el
+    # primer ciclo puede tardar más de 1 s, y la reserva vencería antes de la primera
+    # comprobación.
+    server, client = start(gc_grace_s=0, upload_lease_s=2.0)
     _upload(client, tmp_path, "/a.bin", bytes(range(12)))
     held = client.lock("/a.bin", "w")
     begun = client._call(
@@ -435,12 +438,17 @@ def test_an_abandoned_cow_reservation_is_kept_while_live_and_collected_after_it_
     new_block = SimpleNamespace(block_id=slot.new_block_id, datanode_addresses=list(slot.new_addresses), size_bytes=5)
     client._write_block(new_block, __import__("io").BytesIO(b"abcde"))  # el cliente muere antes del commit
 
-    server._dfsha_garbage_collector.run_cycle()
+    gc = server._dfsha_garbage_collector
+    gc.run_cycle()
     assert slot.new_block_id in _stored(datanodes)  # reserva vigente: en uso
 
-    time.sleep(1.2)
-    server._dfsha_garbage_collector.run_cycle()
-    assert slot.new_block_id not in _stored(datanodes)
+    # Vencida la reserva, algún ciclo la recoge. No necesariamente el primero: un ciclo
+    # se salta un DataNode que el monitor no ve vivo o una barrera que no confirma.
+    def collected():
+        gc.run_cycle()
+        return slot.new_block_id not in _stored(datanodes)
+
+    assert wait_for(collected, timeout=10)
     held.release()
     assert client.read("/a.bin") == bytes(range(12))
 
