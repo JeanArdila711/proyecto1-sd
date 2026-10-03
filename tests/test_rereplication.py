@@ -347,7 +347,9 @@ def test_three_node_degraded_upload_is_rereplicated_when_node_returns(tmp_path, 
     client = DistributedDFShaClient([control_address], rpc_timeout_s=1, failover_budget_s=3)
     try:
         data_servers[2].stop(grace=None)
-        time.sleep(1.2)
+        from conftest import wait_until_datanode_excluded
+
+        assert wait_until_datanode_excluded(client._control_channels[control_address], addresses[2])
         assert len(
             client._call(
                 "BeginUpload", control_node_pb2.BeginUploadRequest(path="/probe", size_bytes=1, op_id="probe")

@@ -236,9 +236,10 @@ def test_upload_uses_exactly_two_live_replicas_when_one_datanode_is_dead(make_cl
     )
     dead = datanodes[2]
     dead["server"].stop(grace=None)
-    import time
+    from conftest import wait_until_datanode_excluded
 
-    time.sleep(0.12)  # dos o más sondeos: supera el umbral de muerte
+    channel = client._control_channels[client._control_addresses[0]]
+    assert wait_until_datanode_excluded(channel, dead["address"])
     _upload(client, tmp_path, "/degradado.txt", b"hola")
 
     [block] = _blocks_of(client, "/degradado.txt")
@@ -258,9 +259,10 @@ def test_upload_below_minimum_live_replicas_is_unavailable_and_invisible(make_cl
     )
     datanodes[1]["server"].stop(grace=None)
     datanodes[2]["server"].stop(grace=None)
-    import time
+    from conftest import wait_until_datanode_excluded
 
-    time.sleep(0.12)
+    channel = client._control_channels[client._control_addresses[0]]
+    assert wait_until_datanode_excluded(channel, datanodes[1]["address"])
     stub = __import__("dfsha.generated.control_node_pb2_grpc", fromlist=["ControlNodeServiceStub"]).ControlNodeServiceStub(
         client._control_channels[client._control_addresses[0]]
     )

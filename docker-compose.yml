@@ -146,6 +146,8 @@ services:
     profiles: [herramientas]
     entrypoint: [python, scripts/inspect_cluster.py]
     command: [estado]
+    environment:
+      DFSHA_GC_GRACE_S: ${DFSHA_GC_GRACE_S:-1200}   # para que `huerfanos` use la misma gracia que el recolector
 
   tests:
     <<: *dfsha

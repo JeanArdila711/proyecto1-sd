@@ -16,7 +16,8 @@ def _write_key(path: Path, force: bool) -> None:
     except FileExistsError as exc:
         raise RuntimeError(f"ya existe {path}; use --force para reemplazarla") from exc
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):  # no existe en Windows con Python < 3.13
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(os.urandom(32))
     except BaseException:

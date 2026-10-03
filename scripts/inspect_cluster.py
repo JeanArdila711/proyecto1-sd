@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -261,7 +262,12 @@ def main() -> None:
     p.add_argument("--sin-verificar", action="store_true", help="no descargar los bloques para verificar el SHA")
     sub.add_parser("mapa", help="matriz archivos × DataNodes: cómo quedó particionado todo")
     p = sub.add_parser("huerfanos", help="bloques en disco que ningún archivo visible usa (vía RPC)")
-    p.add_argument("--gracia-s", type=float, default=1200.0, help="la misma --gc-grace-s del ControlNode")
+    p.add_argument(
+        "--gracia-s",
+        type=float,
+        default=float(os.environ.get("DFSHA_GC_GRACE_S", "1200")),
+        help="la misma --gc-grace-s del ControlNode (por defecto, DFSHA_GC_GRACE_S del .env)",
+    )
     p.add_argument("--limite", type=int, default=5)
     args = parser.parse_args()
 

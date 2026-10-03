@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
@@ -174,7 +175,8 @@ def test_block_deleted_before_metadata_read_is_not_found(tmp_path, monkeypatch):
 
     def vanished(self, *args, **kwargs):
         if self.name == BLOCK_ID:
-            raise FileNotFoundError(self)
+            # con errno, como el error real: Path.exists() de Python 3.12 solo ignora ENOENT
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(self))
         return real_stat(self, *args, **kwargs)
 
     monkeypatch.setattr(type(tmp_path), "stat", vanished)
