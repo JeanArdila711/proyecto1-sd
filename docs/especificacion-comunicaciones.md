@@ -1,6 +1,6 @@
 # DFSha — Especificación de comunicaciones
 
-> **Estado:** describe lo implementado en `main` al cierre de la parte de alta disponibilidad, consistencia y cifrado en reposo del Hito 3. TLS, usuarios y permisos (C1–C3) todavía no están: §10 dice qué cambia cuando entren.
+> **Estado:** describe lo implementado en `main` en el Hito 3: alta disponibilidad, consistencia, cifrado en reposo, TLS, canal Raft cifrado y transferencia paralela. Usuarios y permisos (C2, C3) todavía no están: §10 dice qué cambia cuando entren.
 > **Qué cubre:** los cinco enlaces que pide el enunciado — Cliente↔ControlNode, Cliente↔DataNode, ControlNode↔ControlNode, ControlNode↔DataNode, DataNode↔DataNode —, con protocolo, contrato, semántica de fallos y justificación de cada decisión.
 > **Contratos fuente:** `proto/control_node.proto`, `proto/data_node.proto`. Consenso: `pysyncobj==0.3.17`.
 
@@ -33,11 +33,11 @@ flowchart LR
 
 | # | Enlace | Protocolo | Estilo | Qué transporta | Puerto (Docker) |
 |:---:|---|---|---|---|---|
-| ① | Cliente → ControlNode | gRPC sobre HTTP/2 | Unario, petición-respuesta | Metadatos, locks, reservas de escritura (KB) | `50051` |
-| ② | Cliente → DataNode | gRPC sobre HTTP/2 | *Client streaming* (escritura), *server streaming* (lectura) | Bloques o rangos de bloque (MB) | `50061` |
-| ③ | ControlNode ↔ ControlNode | TCP propio de `pysyncobj` | Mensajes asíncronos de Raft | Log replicado, votos, heartbeats | `6000` |
-| ④ | ControlNode → DataNode | gRPC sobre HTTP/2 | Unario y *server streaming* | Liveness, órdenes de copia y de borrado, inventario | `50061` |
-| ⑤ | DataNode → DataNode | gRPC sobre HTTP/2 | *Client streaming* encadenado | Réplicas de bloques (pipeline y re-replicación) | `50061` |
+| ① | Cliente → ControlNode | gRPC sobre HTTP/2 + TLS | Unario, petición-respuesta | Metadatos, locks, reservas de escritura (KB) | `50051` |
+| ② | Cliente → DataNode | gRPC sobre HTTP/2 + TLS | *Client streaming* (escritura), *server streaming* (lectura) | Bloques o rangos de bloque (MB) | `50061` |
+| ③ | ControlNode ↔ ControlNode | TCP propio de `pysyncobj`, cifrado con password | Mensajes asíncronos de Raft | Log replicado, votos, heartbeats | `6000` |
+| ④ | ControlNode → DataNode | gRPC sobre HTTP/2 + TLS | Unario y *server streaming* | Liveness, órdenes de copia y de borrado, inventario | `50061` |
+| ⑤ | DataNode → DataNode | gRPC sobre HTTP/2 + TLS | *Client streaming* encadenado | Réplicas de bloques (pipeline y re-replicación) | `50061` |
 
 **Principio que gobierna el diseño: separación de planos.** Por el ControlNode solo pasan metadatos; los bytes de los archivos van siempre directo entre cliente y DataNodes, o entre DataNodes. La carga del ControlNode crece con el número de operaciones, no con el volumen de datos. Esto se mantiene también en la re-replicación: el ControlNode ordena la copia, pero los bytes van de un DataNode a otro.
 
@@ -175,6 +175,8 @@ Cada DataNode guarda un único contenedor `DFSE1` por `block_id`:
 | `UNAVAILABLE` | DataNode caído, o falló una réplica aguas abajo del pipeline |
 | `INVALID_ARGUMENT` | Stream sin header, rango negativo |
 
+**Paralelismo.** `send` y `receive` transfieren hasta `--parallel-transfers` bloques a la vez (4 por defecto), cada uno en su propio stream. En la subida, el orden de los `ConfirmBlock` no importa: el archivo se publica con `CompleteUpload` cuando están todos. En la bajada, cada bloque se escribe en su posición del archivo `.part`. Al primer error, los bloques pendientes no arrancan, los que están en vuelo se cancelan y se aborta la operación con todos los hilos quietos. `read`, `cat` y `write` siguen en serie.
+
 **Deadlines.** Cada `ReadBlock` y `WriteBlock` lleva un deadline calculado por los bytes que mueve: 5 s más el tamaño a 1 MiB/s. Un DataNode colgado no bloquea la operación y una transferencia lenta pero activa no se corta.
 
 ---
@@ -199,7 +201,7 @@ Cada DataNode guarda un único contenedor `DFSE1` por `block_id`:
 
 **Direccionamiento.** `pysyncobj` escucha en la misma dirección que anuncia a los demás, así que la dirección de Raft debe ser resoluble por los otros nodos: nombres de servicio en Docker (`cn0:6000`), IPs o DNS privados en despliegue real. `localhost` solo sirve con los 3 nodos en la misma máquina.
 
-> ⚠️ **Seguridad:** este enlace no está cifrado ni autenticado, y deserializar `pickle` de la red permite ejecutar código arbitrario. **El puerto de Raft nunca debe exponerse fuera de la red privada.** En Docker Compose no se publica. `pysyncobj` cifra y autentica el canal con `password` (Fernet, clave derivada por PBKDF2): el spike S2 lo probó con tres nodos, reinicio y un nodo con otra password, pero todavía no está activado en el ControlNode.
+> **Seguridad:** el canal va cifrado y autenticado con la `password` de `pysyncobj` (Fernet, clave derivada por PBKDF2), leída de `--raft-password-file` (`secrets/raft.password`). Un nodo sin la password no puede leer el log ni votar. Igual **el puerto de Raft nunca debe exponerse fuera de la red privada**: los mensajes son `pickle`, y deserializar `pickle` de quien tenga la password permite ejecutar código. En Docker Compose no se publica.
 
 ---
 
@@ -373,17 +375,21 @@ sequenceDiagram
 
 ## 10. Seguridad
 
-| Enlace | Hoy | Plan (C1–C3) |
+| Enlace | Hoy | Falta (C2, C3) |
 |---|---|---|
-| ① Cliente ↔ ControlNode | `insecure_channel`, sin autenticación | TLS + token de usuario en la metadata de cada RPC + permisos por ruta |
-| ② Cliente ↔ DataNode | `insecure_channel` | TLS + capability por bloque, firmada por el ControlNode |
-| ③ ControlNode ↔ ControlNode | Sin cifrar, `pickle` en el cable; puerto solo en la red privada | `password` de `pysyncobj` (Fernet), ya probado en el spike S2 |
-| ④ ControlNode → DataNode | `insecure_channel` | TLS + capability administrativa firmada (HMAC) |
-| ⑤ DataNode ↔ DataNode | `insecure_channel` | TLS + la capability del bloque, reenviada por el pipeline |
+| ① Cliente ↔ ControlNode | TLS | Token de usuario en la metadata de cada RPC + permisos por ruta |
+| ② Cliente ↔ DataNode | TLS | Capability por bloque, firmada por el ControlNode |
+| ③ ControlNode ↔ ControlNode | Cifrado y autenticado con la password de `pysyncobj`; puerto solo en la red privada | — |
+| ④ ControlNode → DataNode | TLS | Capability administrativa firmada (HMAC) |
+| ⑤ DataNode ↔ DataNode | TLS | La capability del bloque, reenviada por el pipeline |
 
-**Por qué capabilities y no mTLS en ④ y ⑤:** el DataNode atiende a clientes y a nodos internos en el mismo puerto. El spike S1 mostró que grpcio no permite mTLS *opcional*: con `require_client_auth=False` el servidor ni pide el certificado, y con `True` rechaza a los clientes. Una capability firmada con una llave que comparten ControlNodes y DataNodes autoriza cada operación sin depender del transporte.
+**TLS de servidor.** Una CA privada (`secrets/ca.crt`) firma un único certificado (`secrets/node.crt`) que presentan todos los ControlNodes y DataNodes, con el nombre fijo `dfsha-node`. Clientes y nodos verifican ese nombre (`grpc.ssl_target_name_override`), no la dirección a la que se conectan: el mismo certificado sirve en Docker, en `localhost` y con IPs de AWS. TLS cifra el canal y prueba que del otro lado hay un nodo de DFSha; no identifica al cliente.
 
-**Ya implementado:** validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco, y cifrado autenticado en reposo `DFSE1` (§4). Cada DataNode recibe una llave distinta en `secrets/dnX.key`, fuera del repo y montada en solo lectura. No hay rotación ni migración: al pasar al formato cifrado hay que crear volúmenes nuevos con `docker compose down -v`.
+**Por qué no mTLS:** el DataNode atiende a clientes y a nodos internos en el mismo puerto. El spike S1 mostró que grpcio no permite mTLS *opcional*: con `require_client_auth=False` el servidor ni pide el certificado, y con `True` rechaza a los clientes. Por eso las operaciones internas se autorizarán con capabilities firmadas (C3), sin depender del transporte. Hasta entonces, quien tenga `ca.crt` y llegue a la red puede llamar `ReplicateBlock`, `DeleteBlock` o `ListStoredBlocks`.
+
+**Secretos.** El servicio `init` de Compose los crea la primera vez dentro de la imagen y los deja con dueño `uid 1000` (el usuario de los contenedores): llaves de cifrado en reposo por DataNode, password de Raft, CA y certificado de los nodos. `secrets/` no se versiona y se monta en solo lectura.
+
+**Ya implementado además:** validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco, y cifrado autenticado en reposo `DFSE1` (§4).
 
 ---
 

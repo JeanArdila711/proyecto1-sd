@@ -2,7 +2,7 @@
 
 Todo se hace desde la raíz del repo. Los comandos son los mismos en Windows (PowerShell), macOS y Linux.
 
-**Requisitos:** Docker Desktop (o Docker Engine con Compose v2), git y Python 3 (solo para generar las llaves).
+**Requisitos:** Docker Desktop (o Docker Engine con Compose v2) y git. Nada más: todo corre dentro de los contenedores.
 
 ---
 
@@ -10,12 +10,13 @@ Todo se hace desde la raíz del repo. Los comandos son los mismos en Windows (Po
 
 ```bash
 git pull
-python scripts/generate_secrets.py      # solo la primera vez: crea secrets/dn1.key, dn2.key, dn3.key
 docker compose up -d --build
 docker compose ps
 ```
 
 Tienen que aparecer 6 servicios `healthy`: `dn1`, `dn2`, `dn3` (DataNodes) y `cn0`, `cn1`, `cn2` (ControlNodes).
+
+La primera vez, el servicio `init` crea `secrets/`: las llaves de cifrado de los DataNodes, la password de Raft y los certificados TLS. Las siguientes veces conserva lo que hay. `secrets/` nunca se sube al repo.
 
 Si vienes de una versión anterior a la del cifrado en reposo, borra los datos viejos antes del `up`: `docker compose down -v`. Los DataNodes no leen bloques sin cifrar.
 
@@ -98,6 +99,7 @@ DFSHA_UPLOAD_LEASE_S=15
 | `DFSHA_GC_INTERVAL_S` | 60 | Cada cuánto el líder busca bloques huérfanos |
 | `DFSHA_GC_GRACE_S` | 1200 | Edad mínima de un bloque sin uso para borrarlo |
 | `DFSHA_UPLOAD_LEASE_S` | 600 | Segundos para liberar una subida o escritura abandonada |
+| `DFSHA_PARALLEL_TRANSFERS` | 4 | Bloques que `send` y `receive` transfieren a la vez |
 
 ---
 
@@ -155,6 +157,15 @@ docker compose exec dn1 sh -c 'f=$(ls /data | head -1); head -c 5 /data/$f; echo
 ```
 
 Imprime `DFSE1`: lo que hay en disco es un contenedor cifrado con AES-256-GCM, no el archivo.
+
+### Cifrado en tránsito
+
+```bash
+docker compose exec dn1 sh -c "openssl s_client -connect dn2:50061 -CAfile /secrets/ca.crt -verify_hostname dfsha-node -brief </dev/null"
+docker compose logs cn0 | grep escuchando
+```
+
+El primero muestra `TLSv1.3`, el certificado `CN=dfsha-node` y `Verification: OK` contra la CA de DFSha: todo el tráfico gRPC (shell, ControlNodes y DataNodes) va cifrado. El `unexpected eof` del final es normal: `openssl` no habla gRPC. El segundo muestra `TLS=True, Raft cifrado=True`: el canal Raft entre ControlNodes va cifrado y autenticado con la password de `secrets/raft.password`.
 
 ### Cae el líder
 

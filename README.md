@@ -14,6 +14,7 @@ Un cliente sube y baja archivos que quedan partidos en bloques y replicados entr
      │           ┌────────▼──────── plano de datos (bloques) ───────────┐
      └──gRPC────►  dn1 ──pipeline──► dn2 ──pipeline──► dn3            │
                  │  bloques cifrados con AES-256-GCM en cada disco      │
+                 │  todo el tráfico gRPC con TLS; Raft cifrado          │
                  └──────────────────────────────────────────────────────┘
 ```
 
@@ -31,8 +32,9 @@ Todo el transporte es gRPC. Diagrama completo con cada flujo: [docs/arquitectura
 | 2 | Arquitectura distribuida: ControlNode + DataNodes, bloques, replicación en pipeline, 3 ControlNodes con Raft, Docker, especificación de comunicaciones | ✅ |
 | 3 | Alta disponibilidad: detección de DataNodes caídos, escritura con 2 de 3 réplicas, re-replicación, recolector de huérfanos | ✅ |
 | 3 | Consistencia y RF3: locks lectores/escritor con lease, `read` por rangos, `write` copy-on-write | ✅ |
-| 3 | Seguridad: cifrado en reposo (AES-256-GCM) | ✅ |
-| 3 | Seguridad: TLS en las comunicaciones, autenticación de usuarios, permisos por archivo | ⬜ |
+| 3 | Seguridad: cifrado en reposo (AES-256-GCM), TLS en gRPC, canal Raft cifrado | ✅ |
+| 3 | Rendimiento: `send` y `receive` transfieren varios bloques a la vez | ✅ |
+| 3 | Seguridad: autenticación de usuarios, permisos por archivo | ⬜ |
 | Final | Despliegue en AWS, informe, video | ⬜ |
 
 Detalle de cada parte, decisiones y límites conocidos: [ESTADO_PROYECTO.md](ESTADO_PROYECTO.md).
@@ -40,8 +42,7 @@ Detalle de cada parte, decisiones y límites conocidos: [ESTADO_PROYECTO.md](EST
 ## Uso rápido
 
 ```bash
-python scripts/generate_secrets.py        # solo la primera vez: llaves de cifrado de los DataNodes
-docker compose up -d --build              # 3 DataNodes + 3 ControlNodes
+docker compose up -d --build              # 3 DataNodes + 3 ControlNodes (la 1.ª vez crea secrets/)
 docker compose run --rm shell             # shell distribuida
 docker compose run --rm inspect mapa      # dónde quedó cada bloque
 docker compose down                       # apagar

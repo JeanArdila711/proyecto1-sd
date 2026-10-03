@@ -1,6 +1,6 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-10-03, tras cerrar la alta disponibilidad, la consistencia (RF3) y el cifrado en reposo del Hito 3.
+Última actualización: 2026-10-03, tras agregar TLS, Raft cifrado y transferencia paralela de bloques (Hito 3, C1).
 
 Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
@@ -26,23 +26,21 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | B3 — `write` copy-on-write | ✅ |
 | 3 | C4 — cifrado en reposo AES-256-GCM | ✅ |
 | 3 | S1, S2 — spikes de mTLS y de Raft cifrado | ✅ (mTLS opcional: resultado negativo) |
-| 3 | C1 — TLS en los enlaces gRPC | ⬜ |
+| 3 | C1 — TLS en los enlaces gRPC y canal Raft cifrado | ✅ |
+| 3 | Transferencia paralela de bloques en `send`/`receive` | ✅ |
 | 3 | C2 — usuarios y autenticación | ⬜ |
 | 3 | C3 — permisos por archivo y autorización de operaciones internas | ⬜ |
 | Final | Despliegue en AWS, informe, video de 10–15 min | ⬜ |
 
-412 tests en verde, en Windows y dentro de la imagen de Docker.
+430 tests en verde, en Windows y dentro de la imagen de Docker.
 
 ## Qué falta
 
-1. **Seguridad en tránsito y de acceso (Hito 3).**
-   - **C1 — TLS** en los enlaces gRPC ①②④⑤. Según el spike S1, grpcio no permite mTLS *opcional* en un mismo puerto: con `require_client_auth=False` el servidor ni pide el certificado del cliente. Plan: TLS de servidor para todos, y las operaciones internas del DataNode (`ReplicateBlock`, `DeleteBlock`, `ListStoredBlocks`) autorizadas con capabilities firmadas con HMAC que emite el ControlNode.
-   - **Raft cifrado:** el spike S2 probó `SyncObjConf(password=...)` (Fernet) con tres nodos, reinicio y aislamiento de un nodo con otra password, pero **no está activado** en el ControlNode. Falta la flag, el secreto en `secrets/` y su entrada en Compose.
+1. **Usuarios y permisos (Hito 3).**
    - **C2 — usuarios:** registro/login, token en la metadata de cada RPC y `_users` en el estado replicado. El test de upgrade de S2 ya deja el gancho (`extension_checks`) para verificarlo sobre un journal viejo.
-   - **C3 — permisos:** dueño y ACL por ruta, y capability por bloque para que un cliente solo lea o escriba los bloques que el ControlNode le autorizó.
-2. **Rendimiento:** las transferencias son en serie, bloque por bloque. El enunciado pide *"lectura y escritura paralela de bloques"*; falta un pool de hilos en el cliente para `send`/`receive`.
-3. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada), informe técnico y video.
-4. **Documentación:** la especificación de comunicaciones está consolidada con lo del Hito 3; hay que actualizarla otra vez cuando entren C1–C3.
+   - **C3 — permisos:** dueño y ACL por ruta, y capability por bloque firmada por el ControlNode, para que un cliente solo lea o escriba los bloques que se le autorizaron y que las operaciones internas del DataNode (`ReplicateBlock`, `DeleteBlock`, `ListStoredBlocks`) solo las pida un ControlNode. Hoy TLS cifra todo, pero cualquiera que tenga `ca.crt` y llegue a la red puede llamarlas.
+2. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada), informe técnico y video.
+3. **Documentación:** actualizar la especificación de comunicaciones cuando entren C2 y C3.
 
 ## Qué está implementado
 
@@ -213,8 +211,20 @@ El ControlNode deja de ser punto único de falla: **clúster de 3 ControlNodes c
 
 - Cada bloque físico es un único contenedor `DFSE1` en `dfsha/data_node/block_store.py`: header con versión y prefijo aleatorio, chunks de 1 MiB AES-256-GCM y metadata final autenticada con tamaño lógico, conteo y SHA-256 del plaintext. Ya no existe sidecar `.sha256`.
 - `ReadBlock` autentica primero la metadata y luego únicamente los chunks requeridos para el rango; corrupción, truncación, llave incorrecta o un archivo legacy/plaintext producen `BlockCorruptedError`/`DATA_LOSS` sin migración silenciosa. `list_blocks` informa tamaño lógico y edad calculada por el reloj del DataNode.
-- `--encryption-key-file` es obligatorio: lee una llave cruda de exactamente 32 bytes. `scripts/generate_secrets.py` crea solo `secrets/dn1.key`, `dn2.key` y `dn3.key`, con modo 0600 y sin sobrescribir salvo `--force`; Compose los monta como solo lectura. No hay rotación de llaves.
+- `--encryption-key-file` es obligatorio: lee una llave cruda de exactamente 32 bytes. `scripts/generate_secrets.py` crea `secrets/dn1.key`, `dn2.key` y `dn3.key`, con modo 0600 y sin sobrescribir salvo `--force`; Compose los monta como solo lectura. *(Desde C1 lo corre el servicio `init` de Compose y crea también la password de Raft y los certificados TLS.)* No hay rotación de llaves.
 - El formato cambió sin migración: usar `docker compose down -v` antes de crear volúmenes cifrados nuevos; un volumen previo falla explícitamente al leerse.
+
+### Hito 3 — C1: TLS, Raft cifrado y transferencia paralela
+
+- **TLS en los enlaces gRPC ① ② ④ ⑤** (`dfsha/common/tls.py`). Una CA privada firma un único certificado de servidor con el nombre fijo `dfsha-node`, que presentan todos los ControlNodes y DataNodes. Los clientes lo verifican contra ese nombre con `grpc.ssl_target_name_override`, no contra la dirección: el mismo certificado sirve con `dn1:50061`, `localhost` o una IP privada de AWS, sin regenerarlo por despliegue. Es TLS de servidor: por el spike S1, no hay mTLS. Todos los canales salen de una sola fábrica (`channel_factory`), inyectada en el cliente, el servicer del ControlNode, el monitor, el re-replicador, el recolector, el pipeline del DataNode y el inspector.
+- **Canal Raft cifrado y autenticado** (enlace ③) con `SyncObjConf(password=...)`, leída de `--raft-password-file`. Un nodo con otra password no recibe el log ni vota. El journal no cambia de formato: un clúster con datos previos los conserva al activarla (hay un test).
+- **Flags opcionales** (`--tls-ca-file`, `--tls-cert-file`, `--tls-key-file`, `--raft-password-file`): sin ellos los nodos avisan y van en claro, para tests y desarrollo. Compose los pasa siempre.
+- **Secretos sin Python en el host:** el servicio `init` de Compose corre `scripts/generate_secrets.py` dentro de la imagen antes que los nodos, crea solo lo que falta (llaves de los DataNodes, `raft.password`, `ca.crt`/`ca.key`, `node.crt`/`node.key`) y deja todo con dueño `uid 1000`, el usuario de la imagen. También prepara `intercambio/`.
+- **Healthchecks** con `scripts/healthcheck.py`, que se conecta con TLS (un canal en claro nunca quedaría listo).
+- **Transferencia paralela:** `send` y `receive` mueven hasta `--parallel-transfers` bloques a la vez (4 por defecto, `DFSHA_PARALLEL_TRANSFERS`). Cada hilo usa su propio descriptor del archivo local. En la descarga, el archivo `.part` se crea con su tamaño final y cada hilo escribe su bloque en su región (`_RegionWriter`). Al primer error, los bloques que no empezaron no arrancan, los que están en vuelo se cortan en el siguiente chunk y, con todos los hilos quietos, se hace `AbortUpload`. `read`/`cat` por rangos y `write` siguen en serie.
+- **Medido en Docker** (una sola máquina, 4 CPU para los 7 contenedores, 200 MB en bloques de 8 MB): subida de 41 a 74 MB/s y bajada de 163 a 261 MB/s con 4 hilos; con 8 casi no mejora. En máquinas separadas la ganancia debería ser mayor, porque cada DataNode tiene su propio disco y su propia red.
+- **Verificado en Docker:** `openssl s_client` ve TLS 1.3 con el certificado de la CA; un cliente sin TLS es rechazado; subida degradada y re-replicación, caída del líder con Raft cifrado, borrado y recolector funcionan por los canales TLS.
+- **Verificado con permisos de Linux** (volúmenes ext4 en vez de carpetas de Windows, partiendo de carpetas creadas por root): sin el `--owner` de `init`, el DataNode no puede leer su llave (`Permission denied`); con él, el clúster arranca y la shell escribe en `intercambio/`.
 
 ### Revisión de cierre del Hito 3 (2026-10-03)
 
@@ -241,7 +251,9 @@ Cosas que costó descubrir y que no vale la pena redescubrir:
 - **Con 3 DataNodes y uno caído las subidas siguen funcionando**, con 2 réplicas por bloque (Hito 3 A1, `--min-write-replicas 2`). Pero hay una ventana: el monitor tarda `--datanode-dead-after-s` en dar el nodo por muerto, y una subida que empiece en ese intervalo falla porque el pipeline todavía lo incluye. Con dos DataNodes caídos, `BeginUpload` responde `UNAVAILABLE` sin reservar nada. El re-replicador repara solo lo que lleva caído más de `--rereplication-delay-s`, para no copiar bloques enteros por un reinicio corto.
 - **El forwarding del pipeline usa un `ThreadPoolExecutor` propio**, separado del del servidor gRPC. No es por prolijidad: si compartiera el pool del servidor, N escrituras simultáneas podrían ocupar todos los workers esperando a que el siguiente DataNode responda, sin dejar ninguno libre para reenviar, y el pipeline se auto-bloquea.
 - **La cola del forwarding está acotada a 4 chunks (4 MiB)** a propósito — es lo que impide que un bloque de 128 MB se acumule entero en RAM si el siguiente nodo va más lento. El productor se bloquea hasta que haya lugar. `tests/test_replication.py::test_pipeline_with_block_larger_than_forwarding_queue` cubre que no se cuelgue.
-- **El failover de lectura tiene que descartar bytes parciales.** Una réplica puede caerse a mitad de bloque con bytes ya escritos al archivo local; `_read_block_with_failover` hace `seek` + `truncate` a la posición donde arrancó el bloque antes de probar la siguiente réplica. Sin eso el archivo final sale corrupto **en silencio**. Ojo: ni un nodo caído ni un bloque podrido ejercitan ese camino (los dos fallan antes del primer byte), por eso hay un test específico que corta el stream a mitad.
+- **En Linux los permisos de `secrets/` e `intercambio/` sí importan.** Los contenedores corren como `uid 1000`. Docker Desktop en Windows y macOS no aplica permisos en las carpetas montadas, así que ahí todo funciona igual; en Linux (AWS), un archivo `0600` de otro dueño no se puede leer, y una carpeta que Docker crea sola queda de root. Por eso los secretos los crea el servicio `init` como root y los pasa a `uid 1000`. Si se cambia el `uid` del `Dockerfile`, hay que cambiar el `--owner` de `init`.
+- **El certificado de los nodos no lleva sus direcciones**, lleva el nombre `dfsha-node`. Un cliente nuevo (otro lenguaje, `grpcurl`) tiene que verificar contra ese nombre, no contra el host al que se conecta.
+- **El failover de lectura tiene que descartar bytes parciales.** Una réplica puede caerse a mitad de bloque con bytes ya escritos al archivo local; `_read_block_with_failover` hace `seek` + `truncate` a la posición donde arrancó el bloque antes de probar la siguiente réplica. Sin eso el archivo final sale corrupto **en silencio**. Con la descarga paralela, el archivo es compartido entre hilos y `truncate` borraría los bloques de los demás: cada hilo escribe a través de un `_RegionWriter` cuyo `truncate` no recorta, y la réplica siguiente sobrescribe la región. Ojo: ni un nodo caído ni un bloque podrido ejercitan ese camino (los dos fallan antes del primer byte), por eso hay un test específico que corta el stream a mitad.
 - **Un comando replicado nunca puede lanzar una excepción.** `pysyncobj` no las atrapa al aplicar el log: la entrada queda sin aplicar y el nodo la reintenta para siempre. Como los 3 nodos aplican el mismo log, **un solo `mkdir` de una ruta existente bloquearía el clúster entero** (verificado en el spike: después de un comando que lanza, la siguiente escritura normal también se queda en timeout). Por eso `ReplicatedTree.apply` convierte todo en `("error", clase, mensaje)`, incluso excepciones inesperadas, y el servicer la vuelve a lanzar del lado del líder.
 - **`apply` no puede tener efectos secundarios** (red, disco, DataNodes). Corre en los 3 nodos, y otra vez cada vez que un nodo reinicia y reproduce el journal. Los `DeleteBlock` de `Remove` están en el servicer del líder, después del commit, a propósito.
 - **Nunca guardarse una referencia a `ReplicatedTree.tree`.** Restaurar un snapshot reemplaza el objeto árbol entero; una referencia vieja seguiría leyendo un árbol muerto. Siempre acceder vía `self._replicated.tree`.
@@ -268,7 +280,7 @@ dfsha/
   client/
     dfsha_client.py         Hito 1 — cliente monolítico
     shell.py                shell interactiva (Hito 1 y distribuida, con los comandos de RF3)
-    distributed_client.py   cliente distribuido: failover entre ControlNodes y réplicas, locks, rangos, write COW
+    distributed_client.py   cliente distribuido: failover entre ControlNodes y réplicas, transferencia paralela, locks, rangos, write COW
     distributed_shell_main.py
   control_node/
     tree.py                 árbol, bloques, subidas, locks y escrituras COW (lógica pura, determinista)
@@ -282,18 +294,21 @@ dfsha/
     block_store.py          bloques cifrados DFSE1 (AES-256-GCM)
     servicer.py             RPC del DataNode y pipeline de replicación
     main.py
-  common/            excepciones de dominio, compartidas por todo
+  common/
+    exceptions.py           excepciones de dominio, compartidas por todo
+    tls.py                  TLS: carga de certificados, canales, puertos, generación de la CA
   generated/         código gRPC generado (no se versiona, se regenera con scripts/generate_proto.py)
 proto/               definiciones .proto (dfsha, control_node, data_node)
 scripts/
   generate_proto.py         stubs gRPC
-  generate_secrets.py       llaves de los DataNodes en secrets/
+  generate_secrets.py       secretos en secrets/ (lo corre el servicio init de Compose)
+  healthcheck.py            healthcheck de Docker con TLS
   inspect_cluster.py        servicio inspect: estado, líder, árbol, mapa, bloques, huérfanos
   spikes/                   spikes S1 (mTLS) y S2 (Raft cifrado, fixture legacy)
-tests/               412 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
+tests/               430 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
 docs/                GUIA.md, especificacion-comunicaciones.md, arquitectura-y-flujos.excalidraw
 Dockerfile           imagen única para todos los roles
-docker-compose.yml   clúster completo + shell + inspect + tests
+docker-compose.yml   init (secretos) + clúster completo + shell + inspect + tests
 .env                 parámetros del clúster
 ```
 
