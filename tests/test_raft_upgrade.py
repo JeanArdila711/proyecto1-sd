@@ -385,3 +385,36 @@ def assert_legacy_writes(replica) -> None:
         assert version == 0
         assert block_size > 0
         assert all(size == block_size for size in sizes[:-1])
+
+
+def test_legacy_fixture_starts_without_users_and_accepts_new_ones(tmp_path):
+    """C2 sobre estado real de 9985c6d: el snapshot no trae `_users`, el replay no cambia
+    nada del árbol, y un usuario creado después converge en las tres réplicas."""
+    manifest = _fixture_manifest()
+    nodes, leader_index = _start_restored_cluster(tmp_path)
+    try:
+        replicas = [replicated for _, replicated in nodes]
+        expected_op_ids = {operation["op_id"] for operation in manifest["legacy_operations"]}
+        assert wait_for(lambda: all(expected_op_ids <= set(replica.applied_ops) for replica in replicas))
+        assert_legacy_upgrade(replicas, manifest, extension_checks=(assert_legacy_users,))
+        assert [_canonical_legacy_projection(replica) for replica in replicas] == [
+            EXPECTED_LEGACY_PROJECTION
+        ] * len(replicas)
+
+        leader = replicas[leader_index()]
+        assert leader.apply(
+            "c2-upgrade-user", "create_user", ("alice", b"h" * 32, b"s" * 16, ("alice",), False),
+            sync=True, timeout=1.0,
+        ) == ("ok", None)
+
+        assert wait_for(lambda: all(replica.tree.get_user("alice") is not None for replica in replicas))
+        records = [replica.tree.get_user("alice") for replica in replicas]
+        assert records[0].password_hash == b"h" * 32
+        assert records == [records[0]] * len(replicas)
+    finally:
+        _stop_cluster(nodes)
+
+
+def assert_legacy_users(replica) -> None:
+    assert replica.tree._users == {}
+    assert not replica.tree.has_users()

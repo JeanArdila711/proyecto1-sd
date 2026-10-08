@@ -16,7 +16,9 @@ docker compose ps
 
 Tienen que aparecer 6 servicios `healthy`: `dn1`, `dn2`, `dn3` (DataNodes) y `cn0`, `cn1`, `cn2` (ControlNodes).
 
-La primera vez, el servicio `init` crea `secrets/`: las llaves de cifrado de los DataNodes, la password de Raft y los certificados TLS. Las siguientes veces conserva lo que hay. `secrets/` nunca se sube al repo.
+La primera vez, el servicio `init` crea `secrets/`: las llaves de cifrado de los DataNodes, la password de Raft, los certificados TLS, el secreto con el que se firman los tokens de sesión y la contraseña inicial del usuario `admin` (`secrets/admin.password`). Las siguientes veces conserva lo que hay. `secrets/` nunca se sube al repo.
+
+Cada contenedor monta solo los secretos que usa, desde su carpeta en `secrets/mounts/`: un DataNode no ve la password de Raft, la shell solo ve el certificado de la CA, y la llave de la CA no se monta en ningún contenedor.
 
 Si vienes de una versión anterior a la del cifrado en reposo, borra los datos viejos antes del `up`: `docker compose down -v`. Los DataNodes no leen bloques sin cifrar.
 
@@ -31,6 +33,8 @@ docker compose run --rm shell
 La carpeta `intercambio/` del repo es `/intercambio` dentro de la shell.
 
 ```
+dfsha:/$ login admin
+Contraseña de admin:                 (la de secrets/admin.password; no se muestra al escribirla)
 dfsha:/$ mkdir /docs
 dfsha:/$ send /intercambio/tesis.pdf /docs/tesis.pdf
 dfsha:/$ receive /docs/tesis.pdf /intercambio/copia.pdf
@@ -49,8 +53,15 @@ dfsha:/$ exit
 | `write <ruta> <offset> <local>` | Escribir el contenido de un archivo local desde un offset |
 | `open <ruta> r\|w` · `close <ruta>` | Abrir y cerrar un archivo (toma y suelta el lock) |
 | `lock <ruta> r\|w` · `unlock <ruta>` · `locks` | Tomar, soltar y listar locks |
+| `login <usuario>` · `whoami` | Iniciar sesión y ver con qué usuario estás |
+| `adduser <usuario> [--admin] [grupo ...]` | Crear un usuario (solo un admin) |
+| `passwd [usuario]` | Cambiar tu contraseña, o la de otro usuario si eres admin |
 
 `r` = lock compartido (varios lectores), `w` = lock exclusivo (un escritor). Las rutas con espacios van entre comillas: `send "/intercambio/mi tesis.pdf" /docs/tesis.pdf`.
+
+**Sesiones.** Sin `login`, todos los comandos que hablan con el clúster son rechazados. Las contraseñas se piden aparte y nunca van en la línea del comando. Una sesión dura 30 minutos (`DFSHA_TOKEN_TTL_S`); cuando vence, la shell pide la contraseña otra vez y hay que repetir el comando. Si la sesión vence con un archivo abierto (`open`), su lock se pierde.
+
+Conviene cambiar la contraseña del admin con `passwd` después del primer login: la inicial queda escrita en `secrets/admin.password`.
 
 ---
 
@@ -66,6 +77,8 @@ docker compose run --rm inspect huerfanos                  # bloques sin uso y c
 ```
 
 En Git Bash de Windows, antepón `MSYS_NO_PATHCONV=1` a los comandos que llevan una ruta como `/docs/...`.
+
+El inspector entra como `admin` con la contraseña de `secrets/admin.password`. Si ya la cambiaste, te la pide por teclado.
 
 ---
 
@@ -100,12 +113,13 @@ DFSHA_UPLOAD_LEASE_S=15
 | `DFSHA_GC_GRACE_S` | 1200 | Edad mínima de un bloque sin uso para borrarlo |
 | `DFSHA_UPLOAD_LEASE_S` | 600 | Segundos para liberar una subida o escritura abandonada |
 | `DFSHA_PARALLEL_TRANSFERS` | 4 | Bloques que `send` y `receive` transfieren a la vez |
+| `DFSHA_TOKEN_TTL_S` | 1800 | Segundos que dura una sesión |
 
 ---
 
 ## 5. Probar cada funcionalidad
 
-Con los valores de demo del paso 4. Deja una shell abierta en otra terminal para los pasos que dicen *en la shell*.
+Con los valores de demo del paso 4. Deja una shell abierta en otra terminal, con la sesión iniciada (`login admin`), para los pasos que dicen *en la shell*.
 
 ### Particionamiento y replicación
 
@@ -166,6 +180,23 @@ docker compose logs cn0 | grep escuchando
 ```
 
 El primero muestra `TLSv1.3`, el certificado `CN=dfsha-node` y `Verification: OK` contra la CA de DFSha: todo el tráfico gRPC (shell, ControlNodes y DataNodes) va cifrado. El `unexpected eof` del final es normal: `openssl` no habla gRPC. El segundo muestra `TLS=True, Raft cifrado=True`: el canal Raft entre ControlNodes va cifrado y autenticado con la password de `secrets/raft.password`.
+
+### Usuarios y sesiones
+
+```bash
+# en una shell nueva: ls                  # rechazado: falta el token de sesión
+# en la shell: login admin                # la contraseña es la de secrets/admin.password
+# en la shell: whoami
+# en la shell: adduser jean               # pide la contraseña nueva dos veces
+# en otra shell: login jean
+# en otra shell: mkdir /de-jean           # funciona: jean tiene sesión
+# en otra shell: adduser otro             # denegado: solo un admin crea usuarios
+# en otra shell: passwd                   # pide la contraseña actual y la nueva dos veces
+```
+
+Para ver vencer una sesión, pon `DFSHA_TOKEN_TTL_S=20` en `.env`, corre `docker compose up -d`, inicia sesión y espera 20 segundos: el siguiente comando pide la contraseña otra vez. Si matas al líder con una sesión abierta (los pasos de *Cae el líder*, más abajo), la shell sigue funcionando sin volver a pedir login: los tres ControlNodes firman y verifican con el mismo secreto.
+
+Límites: no hay revocación (un token sirve hasta que vence, aunque cambies la contraseña), y los DataNodes todavía no piden nada a quien les habla; eso llega con los permisos por archivo.
 
 ### Cae el líder
 

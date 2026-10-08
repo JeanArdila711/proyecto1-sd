@@ -38,13 +38,15 @@ def wait_for(predicate, timeout: float = 5.0) -> bool:
     return False
 
 
-def wait_until_datanode_excluded(channel, address: str, timeout: float = 15.0) -> bool:
+def wait_until_datanode_excluded(channel, address: str, timeout: float = 15.0, metadata=None) -> bool:
     """Espera a que el monitor del ControlNode deje de ofrecer `address` en los pipelines.
 
     No basta con dormir un tiempo fijo: en Windows un connect a un puerto cerrado
     tarda ~2 s en fallar (en Linux es inmediato), así que el Ping que declara muerto
     al nodo llega mucho después que en Linux. Se sondea con BeginUpload y se aborta
     la sonda; UNAVAILABLE (menos réplicas vivas que el mínimo) también cuenta.
+
+    `metadata` lleva el token contra un ControlNode con autenticación (C2).
     """
     import uuid
 
@@ -58,11 +60,14 @@ def wait_until_datanode_excluded(channel, address: str, timeout: float = 15.0) -
         op_id = uuid.uuid4().hex
         try:
             response = stub.BeginUpload(
-                control_node_pb2.BeginUploadRequest(path="/__sonda__", size_bytes=1, op_id=op_id)
+                control_node_pb2.BeginUploadRequest(path="/__sonda__", size_bytes=1, op_id=op_id),
+                metadata=metadata,
             )
         except grpc.RpcError as exc:
             return exc.code() == grpc.StatusCode.UNAVAILABLE
-        stub.AbortUpload(control_node_pb2.AbortUploadRequest(path="/__sonda__", op_id=f"{op_id}-abort"))
+        stub.AbortUpload(
+            control_node_pb2.AbortUploadRequest(path="/__sonda__", op_id=f"{op_id}-abort"), metadata=metadata
+        )
         return address not in response.blocks[0].datanode_addresses
 
     return wait_for(excluded, timeout)

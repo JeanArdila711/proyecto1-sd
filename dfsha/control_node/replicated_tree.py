@@ -28,6 +28,8 @@ MUTATIONS = frozenset(
         "begin_write",
         "commit_write",
         "abort_write",
+        "create_user",
+        "change_password",
     }
 )
 

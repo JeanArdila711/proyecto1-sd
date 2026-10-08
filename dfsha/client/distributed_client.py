@@ -260,6 +260,12 @@ class DistributedDFShaClient:
         self._locks_guard = threading.RLock()
         self._lock_renewal_stop = threading.Event()
         self._lock_renewal_thread: threading.Thread | None = None
+        # Sesión (C2). El token vive solo en memoria y la contraseña no se guarda: cuando
+        # el token vence, hay que volver a llamar login(). None = sin sesión.
+        self._auth_metadata: tuple[tuple[str, str], ...] | None = None
+        self.username: str | None = None
+        self.groups: tuple[str, ...] = ()
+        self.is_admin = False
 
     def close(self) -> None:
         # Libera primero los leases para no dejar esperar al siguiente cliente; si la
@@ -290,7 +296,12 @@ class DistributedDFShaClient:
                 channel = self._control_channels[self._control_addresses[index]]
                 stub = control_node_pb2_grpc.ControlNodeServiceStub(channel)
                 try:
-                    response = getattr(stub, rpc_name)(request, timeout=self._rpc_timeout_s)
+                    # El token va en cada llamada, también desde los hilos de transferencia
+                    # y el que renueva locks. Un UNAUTHENTICATED no es reintentable: los tres
+                    # nodos comparten el secreto, probar otro no cambia nada.
+                    response = getattr(stub, rpc_name)(
+                        request, timeout=self._rpc_timeout_s, metadata=self._auth_metadata
+                    )
                 except grpc.RpcError as exc:
                     if exc.code() not in _RETRYABLE_CODES:
                         raise _translate(exc) from exc
@@ -360,6 +371,37 @@ class DistributedDFShaClient:
             size_bytes / self._minimum_transfer_throughput_bytes_per_s
         )
 
+    def login(self, username: str, password: str) -> None:
+        """Inicia sesión. Si falla, la sesión anterior queda como estaba."""
+        response = self._call("Login", control_node_pb2.LoginRequest(username=username, password=password))
+        self._auth_metadata = (("authorization", f"Bearer {response.token}"),)
+        self.username = response.username
+        self.groups = tuple(response.groups)
+        self.is_admin = response.is_admin
+
+    def create_user(
+        self, username: str, password: str, groups: list[str] | None = None, is_admin: bool = False
+    ) -> None:
+        self._call(
+            "CreateUser",
+            control_node_pb2.CreateUserRequest(
+                username=username, password=password, groups=groups or [], is_admin=is_admin, op_id=_new_op_id()
+            ),
+        )
+
+    def change_password(self, new_password: str, current_password: str = "", username: str = "") -> None:
+        """Sin `username` cambia la propia, y hace falta la actual. Un admin cambia la de
+        otro usuario sin ella."""
+        self._call(
+            "ChangePassword",
+            control_node_pb2.ChangePasswordRequest(
+                username=username,
+                current_password=current_password,
+                new_password=new_password,
+                op_id=_new_op_id(),
+            ),
+        )
+
     def list_dir(self, path: str):
         response = self._call("ListDir", control_node_pb2.ListDirRequest(path=path))
         return list(response.entries)
@@ -422,9 +464,11 @@ class DistributedDFShaClient:
                     path=held.path, lock_id=held.lock_id, op_id=_new_op_id()
                 ),
             )
-        except ConflictError:
-            # El servidor ya depuró el holder vencido: no mantener un handle que
-            # aparenta proteger la lectura ni dejar vivo el hilo renovador.
+        except (ConflictError, AuthError):
+            # ConflictError: el servidor ya depuró el holder vencido. AuthError: el token
+            # venció con el handle abierto y el lease ya no se puede renovar, así que va a
+            # caducar en el servidor. En los dos casos: no mantener un handle que aparenta
+            # proteger la lectura ni dejar vivo el hilo renovador.
             self._forget_held_lock(held, lost=True)
             raise
 

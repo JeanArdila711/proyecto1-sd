@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 
@@ -105,6 +106,27 @@ class DirNode:
     children: dict = field(default_factory=dict)  # str -> DirNode | FileNode
 
 
+# Nombres de usuario y de grupo, estilo Unix. Se validan acá y no solo en el servicer:
+# el bootstrap del admin entra por _commit_raw sin pasar por un RPC.
+_USERNAME_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+
+
+@dataclass(frozen=True)
+class UserRecord:
+    """Un usuario (C2). Inmutable: cambiar la contraseña reemplaza el registro entero.
+    Hash y sal los calcula el líder y viajan en el comando replicado; quedan en el
+    journal de Raft, que no va cifrado en disco."""
+
+    password_hash: bytes
+    salt: bytes
+    groups: tuple[str, ...] = ()
+    is_admin: bool = False
+
+
+def _valid_name(value) -> bool:
+    return isinstance(value, str) and _USERNAME_RE.fullmatch(value) is not None
+
+
 @dataclass
 class DirEntryData:
     name: str
@@ -122,6 +144,8 @@ class ControlTree:
         self._locks: dict[str, LockState] = {}
         # Reservas de escritura COW por write_id (B3); también se recuperan en __setstate__.
         self._writes: dict[str, WriteReservation] = {}
+        # Usuarios por nombre (C2); también se recuperan en __setstate__.
+        self._users: dict[str, UserRecord] = {}
 
     # Raft guarda snapshots del árbol con pickle, y un Lock no se puede serializar:
     # se descarta al guardar y se crea uno nuevo al restaurar.
@@ -138,6 +162,8 @@ class ControlTree:
             self._locks = {}
         if not hasattr(self, "_writes"):
             self._writes = {}
+        if not hasattr(self, "_users"):
+            self._users = {}
 
     def _parts(self, virtual_path: str) -> list[str]:
         if ".." in virtual_path.split("/"):
@@ -327,6 +353,45 @@ class ControlTree:
             del state.holders[lock_id]
             if not state.holders:
                 del self._locks[canonical_path]
+
+    # --- Usuarios (C2) ---------------------------------------------------------------------
+    #
+    # Las dos mutaciones devuelven None a propósito: el resultado de un comando replicado
+    # queda en applied_ops, y ahí no puede terminar un hash.
+
+    def create_user(
+        self,
+        username: str,
+        password_hash: bytes,
+        salt: bytes,
+        groups: tuple[str, ...] = (),
+        is_admin: bool = False,
+    ) -> None:
+        with self._lock:
+            if not _valid_name(username):
+                raise InvalidPathError(f"nombre de usuario inválido: {username!r}")
+            invalid = [group for group in groups if not _valid_name(group)]
+            if invalid:
+                raise InvalidPathError(f"nombre de grupo inválido: {invalid[0]!r}")
+            if username in self._users:
+                # nunca pisa el hash: un segundo create_user no puede robar una cuenta
+                raise PathExistsError(f"el usuario ya existe: {username}")
+            self._users[username] = UserRecord(bytes(password_hash), bytes(salt), tuple(groups), bool(is_admin))
+
+    def change_password(self, username: str, password_hash: bytes, salt: bytes) -> None:
+        with self._lock:
+            user = self._users.get(username) if isinstance(username, str) else None
+            if user is None:
+                raise PathNotFoundError(f"no existe el usuario: {username}")
+            self._users[username] = UserRecord(bytes(password_hash), bytes(salt), user.groups, user.is_admin)
+
+    def get_user(self, username: str) -> UserRecord | None:
+        with self._lock:
+            return self._users.get(username)
+
+    def has_users(self) -> bool:
+        with self._lock:
+            return bool(self._users)
 
     def begin_upload(
         self,

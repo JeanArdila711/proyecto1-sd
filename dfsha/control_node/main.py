@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import math
+import threading
 from concurrent import futures
 from pathlib import Path
 
 import grpc
 from pysyncobj import SyncObj, SyncObjConf
 
+from dfsha.common.auth import DEFAULT_TOKEN_TTL_S, MIN_JWT_SECRET_BYTES, hash_password
 from dfsha.common.tls import TlsConfig, add_port, add_tls_arguments, channel_factory, tls_from_args
 from dfsha.control_node.datanode_monitor import (
     DEFAULT_DATANODE_DEAD_AFTER_S,
@@ -36,6 +40,9 @@ from dfsha.control_node.servicer import (
 from dfsha.generated import control_node_pb2_grpc
 
 DEFAULT_BLOCK_SIZE_BYTES = 128 * 1024 * 1024
+_ADMIN_BOOTSTRAP_RETRY_S = 0.2
+
+logger = logging.getLogger(__name__)
 
 
 def build_raft_conf(
@@ -64,6 +71,22 @@ def load_raft_password(path: Path) -> str:
     password = path.read_text(encoding="utf-8").strip()
     if len(password) < 32:
         raise ValueError(f"la password de Raft en {path} es demasiado corta (mínimo 32 caracteres)")
+    return password
+
+
+def load_jwt_secret(path: Path) -> bytes:
+    secret = path.read_bytes().strip()
+    if len(secret) < MIN_JWT_SECRET_BYTES:
+        raise ValueError(
+            f"el secreto de JWT en {path} es demasiado corto (mínimo {MIN_JWT_SECRET_BYTES} bytes)"
+        )
+    return secret
+
+
+def load_admin_password(path: Path) -> str:
+    password = path.read_text(encoding="utf-8").strip()
+    if not password:
+        raise ValueError(f"la contraseña del admin en {path} está vacía")
     return password
 
 
@@ -109,6 +132,9 @@ def serve(
     gc_grace_s: float = DEFAULT_GC_GRACE_S,
     tls: TlsConfig | None = None,
     raft_password: str | None = None,
+    jwt_secret: bytes | None = None,
+    admin_password: str | None = None,
+    token_ttl_s: float = DEFAULT_TOKEN_TTL_S,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
     DataNodes, que se detiene junto con el servidor.
@@ -116,6 +142,10 @@ def serve(
     data_dir=None deja el log solo en memoria (tests). En producción siempre va un
     directorio: sin él, reiniciar los 3 nodos pierde el árbol entero.
     Quien llama es dueño del SyncObj devuelto y tiene que hacerle destroy().
+
+    jwt_secret=None deja el nodo sin autenticación (tests y desarrollo): ningún RPC
+    exige token. admin_password crea al usuario admin la primera vez que el clúster
+    tiene líder y no tiene usuarios.
     """
     validate_datanode_configuration(datanode_addresses, replication_factor, min_write_replicas)
     replicated = ReplicatedTree()
@@ -147,6 +177,8 @@ def serve(
         monitor,
         lock_lease_s,
         channel_factory=datanode_channel,
+        jwt_secret=jwt_secret,
+        token_ttl_s=token_ttl_s,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
     rereplicator = ReReplicator(
@@ -166,11 +198,33 @@ def serve(
         rereplicator=rereplicator,
         channel_factory=datanode_channel,
     )
+    bootstrap_stop = threading.Event()
+    bootstrap_thread = None
+    if admin_password is not None:
+
+        def bootstrap_admin() -> None:
+            # Cualquiera de los tres nodos puede terminar siendo líder, y al arrancar
+            # ninguno lo sabe todavía: cada uno reintenta hasta que el clúster tenga
+            # usuarios. El hash se calcula una vez, acá, fuera de apply().
+            password_hash, salt = hash_password(admin_password)
+            while not bootstrap_stop.is_set():
+                try:
+                    if servicer.ensure_admin(password_hash, salt):
+                        return
+                except Exception:  # un error raro no puede dejar al clúster sin admin
+                    logger.exception("falló un intento de crear el usuario admin")
+                bootstrap_stop.wait(_ADMIN_BOOTSTRAP_RETRY_S)
+
+        bootstrap_thread = threading.Thread(target=bootstrap_admin, name="dfsha-admin-bootstrap", daemon=False)
+
     original_stop = server.stop
 
     def stop_with_cleanup(grace):
         termination = original_stop(grace)
         termination.wait()
+        bootstrap_stop.set()
+        if bootstrap_thread is not None and bootstrap_thread.is_alive():
+            bootstrap_thread.join()
         garbage_collector.stop()
         rereplicator.stop()
         monitor.stop()
@@ -183,6 +237,8 @@ def serve(
     monitor.start()
     rereplicator.start()
     garbage_collector.start()
+    if bootstrap_thread is not None:
+        bootstrap_thread.start()
     # Atributos de diagnóstico para pruebas de lifecycle; no son parte del RPC.
     server._dfsha_datanode_monitor = monitor
     server._dfsha_rereplicator = rereplicator
@@ -235,9 +291,39 @@ def main() -> None:
         "--raft-password-file",
         help="password compartida por los ControlNodes: cifra y autentica el canal Raft",
     )
+    parser.add_argument(
+        "--jwt-secret-file",
+        help="secreto compartido por los ControlNodes para firmar los tokens de sesión; "
+        "sin él no hay autenticación",
+    )
+    parser.add_argument(
+        "--admin-password-file",
+        help="contraseña inicial del usuario admin; va junto con --jwt-secret-file",
+    )
+    parser.add_argument(
+        "--token-ttl-s",
+        type=float,
+        default=DEFAULT_TOKEN_TTL_S,
+        help="segundos que dura un token de sesión; no hay revocación, así que conviene corto",
+    )
     add_tls_arguments(parser, server=True)
     args = parser.parse_args()
     tls = tls_from_args(args, server=True)
+    jwt_secret = admin_password = None
+    if bool(args.jwt_secret_file) != bool(args.admin_password_file):
+        raise SystemExit("autenticación incompleta: hacen falta --jwt-secret-file y --admin-password-file")
+    if not math.isfinite(args.token_ttl_s) or args.token_ttl_s <= 0:
+        raise SystemExit("--token-ttl-s debe ser un número finito mayor que cero")
+    if args.jwt_secret_file:
+        try:
+            jwt_secret = load_jwt_secret(Path(args.jwt_secret_file))
+            admin_password = load_admin_password(Path(args.admin_password_file))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        if tls is None:
+            print("AVISO: autenticación sin TLS, contraseñas y tokens viajan en claro (solo para desarrollo)")
+    else:
+        print("AVISO: sin --jwt-secret-file, ningún RPC exige token (solo para desarrollo)")
     raft_password = None
     if args.raft_password_file:
         try:
@@ -281,6 +367,9 @@ def main() -> None:
         gc_grace_s=args.gc_grace_s,
         tls=tls,
         raft_password=raft_password,
+        jwt_secret=jwt_secret,
+        admin_password=admin_password,
+        token_ttl_s=args.token_ttl_s,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")
@@ -288,7 +377,8 @@ def main() -> None:
         f"ControlNode {args.node_id} escuchando en {args.host}:{bound_port}, "
         f"Raft={raft_self} peers={raft_peers}, DataNodes={addresses}, "
         f"factor={args.replication_factor}, mínimo escritura={args.min_write_replicas}, "
-        f"TLS={tls is not None}, Raft cifrado={raft_password is not None}"
+        f"TLS={tls is not None}, Raft cifrado={raft_password is not None}, "
+        f"autenticación={jwt_secret is not None}"
     )
     try:
         server.wait_for_termination()

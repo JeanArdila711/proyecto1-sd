@@ -4,6 +4,13 @@
     raft.password             password del canal Raft entre ControlNodes
     ca.crt ca.key             CA privada de DFSha; un cliente solo necesita ca.crt
     node.crt node.key         certificado TLS que presentan los ControlNodes y DataNodes
+    jwt.secret                secreto con el que los ControlNodes firman los tokens de sesión
+    admin.password            contraseña inicial del usuario admin (para el primer login)
+    mounts/<vista>/           copia de lo que usa cada rol; es lo que monta cada contenedor
+
+Cada contenedor monta solo su vista de mounts/, no la carpeta entera: un DataNode no ve
+la password de Raft ni el secreto de los tokens, la shell solo ve ca.crt, y ca.key no
+está en ninguna vista.
 
 Solo crea lo que falta: correrlo otra vez no cambia nada. Docker Compose lo corre solo
 (servicio `init`) antes de levantar los nodos, como root, y deja los archivos con el
@@ -16,6 +23,8 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -24,6 +33,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dfsha.common.tls import generate_ca, issue_node_cert  # noqa: E402
 
 _DATANODE_KEYS = ("dn1.key", "dn2.key", "dn3.key")
+_AUTH_SECRETS = ("jwt.secret", "admin.password")
+_NODE_TLS = ("ca.crt", "node.crt", "node.key")
+
+# Qué archivos de secrets/ ve cada rol. ca.key no está en ninguna vista: solo hace falta
+# para emitir certificados, y eso lo hace este script.
+MOUNT_VIEWS = {
+    "dn1": (*_NODE_TLS, "dn1.key"),
+    "dn2": (*_NODE_TLS, "dn2.key"),
+    "dn3": (*_NODE_TLS, "dn3.key"),
+    "control": (*_NODE_TLS, "raft.password", *_AUTH_SECRETS),
+    "client": ("ca.crt",),
+    "inspect": ("ca.crt", "admin.password"),
+}
 
 
 def _write(path: Path, content: bytes, mode: int, force: bool) -> bool:
@@ -85,6 +107,47 @@ def generate(secrets_dir: Path, force: bool = False, owner: tuple[int, int] | No
         _chown(path, owner)
 
 
+def generate_auth_secrets(
+    secrets_dir: Path, force: bool = False, owner: tuple[int, int] | None = None
+) -> None:
+    """Secretos de autenticación (C2). Aparte de generate(), que crea los de TLS, Raft y
+    cifrado en reposo."""
+    secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write(secrets_dir / "jwt.secret", secrets.token_hex(32).encode(), 0o600, force)
+    # 24 caracteres sin símbolos raros: hay que poder pegarla en la shell
+    _write(secrets_dir / "admin.password", secrets.token_urlsafe(18).encode(), 0o600, force)
+    for name in _AUTH_SECRETS:
+        _chown(secrets_dir / name, owner)
+
+
+def sync_mount_views(secrets_dir: Path, owner: tuple[int, int] | None = None) -> None:
+    """Deja en secrets/mounts/<vista>/ una copia de lo que usa cada rol.
+
+    Se montan carpetas y no archivos sueltos: si Docker tiene que crear el origen de un
+    montaje que todavía no existe, crea una carpeta, y acá eso es justo lo correcto. Por
+    lo mismo, la carpeta de una vista nunca se borra ni se recrea: un contenedor que ya
+    la tiene montada seguiría viendo la vieja."""
+    missing = sorted({name for names in MOUNT_VIEWS.values() for name in names if not (secrets_dir / name).is_file()})
+    if missing:
+        raise FileNotFoundError(f"faltan secretos en {secrets_dir}: {', '.join(missing)}")
+    mounts = secrets_dir / "mounts"
+    for view, names in MOUNT_VIEWS.items():
+        view_dir = mounts / view
+        view_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for name in names:
+            source, target = secrets_dir / name, view_dir / name
+            content = source.read_bytes()
+            if not target.is_file() or target.read_bytes() != content:
+                _write(target, content, stat.S_IMODE(source.stat().st_mode), True)
+        for extra in view_dir.iterdir():
+            if extra.name not in names:
+                # un rol no conserva un secreto que dejó de corresponderle
+                shutil.rmtree(extra) if extra.is_dir() else extra.unlink()
+        for path in [view_dir, *sorted(view_dir.iterdir())]:
+            _chown(path, owner)
+    _chown(mounts, owner)
+
+
 def _prepare_writable_dir(path: Path, owner: tuple[int, int] | None) -> None:
     """Una carpeta montada que el contenedor escribe (intercambio/). Si no existía, Docker
     la crea con dueño root en Linux y la shell no podría guardar lo que baja."""
@@ -111,6 +174,8 @@ def main() -> None:
 
     print(f"Secretos en {args.dir}:")
     generate(Path(args.dir), args.force, args.owner)
+    generate_auth_secrets(Path(args.dir), args.force, args.owner)
+    sync_mount_views(Path(args.dir), args.owner)
     for path in args.writable_dir:
         _prepare_writable_dir(path, args.owner)
     print("  listo")

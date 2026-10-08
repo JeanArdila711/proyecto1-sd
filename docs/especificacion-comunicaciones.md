@@ -1,6 +1,6 @@
 # DFSha — Especificación de comunicaciones
 
-> **Estado:** describe lo implementado en `main` en el Hito 3: alta disponibilidad, consistencia, cifrado en reposo, TLS, canal Raft cifrado y transferencia paralela. Usuarios y permisos (C2, C3) todavía no están: §10 dice qué cambia cuando entren.
+> **Estado:** describe lo implementado en `main` en el Hito 3: alta disponibilidad, consistencia, cifrado en reposo, TLS, canal Raft cifrado, transferencia paralela, y usuarios con login y token de sesión (C2). Los permisos por archivo y la autorización en los DataNodes (C3) todavía no están: §10 dice qué cambia cuando entren.
 > **Qué cubre:** los cinco enlaces que pide el enunciado — Cliente↔ControlNode, Cliente↔DataNode, ControlNode↔ControlNode, ControlNode↔DataNode, DataNode↔DataNode —, con protocolo, contrato, semántica de fallos y justificación de cada decisión.
 > **Contratos fuente:** `proto/control_node.proto`, `proto/data_node.proto`. Consenso: `pysyncobj==0.3.17`.
 
@@ -61,7 +61,7 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 
 ## 3. Enlace ① — Cliente → ControlNode
 
-**Servicio:** `dfsha.control_node.ControlNodeService` (15 RPC, todos unarios).
+**Servicio:** `dfsha.control_node.ControlNodeService` (18 RPC, todos unarios). Con la autenticación activa, todos salvo `Login` exigen el token de sesión en la metadata de la llamada: `authorization: Bearer <jwt>` (§10).
 
 | RPC | Muta | Descripción |
 |---|:---:|---|
@@ -80,6 +80,9 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 | `BeginWrite(path, offset, length, lock_id, op_id)` | ✓ | Reserva bloques nuevos para los bloques que toca una escritura (copy-on-write). |
 | `CommitWrite(path, write_id, base_version, lock_id, slots, op_id)` | ✓ | Publica los bloques nuevos si la versión del archivo no cambió. |
 | `AbortWrite(path, write_id, lock_id, op_id)` | ✓ | Descarta la reserva y borra los bloques nuevos. |
+| `Login(username, password)` | — | Devuelve el token de sesión y su duración. Es el único RPC que no exige token. |
+| `CreateUser(username, password, groups, is_admin, op_id)` | ✓ | Solo un admin. Sin grupos, el usuario queda en un grupo con su nombre. |
+| `ChangePassword(username, current_password, new_password, op_id)` | ✓ | La propia exige la contraseña actual; un admin cambia la de otro sin ella. |
 
 **Descubrimiento del líder.** El cliente recibe la lista de los 3 ControlNodes. Solo el líder atiende; los seguidores responden `UNAVAILABLE`. El cliente empieza por el último líder conocido y rota ante `UNAVAILABLE` o `DEADLINE_EXCEEDED`.
 
@@ -129,6 +132,9 @@ Cuando la escritura toca un bloque solo en parte, el cliente primero lee el bloq
 | `PERMISSION_DENIED` | `InvalidPathError` | Ruta con `..`, borrar la raíz, tamaño ≤ 0, rango de escritura inválido |
 | `INVALID_ARGUMENT` | `NotAFileError`, `NotADirectoryError` | Tipo de nodo equivocado; `op_id` vacío |
 | `ABORTED` | `ConflictError` | Lock en conflicto, archivo con locks al borrarlo, escritura sobre una versión vieja |
+| `UNAUTHENTICATED` | `AuthError` | Falta el token, está vencido o es inválido; usuario o contraseña incorrectos en `Login`. El cliente no reintenta en otro nodo |
+| `PERMISSION_DENIED` | `AccessDeniedError` | El usuario no es admin, o la contraseña actual no coincide en `ChangePassword`. Se distingue de `InvalidPathError` por el trailer `dfsha-error` |
+| `UNIMPLEMENTED` | — | `Login`, `CreateUser` o `ChangePassword` contra un clúster que arrancó sin autenticación |
 | `UNAVAILABLE` | — (el cliente reintenta) | Nodo seguidor, nodo caído, commit o barrera sin confirmar, menos DataNodes vivos que `--min-write-replicas` |
 
 ---
@@ -195,7 +201,7 @@ Cada DataNode guarda un único contenedor `DFSE1` por `block_id`:
 | Conexión considerada muerta | Tras 3,5 s sin datos |
 | Reintento de conexión | Cada 5 s |
 | Persistencia | `raft.journal` (log) y `raft.dump` (snapshot) en `--data-dir`; compactación cada 5.000 entradas, sin `fork()` |
-| Comando replicado | Uno genérico, `apply(op_id, method, args)`, con lista blanca de 14 mutaciones; nunca lanza excepciones ni tiene efectos secundarios |
+| Comando replicado | Uno genérico, `apply(op_id, method, args)`, con lista blanca de 16 mutaciones; nunca lanza excepciones ni tiene efectos secundarios |
 
 **Qué se replica y qué no.** Se replican el árbol, los bloques de cada archivo con sus réplicas, las subidas pendientes, los locks, las reservas de escritura y los `op_id` aplicados. **No** se replica qué DataNodes están vivos: cada ControlNode lo mide por su cuenta (§6), porque es una observación local y cambia cada segundo.
 
@@ -375,9 +381,9 @@ sequenceDiagram
 
 ## 10. Seguridad
 
-| Enlace | Hoy | Falta (C2, C3) |
+| Enlace | Hoy | Falta (C3) |
 |---|---|---|
-| ① Cliente ↔ ControlNode | TLS | Token de usuario en la metadata de cada RPC + permisos por ruta |
+| ① Cliente ↔ ControlNode | TLS + token de sesión (JWT) en la metadata de cada RPC | Permisos por ruta |
 | ② Cliente ↔ DataNode | TLS | Capability por bloque, firmada por el ControlNode |
 | ③ ControlNode ↔ ControlNode | Cifrado y autenticado con la password de `pysyncobj`; puerto solo en la red privada | — |
 | ④ ControlNode → DataNode | TLS | Capability administrativa firmada (HMAC) |
@@ -387,7 +393,9 @@ sequenceDiagram
 
 **Por qué no mTLS:** el DataNode atiende a clientes y a nodos internos en el mismo puerto. El spike S1 mostró que grpcio no permite mTLS *opcional*: con `require_client_auth=False` el servidor ni pide el certificado, y con `True` rechaza a los clientes. Por eso las operaciones internas se autorizarán con capabilities firmadas (C3), sin depender del transporte. Hasta entonces, quien tenga `ca.crt` y llegue a la red puede llamar `ReplicateBlock`, `DeleteBlock` o `ListStoredBlocks`.
 
-**Secretos.** El servicio `init` de Compose los crea la primera vez dentro de la imagen y los deja con dueño `uid 1000` (el usuario de los contenedores): llaves de cifrado en reposo por DataNode, password de Raft, CA y certificado de los nodos. `secrets/` no se versiona y se monta en solo lectura.
+**Usuarios y sesiones.** Los usuarios viven en el estado replicado, con la contraseña como hash `scrypt` con sal. `Login` devuelve un JWT HS256 firmado con `secrets/jwt.secret`, que comparten los tres ControlNodes; lleva usuario, grupos, si es admin y vencimiento (30 minutos por defecto). El ControlNode valida firma y fecha en cada RPC, antes de mirar el liderazgo, sin consultar el árbol. Por eso un token emitido por un líder sigue sirviendo con el siguiente, y por eso mismo no hay revocación: un token robado sirve hasta que vence. El líder crea al usuario `admin` la primera vez, con la contraseña de `secrets/admin.password`. Los DataNodes todavía no verifican nada: eso es C3.
+
+**Secretos.** El servicio `init` de Compose los crea la primera vez dentro de la imagen y los deja con dueño `uid 1000` (el usuario de los contenedores): llaves de cifrado en reposo por DataNode, password de Raft, CA y certificado de los nodos, secreto de los tokens y contraseña inicial del admin. `secrets/` no se versiona. Cada contenedor monta en solo lectura su propia vista (`secrets/mounts/<rol>/`), con los archivos que usa: la llave de la CA no llega a ningún contenedor, y la shell solo recibe `ca.crt`.
 
 **Ya implementado además:** validación de rutas (`..` rechazado), validación del formato de `block_id` antes de construir rutas en disco, y cifrado autenticado en reposo `DFSE1` (§4).
 
@@ -429,6 +437,10 @@ Los errores de forma del protocolo que no nacen de una excepción de dominio (po
 | `BeginWrite` | `PathNotFoundError` → `NOT_FOUND`; `ConflictError` → `ABORTED`; `InvalidPathError` → `PERMISSION_DENIED` (rango inválido) |
 | `CommitWrite` | `ConflictError` → `ABORTED` |
 | `AbortWrite` | `ConflictError` → `ABORTED` |
+| `Login` | `AuthError` → `UNAUTHENTICATED` (usuario o contraseña incorrectos) |
+| `CreateUser` | `AccessDeniedError` → `PERMISSION_DENIED` (no es admin); `PathExistsError` → `ALREADY_EXISTS`; `InvalidPathError` → `PERMISSION_DENIED` (nombre, grupo o contraseña inválidos) |
+| `ChangePassword` | `AccessDeniedError` → `PERMISSION_DENIED` (contraseña actual incorrecta, o la de otro sin ser admin); `PathNotFoundError` → `NOT_FOUND`; `InvalidPathError` → `PERMISSION_DENIED` (contraseña nueva inválida) |
+| Todos salvo `Login` | `AuthError` → `UNAUTHENTICATED` (token ausente, vencido o inválido), antes de cualquier otro chequeo |
 
 ### DataNode — `DataNodeService`
 

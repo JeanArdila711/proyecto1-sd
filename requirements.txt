@@ -1,5 +1,6 @@
 cryptography==50.0.1
 grpcio
 grpcio-tools
+PyJWT==2.15.1
 pysyncobj==0.3.17
 pytest

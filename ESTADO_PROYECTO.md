@@ -28,19 +28,18 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | S1, S2 — spikes de mTLS y de Raft cifrado | ✅ (mTLS opcional: resultado negativo) |
 | 3 | C1 — TLS en los enlaces gRPC y canal Raft cifrado | ✅ |
 | 3 | Transferencia paralela de bloques en `send`/`receive` | ✅ |
-| 3 | C2 — usuarios y autenticación | ⬜ |
+| 3 | C2 — usuarios, login y token de sesión | ✅ |
 | 3 | C3 — permisos por archivo y autorización de operaciones internas | ⬜ |
 | Final | Despliegue en AWS, informe, video de 10–15 min | ⬜ |
 
-430 tests en verde, en Windows y dentro de la imagen de Docker.
+569 tests en verde en macOS y dentro de la imagen de Docker (ahí, 3 se saltan porque leen `docker-compose.yml`, que no se copia a la imagen). Los tests de C2 todavía no se corrieron en Windows.
 
 ## Qué falta
 
-1. **Usuarios y permisos (Hito 3).**
-   - **C2 — usuarios:** registro/login, token en la metadata de cada RPC y `_users` en el estado replicado. El test de upgrade de S2 ya deja el gancho (`extension_checks`) para verificarlo sobre un journal viejo.
+1. **Permisos (Hito 3).**
    - **C3 — permisos:** dueño y ACL por ruta, y capability por bloque firmada por el ControlNode, para que un cliente solo lea o escriba los bloques que se le autorizaron y que las operaciones internas del DataNode (`ReplicateBlock`, `DeleteBlock`, `ListStoredBlocks`) solo las pida un ControlNode. Hoy TLS cifra todo, pero cualquiera que tenga `ca.crt` y llegue a la red puede llamarlas.
 2. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada), informe técnico y video.
-3. **Documentación:** actualizar la especificación de comunicaciones cuando entren C2 y C3.
+3. **Documentación:** actualizar la especificación de comunicaciones cuando entre C3.
 
 ## Qué está implementado
 
@@ -239,9 +238,34 @@ Revisión de las diez entregas de Jean (P0, S2, A1, B1, A2, B2, B3, A3, S1, C4) 
   - `inspect huerfanos` usaba una gracia fija de 1200 s; ahora toma `DFSHA_GC_GRACE_S` del `.env`, igual que los ControlNodes.
 - Guía (`docs/GUIA.md`), README y diagrama (`docs/arquitectura-y-flujos.excalidraw`) reescritos con el estado actual.
 
+### Hito 3 — C2: usuarios, login y tokens de sesión
+
+- **Usuarios en el estado replicado** (`ControlTree._users`, `dfsha/control_node/tree.py`), con dos mutaciones nuevas en la lista blanca: `create_user` y `change_password`. La contraseña se guarda como hash `scrypt` con sal; hash y sal se calculan en el líder y viajan en el comando, porque `apply()` no genera azar. Las dos devuelven `None`, para que un hash nunca quede en `applied_ops`. Un snapshot anterior a C2 se restaura con `_users = {}` (hay un test sobre el fixture de `9985c6d`).
+- **Token de sesión:** JWT HS256 autocontenido (`dfsha/common/auth.py`, con PyJWT). Lleva usuario, grupos, si es admin y vencimiento; el ControlNode le cree con verificar firma y fecha, sin consultar el árbol. Dura 30 minutos (`--token-ttl-s`, `DFSHA_TOKEN_TTL_S`). No lleva `iat`: PyJWT rechaza un `iat` futuro, y un desfase de reloj entre ControlNodes invalidaría tokens recién emitidos después de un failover.
+- **Todos los RPC del ControlNode exigen el token** en la metadata (`authorization: Bearer ...`), salvo `Login`. `_authenticate(context)` es la primera línea de cada RPC y va antes del chequeo de liderazgo y de la barrera: una llamada sin token se rechaza en cualquier nodo con `UNAUTHENTICATED` (`AuthError`), sin failover y sin escribir en Raft.
+- **RPC nuevos:** `Login` (pasa la barrera y compara el hash fuera del lock del árbol), `CreateUser` (solo admin; hasta 16 grupos por usuario, porque los grupos viajan en el token y gRPC limita el tamaño de la metadata) y `ChangePassword` (la propia exige la contraseña actual; un admin cambia la de otro sin ella). Usuario inexistente y contraseña incorrecta dan el mismo mensaje y tardan lo mismo: el login de un usuario que no existe corre igual un `scrypt` contra un señuelo.
+- **Admin inicial:** cada ControlNode arranca un hilo que, cuando el nodo es líder y el clúster no tiene usuarios, confirma `create_user("admin", ...)` con el `op_id` fijo `bootstrap-admin` y la contraseña de `secrets/admin.password`. Lo intentan los tres y queda uno solo. Si el admin cambia su contraseña, un reinicio no la restaura.
+- **Autenticación opcional, como TLS:** sin `--jwt-secret-file` el nodo avisa y no exige token (tests y desarrollo); los tres RPC nuevos responden `UNIMPLEMENTED`. Compose pasa siempre los flags. `--jwt-secret-file` y `--admin-password-file` van juntos.
+- **Cliente y shell:** `login` guarda el token en memoria y lo adjunta en cada llamada, también desde los hilos de transferencia y el que renueva locks. La contraseña no se guarda: cuando el token vence, la shell la pide otra vez y hay que repetir el comando. Comandos nuevos: `login`, `whoami`, `adduser`, `passwd`; las contraseñas se piden con `getpass`, nunca en la línea del comando. Si el token vence con un handle abierto, el lock se marca como perdido en vez de caducar en silencio. El dueño guardado de un lock pasa a ser el usuario.
+- **Cada contenedor monta solo sus secretos.** `scripts/generate_secrets.py` arma en `secrets/mounts/<rol>/` una copia de lo que usa cada rol (`dn1`, `dn2`, `dn3`, `control`, `client`, `inspect`) y cada servicio de Compose monta su carpeta en `/secrets`. `ca.key` no está en ninguna vista. Se montan carpetas y no archivos sueltos porque, si Docker tiene que crear el origen de un montaje que todavía no existe, crea una carpeta.
+- **Inspector:** entra como `admin` con `--password-file` y sondea el rol de cada ControlNode con `Login`, que mira el liderazgo antes que la contraseña; así sigue distinguiendo seguidor de líder sin mayoría. Si el archivo falta o la contraseña ya no sirve, la pide por teclado.
+- **Verificado en Docker:** primer arranque limpio con los seis nodos `healthy`; `ls /secrets` en `dn1`, `cn0`, `shell` e `inspect` muestra solo lo de cada rol; sin sesión los comandos son rechazados; el admin crea un usuario, que no puede crear otros; un archivo subido por uno y bajado por otro vuelve idéntico; con `DFSHA_TOKEN_TTL_S=20` la shell pide la contraseña al vencer; matar al líder no corta la sesión; con dos ControlNodes caídos `inspect estado` sigue mostrando los roles; las contraseñas no aparecen en los logs; `scrypt` tarda 27 ms dentro de la imagen.
+- **Límites declarados:**
+  - No hay revocación: un token robado sirve hasta que vence, y cambiar la contraseña no lo corta.
+  - Pedir la contraseña actual en `passwd` protege la cuenta de un usuario común. Un token de admin robado alcanza para quedarse con el clúster: puede crear otro admin o cambiarle la contraseña a cualquiera.
+  - Quien tenga `jwt.secret` fabrica tokens de cualquier usuario, también de uno que no existe. Por eso ese archivo solo está en la vista `control`.
+  - Hashes y sales quedan en el journal y en los snapshots de Raft, que no van cifrados en disco.
+  - `Login` no tiene límite de intentos.
+  - C2 protege la metadata, no los datos: hasta C3, quien tenga `ca.crt` y llegue a la red puede pedirle bloques directamente a un DataNode.
+  - Una subida que dure más que lo que le queda al token falla a mitad.
+
 ## Cosas a tener en cuenta si vas a seguir sobre este código
 
 Cosas que costó descubrir y que no vale la pena redescubrir:
+
+- **Todo RPC nuevo del ControlNode empieza con `self._authenticate(context)`.** `tests/test_auth_servicer.py` recorre los RPC del `.proto` y falla si uno responde sin token. Los únicos públicos están en `PUBLIC_RPCS`, en ese mismo test; agregar uno ahí es una decisión de seguridad.
+- **Después de bajar cambios que tocan dependencias o un `.proto`:** `pip install -r requirements.txt` y `python scripts/generate_proto.py`. Sin lo primero, toda la suite falla al importar `jwt`; sin lo segundo, con `AttributeError` sobre los mensajes nuevos.
+- **Un secreto nuevo se agrega en dos lugares de `scripts/generate_secrets.py`:** donde se crea y en `MOUNT_VIEWS`, que dice qué rol lo ve. Si no está en una vista, ningún contenedor lo recibe.
 
 - **Un identificador "opaco" sigue siendo una ruta si se une con `/`.** El DataNode valida `block_id` contra el formato exacto que genera el ControlNode (`uuid4().hex`, 32 hex minúsculas) antes de tocar el filesystem, en `dfsha/data_node/block_store.py::_block_path`. Esto no era así originalmente — se pensaba que un `block_id` "no es una ruta" y no necesitaba protección, hasta que una revisión encontró que sí se unía a una con `Path(root) / block_id`, y el operador `/` de `pathlib` descarta el lado izquierdo si el derecho es una ruta absoluta. Cualquier RPC nuevo que reciba un identificador de la red y lo use para armar una ruta en disco necesita la misma validación.
 - **`ControlTree` tiene un lock global** (`dfsha/control_node/tree.py`) porque corre detrás de un `ThreadPoolExecutor` con varios workers gRPC simultáneos, y sin lock hay una condición de carrera real y reproducible en operaciones como `begin_upload`. Es un lock único y grueso sobre todo el árbol (a propósito — las operaciones son en memoria, del orden de microsegundos). Si en algún momento se vuelve un cuello de botella real, pasar a locks por subárbol, no antes.
@@ -284,7 +308,7 @@ dfsha/
     distributed_shell_main.py
   control_node/
     tree.py                 árbol, bloques, subidas, locks y escrituras COW (lógica pura, determinista)
-    replicated_tree.py      máquina de estados Raft (pysyncobj), lista blanca de 14 mutaciones
+    replicated_tree.py      máquina de estados Raft (pysyncobj), lista blanca de 16 mutaciones
     servicer.py             RPC del ControlNode; solo el líder atiende
     datanode_monitor.py     A1 — Ping a cada DataNode, vista local de vivos
     rereplicator.py         A2 — repone copias de bloques sub-replicados
@@ -297,6 +321,7 @@ dfsha/
   common/
     exceptions.py           excepciones de dominio, compartidas por todo
     tls.py                  TLS: carga de certificados, canales, puertos, generación de la CA
+    auth.py                 C2 — hash de contraseñas (scrypt) y tokens de sesión (JWT)
   generated/         código gRPC generado (no se versiona, se regenera con scripts/generate_proto.py)
 proto/               definiciones .proto (dfsha, control_node, data_node)
 scripts/
@@ -305,7 +330,7 @@ scripts/
   healthcheck.py            healthcheck de Docker con TLS
   inspect_cluster.py        servicio inspect: estado, líder, árbol, mapa, bloques, huérfanos
   spikes/                   spikes S1 (mTLS) y S2 (Raft cifrado, fixture legacy)
-tests/               430 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
+tests/               569 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
 docs/                GUIA.md, especificacion-comunicaciones.md, arquitectura-y-flujos.excalidraw
 Dockerfile           imagen única para todos los roles
 docker-compose.yml   init (secretos) + clúster completo + shell + inspect + tests

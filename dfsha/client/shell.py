@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import getpass
 import posixpath
 import shlex
 from pathlib import Path
 
-from dfsha.common.exceptions import DFShaError
+from dfsha.common.exceptions import AuthError, DFShaError
 
 _HELP_TEXT = """Comandos disponibles:
   ls [ruta]                  lista un directorio (por defecto, el actual)
@@ -24,6 +25,11 @@ _HELP_TEXT = """Comandos disponibles:
   lock <ruta> r|w             toma un lock con lease
   unlock <ruta>               libera un lock propio de la ruta
   locks                       lista los locks propios
+  login <usuario>             inicia sesión (pide la contraseña aparte)
+  whoami                      muestra el usuario de la sesión, sus grupos y si es admin
+  adduser <usuario> [--admin] [grupo ...]
+                              crea un usuario (solo admin; pide su contraseña dos veces)
+  passwd [usuario]            cambia la contraseña propia, o la de otro si sos admin
   help                        muestra esta ayuda
   exit / quit                 termina la sesión
 
@@ -42,6 +48,21 @@ _RF3_COMMANDS = {
     "unlock": "unlock",
     "locks": "locks",
 }
+
+
+# Comandos de sesión (C2) y el método que necesitan; mismo motivo que los de RF3.
+_SESSION_COMMANDS = {
+    "login": "login",
+    "whoami": "login",
+    "adduser": "create_user",
+    "passwd": "change_password",
+}
+
+
+def _ask_new_password(prompt_password, whose: str) -> str | None:
+    """Pide una contraseña nueva dos veces; None si no coinciden."""
+    first = prompt_password(f"Contraseña nueva de {whose}: ")
+    return first if prompt_password("Repítela: ") == first else None
 
 
 def _parse_range(values: list[str]) -> tuple[int, int | None] | None:
@@ -73,7 +94,10 @@ def split_command(line: str) -> list[str]:
     return list(lexer)
 
 
-def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
+def handle_command(client, current_dir: str, line: str, prompt_password=None) -> tuple[str, str]:
+    """prompt_password pide una contraseña sin mostrarla (por defecto getpass). Las
+    contraseñas nunca van en la línea del comando: quedarían en pantalla y en el historial."""
+    prompt_password = prompt_password or getpass.getpass
     try:
         parts = split_command(line)
     except ValueError as exc:
@@ -198,13 +222,68 @@ def handle_command(client, current_dir: str, line: str) -> tuple[str, str]:
                 f"{held.mode} {held.path} {held.lock_id}" for held in client.locks()
             )
 
+        if cmd in _SESSION_COMMANDS and not hasattr(client, _SESSION_COMMANDS[cmd]):
+            return current_dir, f"{cmd}: no disponible con este cliente (los usuarios requieren el cliente distribuido)"
+
+        if cmd == "login":
+            if len(args) != 1:
+                return current_dir, "login: uso: login <usuario>   (la contraseña se pide aparte)"
+            client.login(args[0], prompt_password(f"Contraseña de {args[0]}: "))
+            return current_dir, f"sesión iniciada como {client.username}"
+
+        if cmd == "whoami":
+            if not client.username:
+                return current_dir, "sin sesión: inicia sesión con login <usuario>"
+            groups = ", ".join(client.groups) or "-"
+            return current_dir, f"{client.username}  grupos: {groups}  admin: {'sí' if client.is_admin else 'no'}"
+
+        if cmd == "adduser":
+            is_admin = "--admin" in args
+            names = [a for a in args if a != "--admin"]
+            if not names or any(a.startswith("-") for a in names):
+                return current_dir, "adduser: uso: adduser <usuario> [--admin] [grupo ...]"
+            username, groups = names[0], names[1:]
+            password = _ask_new_password(prompt_password, username)
+            if password is None:
+                return current_dir, "adduser: las contraseñas no coinciden; no se creó nada"
+            client.create_user(username, password, groups=groups, is_admin=is_admin)
+            return current_dir, f"usuario {username} creado"
+
+        if cmd == "passwd":
+            if len(args) > 1:
+                return current_dir, "passwd: uso: passwd [usuario]"
+            other = args[0] if args and args[0] != client.username else ""
+            # la propia exige la actual; la de otro la cambia un admin sin ella
+            current = "" if other else prompt_password("Contraseña actual: ")
+            password = _ask_new_password(prompt_password, other or client.username or "tu usuario")
+            if password is None:
+                return current_dir, "passwd: las contraseñas no coinciden; no se cambió nada"
+            client.change_password(password, current_password=current, username=other)
+            return current_dir, "contraseña cambiada"
+
         if cmd == "help":
             return current_dir, _HELP_TEXT
 
         return current_dir, f"comando no reconocido: {cmd}"
 
+    except AuthError as exc:
+        username = getattr(client, "username", None)
+        if cmd == "login":
+            return current_dir, f"login: {exc}"
+        if not username:
+            return current_dir, f"{cmd}: {exc}. Inicia sesión con: login <usuario>"
+        # Había sesión: el token venció (no hay renovación automática, el cliente no
+        # guarda la contraseña). Se vuelve a pedir y el usuario repite el comando.
+        try:
+            client.login(username, prompt_password(f"La sesión venció. Contraseña de {username}: "))
+        except (DFShaError, OSError, EOFError) as retry_exc:
+            # str(): una excepción siempre es verdadera, aunque su mensaje esté vacío (EOF)
+            return current_dir, f"{cmd}: {exc}; no se pudo renovar la sesión: {str(retry_exc) or 'cancelado'}"
+        return current_dir, f"{cmd}: la sesión había vencido y ya se renovó; repite el comando"
     except (DFShaError, OSError) as exc:
         return current_dir, f"{cmd}: {exc}"
+    except EOFError:
+        return current_dir, f"{cmd}: cancelado"
 
 
 def run_repl(client) -> None:

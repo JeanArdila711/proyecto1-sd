@@ -20,6 +20,11 @@ service ControlNodeService {
   rpc BeginWrite(BeginWriteRequest) returns (BeginWriteResponse);
   rpc CommitWrite(CommitWriteRequest) returns (CommitWriteResponse);
   rpc AbortWrite(AbortWriteRequest) returns (AbortWriteResponse);
+  // C2. Con la autenticación activa, todos los RPC exigen `authorization: Bearer <jwt>`
+  // en la metadata de la llamada. Login es el único que no: es el que entrega el token.
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
 }
 
 message ListDirRequest { string path = 1; }
@@ -143,3 +148,31 @@ message CommitWriteResponse { int64 version = 1; }
 
 message AbortWriteRequest { string path = 1; string write_id = 2; string lock_id = 3; string op_id = 4; }
 message AbortWriteResponse {}
+
+// Login no lleva op_id: no cambia el estado.
+message LoginRequest { string username = 1; string password = 2; }
+message LoginResponse {
+  string token = 1;
+  double expires_in_s = 2;
+  // Lo mismo que afirma el token, para que el cliente no tenga que decodificarlo.
+  string username = 3;
+  repeated string groups = 4;
+  bool is_admin = 5;
+}
+
+message CreateUserRequest {
+  string username = 1;
+  string password = 2;
+  repeated string groups = 3; // vacío => un grupo con el nombre del usuario
+  bool is_admin = 4;
+  string op_id = 5;
+}
+message CreateUserResponse {}
+
+message ChangePasswordRequest {
+  string username = 1;         // vacío => quien llama
+  string current_password = 2; // obligatoria al cambiar la propia
+  string new_password = 3;
+  string op_id = 4;
+}
+message ChangePasswordResponse {}

@@ -1,7 +1,9 @@
 # DFSha — clúster completo en contenedores. Guía de uso: docs/GUIA.md
 # Parámetros (tamaño de bloque, factor de replicación, lease): archivo .env
-# Secretos (llaves, password de Raft, certificados TLS): ./secrets, los crea el servicio
-# init la primera vez. Nunca van al repo.
+# Secretos (llaves, password de Raft, certificados TLS, secreto de los tokens): ./secrets,
+# los crea el servicio init la primera vez. Nunca van al repo. Cada contenedor monta solo
+# su vista (./secrets/mounts/<rol>), con los archivos que usa; la carpeta entera, donde
+# está la llave de la CA, solo la ve init.
 #
 # Por qué la shell y el inspector corren dentro de la red: el ControlNode entrega las
 # direcciones de los DataNodes tal como las conoce (dn1:50061), y esos nombres solo
@@ -42,6 +44,9 @@ x-controlnode: &controlnode
 # misma dirección que anuncia a los demás nodos. La lista es idéntica en los 3.
 # TLS: todos los nodos presentan secrets/node.crt; clientes y nodos lo verifican con
 # secrets/ca.crt.
+# Autenticación: los ControlNodes firman los tokens de sesión con secrets/jwt.secret y
+# crean al usuario admin con secrets/admin.password la primera vez. En la shell:
+#   dfsha:/$ login admin
 
 services:
   # Crea los secretos que falten y termina. Corre como root para dejar los archivos con
@@ -60,19 +65,19 @@ services:
     hostname: dn1
     command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn1.key,
               --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
-    volumes: [dn1-data:/data, ./secrets:/secrets:ro]
+    volumes: [dn1-data:/data, ./secrets/mounts/dn1:/secrets:ro]
   dn2:
     <<: *datanode
     hostname: dn2
     command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn2.key,
               --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
-    volumes: [dn2-data:/data, ./secrets:/secrets:ro]
+    volumes: [dn2-data:/data, ./secrets/mounts/dn2:/secrets:ro]
   dn3:
     <<: *datanode
     hostname: dn3
     command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn3.key,
               --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
-    volumes: [dn3-data:/data, ./secrets:/secrets:ro]
+    volumes: [dn3-data:/data, ./secrets/mounts/dn3:/secrets:ro]
 
   cn0:
     <<: *controlnode
@@ -98,10 +103,13 @@ services:
       - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
       - --raft-password-file=/secrets/raft.password
+      - --jwt-secret-file=/secrets/jwt.secret
+      - --admin-password-file=/secrets/admin.password
+      - --token-ttl-s=${DFSHA_TOKEN_TTL_S:-1800}
       - --tls-ca-file=/secrets/ca.crt
       - --tls-cert-file=/secrets/node.crt
       - --tls-key-file=/secrets/node.key
-    volumes: [cn0-raft:/raft, ./secrets:/secrets:ro]
+    volumes: [cn0-raft:/raft, ./secrets/mounts/control:/secrets:ro]
   cn1:
     <<: *controlnode
     hostname: cn1
@@ -126,10 +134,13 @@ services:
       - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
       - --raft-password-file=/secrets/raft.password
+      - --jwt-secret-file=/secrets/jwt.secret
+      - --admin-password-file=/secrets/admin.password
+      - --token-ttl-s=${DFSHA_TOKEN_TTL_S:-1800}
       - --tls-ca-file=/secrets/ca.crt
       - --tls-cert-file=/secrets/node.crt
       - --tls-key-file=/secrets/node.key
-    volumes: [cn1-raft:/raft, ./secrets:/secrets:ro]
+    volumes: [cn1-raft:/raft, ./secrets/mounts/control:/secrets:ro]
   cn2:
     <<: *controlnode
     hostname: cn2
@@ -154,10 +165,13 @@ services:
       - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
       - --upload-lease-s=${DFSHA_UPLOAD_LEASE_S:-600}
       - --raft-password-file=/secrets/raft.password
+      - --jwt-secret-file=/secrets/jwt.secret
+      - --admin-password-file=/secrets/admin.password
+      - --token-ttl-s=${DFSHA_TOKEN_TTL_S:-1800}
       - --tls-ca-file=/secrets/ca.crt
       - --tls-cert-file=/secrets/node.crt
       - --tls-key-file=/secrets/node.key
-    volumes: [cn2-raft:/raft, ./secrets:/secrets:ro]
+    volumes: [cn2-raft:/raft, ./secrets/mounts/control:/secrets:ro]
 
   # Shell interactiva. ./intercambio del host aparece como /intercambio dentro:
   #   dfsha:/$ send /intercambio/tesis.pdf /docs/tesis.pdf
@@ -169,15 +183,17 @@ services:
     working_dir: /intercambio
     command: [python, -m, dfsha.client.distributed_shell_main, --control-nodes, "cn0:50051,cn1:50051,cn2:50051",
               --tls-ca-file, /secrets/ca.crt, --parallel-transfers, "${DFSHA_PARALLEL_TRANSFERS:-4}"]
-    volumes: [./intercambio:/intercambio, ./secrets:/secrets:ro]
+    volumes: [./intercambio:/intercambio, ./secrets/mounts/client:/secrets:ro]
 
   # docker compose run --rm inspect estado|lider|arbol|mapa|huerfanos|bloques <ruta>
   inspect:
     <<: *dfsha
     profiles: [herramientas]
-    entrypoint: [python, scripts/inspect_cluster.py, --tls-ca-file, /secrets/ca.crt]
+    # Entra como admin con la contraseña inicial; si ya la cambiaste, la pide por teclado.
+    entrypoint: [python, scripts/inspect_cluster.py, --tls-ca-file, /secrets/ca.crt,
+                 --password-file, /secrets/admin.password]
     command: [estado]
-    volumes: [./secrets:/secrets:ro]
+    volumes: [./secrets/mounts/inspect:/secrets:ro]
     environment:
       DFSHA_GC_GRACE_S: ${DFSHA_GC_GRACE_S:-1200}   # para que `huerfanos` use la misma gracia que el recolector
 

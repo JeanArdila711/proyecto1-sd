@@ -10,10 +10,15 @@ Corre dentro de la red de Docker:
     docker compose run --rm inspect huerfanos
 
 Solo usa RPC de ControlNodes y DataNodes; no lee los volúmenes de los DataNodes.
+
+Si el clúster tiene autenticación, entra como --username (admin por defecto) con la
+contraseña de --password-file. Si el archivo falta o esa contraseña ya no sirve (la
+guía recomienda cambiar la del admin), la pide por teclado.
 """
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import os
 import sys
@@ -40,6 +45,27 @@ def _channel(address: str):
     return _new_channel(address)
 
 
+# Sesión del inspector (C2). _credentials = (usuario, contraseña) o None; _auth_metadata
+# es el token que entregó el líder, y va en cada RPC a un ControlNode.
+NEEDS_CREDENTIALS = "requiere credenciales"
+_username = "admin"
+_credentials: tuple[str, str] | None = None
+_auth_metadata = None
+
+
+def _can_prompt() -> bool:
+    return sys.stdin.isatty()
+
+
+def _ask_password(reason: str) -> bool:
+    """Pide la contraseña por teclado si hay una terminal. False si no la hay."""
+    global _credentials
+    if not _can_prompt():
+        return False
+    _credentials = (_username, getpass.getpass(f"{reason}. Contraseña de {_username}: "))
+    return True
+
+
 def _split(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
@@ -49,20 +75,44 @@ def roles(cn_addresses: list[str]) -> list[str]:
     import grpc
     from dfsha.generated import control_node_pb2, control_node_pb2_grpc
 
-    result = []
-    for address in cn_addresses:
+    def probe(address: str, with_login: bool) -> str:
+        # Con credenciales la sonda es Login y no ListDir: Login mira el liderazgo antes
+        # que la contraseña, así que sigue distinguiendo seguidor de líder sin mayoría
+        # aunque no haya quién emita un token, y de paso entrega el token del líder.
+        global _auth_metadata
         stub = control_node_pb2_grpc.ControlNodeServiceStub(_channel(address))
         try:
-            stub.ListDir(control_node_pb2.ListDirRequest(path="/"), timeout=3)
-            result.append("LIDER")
+            if with_login:
+                username, password = _credentials
+                response = stub.Login(control_node_pb2.LoginRequest(username=username, password=password), timeout=3)
+                _auth_metadata = (("authorization", f"Bearer {response.token}"),)
+            else:
+                stub.ListDir(control_node_pb2.ListDirRequest(path="/"), timeout=3)
+            return "LIDER"
         except grpc.RpcError as exc:
             details = exc.details() or ""
             if exc.code() == grpc.StatusCode.UNAVAILABLE and "no es el líder" in details:
-                result.append("seguidor")
-            elif exc.code() == grpc.StatusCode.UNAVAILABLE and "confirmar el liderazgo" in details:
-                result.append("líder SIN mayoría")
-            else:
-                result.append("CAÍDO")
+                return "seguidor"
+            if exc.code() == grpc.StatusCode.UNAVAILABLE and "confirmar el liderazgo" in details:
+                return "líder SIN mayoría"
+            if exc.code() == grpc.StatusCode.UNAUTHENTICATED:
+                return NEEDS_CREDENTIALS
+            if with_login and exc.code() == grpc.StatusCode.UNIMPLEMENTED:
+                return probe(address, with_login=False)  # clúster sin autenticación
+            return "CAÍDO"
+
+    def probe_all() -> list[str]:
+        return [probe(address, with_login=_credentials is not None) for address in cn_addresses]
+
+    result = probe_all()
+    if NEEDS_CREDENTIALS in result:
+        had_credentials = _credentials is not None
+        reason = "La contraseña guardada fue rechazada" if had_credentials else "El clúster pide credenciales"
+        if _ask_password(reason):
+            result = probe_all()
+            had_credentials = True
+        if had_credentials and NEEDS_CREDENTIALS in result:
+            sys.exit(f"credenciales del inspector rechazadas para el usuario {_username}")
     return result
 
 
@@ -70,9 +120,12 @@ def leader_stub(cn_addresses: list[str]):
     import grpc
     from dfsha.generated import control_node_pb2_grpc
 
-    for address, role in zip(cn_addresses, roles(cn_addresses)):
+    found = roles(cn_addresses)
+    for address, role in zip(cn_addresses, found):
         if role == "LIDER":
             return address, control_node_pb2_grpc.ControlNodeServiceStub(_channel(address))
+    if NEEDS_CREDENTIALS in found:
+        sys.exit("El clúster pide credenciales: pasa --password-file, o corre el inspector en una terminal.")
     sys.exit("No hay líder: ¿están caídos 2 de los 3 ControlNodes? Raft necesita mayoría.")
 
 
@@ -82,7 +135,8 @@ def walk(stub, path: str = "/"):
     from dfsha.generated import control_node_pb2
 
     out = []
-    for entry in stub.ListDir(control_node_pb2.ListDirRequest(path=path), timeout=5).entries:
+    request = control_node_pb2.ListDirRequest(path=path)
+    for entry in stub.ListDir(request, timeout=5, metadata=_auth_metadata).entries:
         child = f"{path.rstrip('/')}/{entry.name}"
         out.append((child, entry.is_dir, entry.size_bytes))
         if entry.is_dir:
@@ -93,7 +147,8 @@ def walk(stub, path: str = "/"):
 def blocks_of(stub, path: str):
     from dfsha.generated import control_node_pb2
 
-    return list(stub.ListBlocks(control_node_pb2.ListBlocksRequest(path=path), timeout=5).blocks)
+    request = control_node_pb2.ListBlocksRequest(path=path)
+    return list(stub.ListBlocks(request, timeout=5, metadata=_auth_metadata).blocks)
 
 
 def replica_status(address: str, block_id: str, expected_checksum: str) -> str:
@@ -151,10 +206,13 @@ def cmd_estado(args):
 
 def cmd_lider(args):
     """Imprime el nombre del servicio líder (cn0, cn1, cn2), listo para `docker compose kill`."""
-    for address, role in zip(_split(args.control_nodes), roles(_split(args.control_nodes))):
+    found = roles(_split(args.control_nodes))
+    for address, role in zip(_split(args.control_nodes), found):
         if role == "LIDER":
             print(short(address))
             return
+    if NEEDS_CREDENTIALS in found:
+        sys.exit("El clúster pide credenciales: pasa --password-file, o corre el inspector en una terminal.")
     sys.exit("no hay líder")
 
 
@@ -262,6 +320,11 @@ def main() -> None:
     parser.add_argument("--control-nodes", default=DEFAULT_CN)
     parser.add_argument("--datanodes", default=DEFAULT_DN)
     parser.add_argument("--tls-ca-file", help="certificado de la CA si el clúster usa TLS")
+    parser.add_argument("--username", default="admin", help="usuario con el que entra el inspector")
+    parser.add_argument(
+        "--password-file",
+        help="archivo con la contraseña de --username; si falta o ya no sirve, se pide por teclado",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("estado", help="rol de cada ControlNode y si cada DataNode está vivo")
     sub.add_parser("lider", help="imprime el nombre del líder (cn0, cn1 o cn2)")
@@ -284,8 +347,14 @@ def main() -> None:
     import grpc
     from dfsha.common.tls import channel_factory, load_tls
 
-    global _new_channel
+    global _new_channel, _username, _credentials
     _new_channel = channel_factory(load_tls(Path(args.tls_ca_file)) if args.tls_ca_file else None)
+    _username = args.username
+    if args.password_file:
+        try:
+            _credentials = (_username, Path(args.password_file).read_text(encoding="utf-8").strip())
+        except OSError:
+            pass  # sin archivo: si el clúster pide credenciales, se piden por teclado
 
     try:
         {
