@@ -13,6 +13,7 @@ from dfsha.client.distributed_client import (
     DEFAULT_BLOCK_TRANSFER_BASE_TIMEOUT_S,
     DEFAULT_MIN_TRANSFER_THROUGHPUT_BYTES_PER_S,
 )
+from dfsha.common.block_token import INTERNAL_TTL_S, capability_kwargs, issue_block, issue_internal
 from dfsha.control_node.datanode_monitor import DataNodeMonitor
 from dfsha.generated import data_node_pb2, data_node_pb2_grpc
 
@@ -48,6 +49,7 @@ class ReReplicator:
         jitter: Callable[[], float] = lambda: random.uniform(0.5, 1.5),
         channel_factory: Callable[[str], grpc.Channel] = grpc.insecure_channel,
         stub_factory: Callable[[grpc.Channel], object] = data_node_pb2_grpc.DataNodeServiceStub,
+        capability_key: bytes | None = None,
     ) -> None:
         if (
             replication_factor < 1
@@ -72,6 +74,9 @@ class ReReplicator:
         self._jitter = jitter
         self._channel_factory = channel_factory
         self._stub_factory = stub_factory
+        # C3. Por el constructor y no a través del servicer: los tests lo arman con
+        # servicers falsos mínimos. None = las llamadas salen sin metadata.
+        self._capability_key = capability_key
         self._channels: dict[str, grpc.Channel] = {}
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="dfsha-rereplicator", daemon=False)
@@ -177,7 +182,7 @@ class ReReplicator:
         for attempt in range(self._max_attempts):
             try:
                 response = self._datanode_stub(source).ReplicateBlock(
-                    request, timeout=self._block_timeout(size_bytes)
+                    request, timeout=self._block_timeout(size_bytes), **self._replicate_capabilities(block_id)
                 )
                 if response.checksum == expected_checksum:
                     return True
@@ -192,6 +197,18 @@ class ReReplicator:
                     return False
                 self._sleep(self._retry_delay(attempt))
         return False
+
+    def _replicate_capabilities(self, block_id: str) -> dict:
+        """La interna de `replicate` para el origen y la de escritura del bloque para el
+        destino. Se firman en cada intento, con la hora real: tres intentos con el deadline
+        de un bloque grande pasan de INTERNAL_TTL_S."""
+        if self._capability_key is None:
+            return {}
+        now = time.time()
+        return capability_kwargs(
+            issue_internal(self._capability_key, "replicate", INTERNAL_TTL_S, now),
+            issue_block(self._capability_key, block_id, "write", INTERNAL_TTL_S, now),
+        )
 
     def _commit_replicas(self, path: str, block_id: str, expected: list[str], new: list[str]) -> None:
         op_id = uuid.uuid4().hex

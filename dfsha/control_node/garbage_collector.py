@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 import grpc
 
+from dfsha.common.block_token import INTERNAL_TTL_S, capability_kwargs, issue_block, issue_internal
 from dfsha.control_node.datanode_monitor import DataNodeMonitor
 from dfsha.generated import data_node_pb2, data_node_pb2_grpc
 
@@ -42,6 +43,7 @@ class GarbageCollector:
         clock: Callable[[], float] = time.time,
         channel_factory: Callable[[str], grpc.Channel] = grpc.insecure_channel,
         stub_factory: Callable[[grpc.Channel], object] = data_node_pb2_grpc.DataNodeServiceStub,
+        capability_key: bytes | None = None,
     ) -> None:
         if interval_s <= 0 or grace_s < 0 or rpc_timeout_s <= 0:
             raise ValueError("la configuración del recolector no es válida")
@@ -54,6 +56,9 @@ class GarbageCollector:
         self._clock = clock
         self._channel_factory = channel_factory
         self._stub_factory = stub_factory
+        # C3. Las capabilities se firman con time.time(), nunca con self._clock: el DataNode
+        # compara el vencimiento contra la hora real. None = llamadas sin metadata.
+        self._capability_key = capability_key
         self._channels: dict[str, grpc.Channel] = {}
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="dfsha-garbage-collector", daemon=False)
@@ -78,6 +83,11 @@ class GarbageCollector:
             self._channels[address] = self._channel_factory(address)
         return self._stub_factory(self._channels[address])
 
+    def _capability_kwargs(self, issue: Callable[[bytes, float], str]) -> dict:
+        if self._capability_key is None:
+            return {}
+        return capability_kwargs(issue(self._capability_key, time.time()))
+
     def _run(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -98,7 +108,9 @@ class GarbageCollector:
                 stored[address] = [
                     (block.block_id, block.age_s)
                     for block in self._datanode_stub(address).ListStoredBlocks(
-                        data_node_pb2.ListStoredBlocksRequest(), timeout=self._rpc_timeout_s
+                        data_node_pb2.ListStoredBlocksRequest(),
+                        timeout=self._rpc_timeout_s,
+                        **self._capability_kwargs(lambda key, now: issue_internal(key, "list", INTERNAL_TTL_S, now)),
                     )
                 ]
             except grpc.RpcError as exc:
@@ -121,7 +133,11 @@ class GarbageCollector:
                     return  # perdió el liderazgo a mitad de ciclo: el nuevo líder decide
                 try:
                     self._datanode_stub(address).DeleteBlock(
-                        data_node_pb2.DeleteBlockRequest(block_id=block_id), timeout=self._rpc_timeout_s
+                        data_node_pb2.DeleteBlockRequest(block_id=block_id),
+                        timeout=self._rpc_timeout_s,
+                        **self._capability_kwargs(
+                            lambda key, now: issue_block(key, block_id, "delete", INTERNAL_TTL_S, now)
+                        ),
                     )
                 except grpc.RpcError as exc:
                     if exc.code() != grpc.StatusCode.NOT_FOUND:

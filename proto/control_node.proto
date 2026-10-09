@@ -25,6 +25,12 @@ service ControlNodeService {
   rpc Login(LoginRequest) returns (LoginResponse);
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
   rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+  // C3. Permisos por archivo.
+  rpc Chmod(ChmodRequest) returns (ChmodResponse);
+  rpc Chown(ChownRequest) returns (ChownResponse);
+  // C3. Inventario de un DataNode, solo para admin. El ControlNode hace de proxy con su
+  // capability interna, que nunca sale de los nodos. Lo usa `inspect huerfanos`.
+  rpc DataNodeInventory(DataNodeInventoryRequest) returns (DataNodeInventoryResponse);
 }
 
 message ListDirRequest { string path = 1; }
@@ -33,6 +39,10 @@ message DirEntry {
   string name = 1;
   bool is_dir = 2;
   int64 size_bytes = 3;
+  // C3. Dueño, grupo y modo rwx (0 a 0o777) de la entrada.
+  string owner = 4;
+  string group = 5;
+  uint32 mode = 6;
 }
 
 message ListDirResponse { repeated DirEntry entries = 1; }
@@ -61,6 +71,9 @@ message BlockLocation {
   string block_id = 1;
   repeated string datanode_addresses = 2;
   int64 size_bytes = 3;
+  // C3. Capability de escritura de este bloque; se manda en la metadata
+  // `dfsha-capability` del WriteBlock. Vacía si el ControlNode no tiene clave.
+  string capability = 4;
 }
 
 message BeginUploadResponse { repeated BlockLocation blocks = 1; }
@@ -87,6 +100,8 @@ message BlockInfo {
   repeated string datanode_addresses = 2;
   string checksum = 3;
   int64 size_bytes = 4;
+  // C3. Capability de lectura de este bloque, válida en cualquiera de sus réplicas.
+  string capability = 5;
 }
 
 message ListBlocksResponse { repeated BlockInfo blocks = 1; }
@@ -113,6 +128,9 @@ message WriteSlot {
   string new_block_id = 5;
   repeated string new_addresses = 6;
   int64 new_size = 7;
+  // C3. Lectura del bloque viejo (vacía si el slot extiende el archivo) y escritura del nuevo.
+  string old_capability = 8;
+  string new_capability = 9;
 }
 
 message BeginWriteRequest {
@@ -176,3 +194,21 @@ message ChangePasswordRequest {
   string op_id = 4;
 }
 message ChangePasswordResponse {}
+
+// C3. chmod: solo el dueño o un admin. chown: el dueño lo cambia solo un admin; el grupo,
+// el dueño si pertenece al grupo nuevo, o un admin.
+message ChmodRequest { string path = 1; uint32 mode = 2; string op_id = 3; }
+message ChmodResponse {}
+
+message ChownRequest {
+  string path = 1;
+  string owner = 2; // vacío => no cambia
+  string group = 3; // vacío => no cambia
+  string op_id = 4;
+}
+message ChownResponse {}
+
+// C3. address tiene que ser una de las --datanode-addresses del ControlNode.
+message DataNodeInventoryRequest { string address = 1; }
+message StoredBlockInfo { string block_id = 1; int64 size_bytes = 2; double age_s = 3; }
+message DataNodeInventoryResponse { repeated StoredBlockInfo blocks = 1; }

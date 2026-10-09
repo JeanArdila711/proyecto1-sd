@@ -15,13 +15,13 @@ generate_secrets = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(generate_secrets)
 
 BASE_SECRETS = {"dn1.key", "dn2.key", "dn3.key", "raft.password", "ca.crt", "ca.key", "node.crt", "node.key"}
-AUTH_SECRETS = {"jwt.secret", "admin.password"}
+AUTH_SECRETS = {"jwt.secret", "admin.password", "capability.key"}
 NODE_TLS = {"ca.crt", "node.crt", "node.key"}
 EXPECTED_VIEWS = {
-    "dn1": NODE_TLS | {"dn1.key"},
-    "dn2": NODE_TLS | {"dn2.key"},
-    "dn3": NODE_TLS | {"dn3.key"},
-    "control": NODE_TLS | {"raft.password", "jwt.secret", "admin.password"},
+    "dn1": NODE_TLS | {"dn1.key", "capability.key"},
+    "dn2": NODE_TLS | {"dn2.key", "capability.key"},
+    "dn3": NODE_TLS | {"dn3.key", "capability.key"},
+    "control": NODE_TLS | {"raft.password", "jwt.secret", "admin.password", "capability.key"},
     "client": {"ca.crt"},
     "inspect": {"ca.crt", "admin.password"},
 }

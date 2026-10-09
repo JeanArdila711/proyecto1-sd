@@ -6,11 +6,14 @@
     node.crt node.key         certificado TLS que presentan los ControlNodes y DataNodes
     jwt.secret                secreto con el que los ControlNodes firman los tokens de sesión
     admin.password            contraseña inicial del usuario admin (para el primer login)
+    capability.key            clave HMAC de las capabilities de bloque, compartida por
+                              ControlNodes y DataNodes
     mounts/<vista>/           copia de lo que usa cada rol; es lo que monta cada contenedor
 
 Cada contenedor monta solo su vista de mounts/, no la carpeta entera: un DataNode no ve
 la password de Raft ni el secreto de los tokens, la shell solo ve ca.crt, y ca.key no
-está en ninguna vista.
+está en ninguna vista. capability.key la ven los ControlNodes y los DataNodes, nunca la
+shell ni el inspector.
 
 Solo crea lo que falta: correrlo otra vez no cambia nada. Docker Compose lo corre solo
 (servicio `init`) antes de levantar los nodos, como root, y deja los archivos con el
@@ -33,15 +36,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dfsha.common.tls import generate_ca, issue_node_cert  # noqa: E402
 
 _DATANODE_KEYS = ("dn1.key", "dn2.key", "dn3.key")
-_AUTH_SECRETS = ("jwt.secret", "admin.password")
+_AUTH_SECRETS = ("jwt.secret", "admin.password", "capability.key")
 _NODE_TLS = ("ca.crt", "node.crt", "node.key")
 
 # Qué archivos de secrets/ ve cada rol. ca.key no está en ninguna vista: solo hace falta
 # para emitir certificados, y eso lo hace este script.
 MOUNT_VIEWS = {
-    "dn1": (*_NODE_TLS, "dn1.key"),
-    "dn2": (*_NODE_TLS, "dn2.key"),
-    "dn3": (*_NODE_TLS, "dn3.key"),
+    "dn1": (*_NODE_TLS, "dn1.key", "capability.key"),
+    "dn2": (*_NODE_TLS, "dn2.key", "capability.key"),
+    "dn3": (*_NODE_TLS, "dn3.key", "capability.key"),
     "control": (*_NODE_TLS, "raft.password", *_AUTH_SECRETS),
     "client": ("ca.crt",),
     "inspect": ("ca.crt", "admin.password"),
@@ -110,12 +113,14 @@ def generate(secrets_dir: Path, force: bool = False, owner: tuple[int, int] | No
 def generate_auth_secrets(
     secrets_dir: Path, force: bool = False, owner: tuple[int, int] | None = None
 ) -> None:
-    """Secretos de autenticación (C2). Aparte de generate(), que crea los de TLS, Raft y
-    cifrado en reposo."""
+    """Secretos de autenticación (C2) y la clave de las capabilities (C3). Aparte de
+    generate(), que crea los de TLS, Raft y cifrado en reposo. Un clúster que viene de C2
+    recibe capability.key acá: solo se crea lo que falta."""
     secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     _write(secrets_dir / "jwt.secret", secrets.token_hex(32).encode(), 0o600, force)
     # 24 caracteres sin símbolos raros: hay que poder pegarla en la shell
     _write(secrets_dir / "admin.password", secrets.token_urlsafe(18).encode(), 0o600, force)
+    _write(secrets_dir / "capability.key", secrets.token_hex(32).encode(), 0o600, force)
     for name in _AUTH_SECRETS:
         _chown(secrets_dir / name, owner)
 

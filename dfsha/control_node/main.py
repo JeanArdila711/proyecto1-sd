@@ -11,6 +11,7 @@ import grpc
 from pysyncobj import SyncObj, SyncObjConf
 
 from dfsha.common.auth import DEFAULT_TOKEN_TTL_S, MIN_JWT_SECRET_BYTES, hash_password
+from dfsha.common.block_token import DEFAULT_CAPABILITY_TTL_S, load_capability_key
 from dfsha.common.tls import TlsConfig, add_port, add_tls_arguments, channel_factory, tls_from_args
 from dfsha.control_node.datanode_monitor import (
     DEFAULT_DATANODE_DEAD_AFTER_S,
@@ -135,6 +136,8 @@ def serve(
     jwt_secret: bytes | None = None,
     admin_password: str | None = None,
     token_ttl_s: float = DEFAULT_TOKEN_TTL_S,
+    capability_key: bytes | None = None,
+    capability_ttl_s: float = DEFAULT_CAPABILITY_TTL_S,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
     DataNodes, que se detiene junto con el servidor.
@@ -146,6 +149,9 @@ def serve(
     jwt_secret=None deja el nodo sin autenticación (tests y desarrollo): ningún RPC
     exige token. admin_password crea al usuario admin la primera vez que el clúster
     tiene líder y no tiene usuarios.
+
+    capability_key=None deja el nodo sin capabilities (tests y desarrollo): las respuestas
+    no las traen y las llamadas a los DataNodes salen sin metadata.
     """
     validate_datanode_configuration(datanode_addresses, replication_factor, min_write_replicas)
     replicated = ReplicatedTree()
@@ -179,6 +185,8 @@ def serve(
         channel_factory=datanode_channel,
         jwt_secret=jwt_secret,
         token_ttl_s=token_ttl_s,
+        capability_key=capability_key,
+        capability_ttl_s=capability_ttl_s,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
     rereplicator = ReReplicator(
@@ -189,6 +197,7 @@ def serve(
         delay_s=rereplication_delay_s,
         max_per_cycle=rereplication_max_per_cycle,
         channel_factory=datanode_channel,
+        capability_key=capability_key,
     )
     garbage_collector = GarbageCollector(
         servicer,
@@ -197,6 +206,7 @@ def serve(
         grace_s=gc_grace_s,
         rereplicator=rereplicator,
         channel_factory=datanode_channel,
+        capability_key=capability_key,
     )
     bootstrap_stop = threading.Event()
     bootstrap_thread = None
@@ -306,6 +316,18 @@ def main() -> None:
         default=DEFAULT_TOKEN_TTL_S,
         help="segundos que dura un token de sesión; no hay revocación, así que conviene corto",
     )
+    parser.add_argument(
+        "--capability-key-file",
+        help="clave compartida con los DataNodes para firmar las capabilities de bloque; "
+        "sin ella el ControlNode no emite capabilities",
+    )
+    parser.add_argument(
+        "--capability-ttl-s",
+        type=float,
+        default=DEFAULT_CAPABILITY_TTL_S,
+        help="segundos que dura una capability que recibe el cliente; tiene que cubrir el "
+        "arranque del último bloque de una transferencia",
+    )
     add_tls_arguments(parser, server=True)
     args = parser.parse_args()
     tls = tls_from_args(args, server=True)
@@ -324,6 +346,21 @@ def main() -> None:
             print("AVISO: autenticación sin TLS, contraseñas y tokens viajan en claro (solo para desarrollo)")
     else:
         print("AVISO: sin --jwt-secret-file, ningún RPC exige token (solo para desarrollo)")
+    if not math.isfinite(args.capability_ttl_s) or args.capability_ttl_s <= 0:
+        raise SystemExit("--capability-ttl-s debe ser un número finito mayor que cero")
+    capability_key = None
+    if args.capability_key_file:
+        try:
+            capability_key = load_capability_key(Path(args.capability_key_file))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        if jwt_secret is None:
+            print(
+                "AVISO: capabilities sin autenticación, cualquiera que llegue al ControlNode recibe "
+                "capabilities de cualquier bloque (solo para desarrollo)"
+            )
+    else:
+        print("AVISO: sin --capability-key-file, los DataNodes no reciben capabilities (solo para desarrollo)")
     raft_password = None
     if args.raft_password_file:
         try:
@@ -370,6 +407,8 @@ def main() -> None:
         jwt_secret=jwt_secret,
         admin_password=admin_password,
         token_ttl_s=args.token_ttl_s,
+        capability_key=capability_key,
+        capability_ttl_s=args.capability_ttl_s,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")
@@ -378,7 +417,7 @@ def main() -> None:
         f"Raft={raft_self} peers={raft_peers}, DataNodes={addresses}, "
         f"factor={args.replication_factor}, mínimo escritura={args.min_write_replicas}, "
         f"TLS={tls is not None}, Raft cifrado={raft_password is not None}, "
-        f"autenticación={jwt_secret is not None}"
+        f"autenticación={jwt_secret is not None}, capabilities={capability_key is not None}"
     )
     try:
         server.wait_for_termination()

@@ -15,6 +15,7 @@ Un cliente sube y baja archivos que quedan partidos en bloques y replicados entr
      └──gRPC────►  dn1 ──pipeline──► dn2 ──pipeline──► dn3            │
                  │  bloques cifrados con AES-256-GCM en cada disco      │
                  │  todo el tráfico gRPC con TLS; Raft cifrado          │
+                 │  salvo Ping, cada RPC exige una capability firmada   │
                  └──────────────────────────────────────────────────────┘
 ```
 
@@ -35,7 +36,7 @@ Todo el transporte es gRPC. Diagrama completo con cada flujo: [docs/arquitectura
 | 3 | Seguridad: cifrado en reposo (AES-256-GCM), TLS en gRPC, canal Raft cifrado | ✅ |
 | 3 | Rendimiento: `send` y `receive` transfieren varios bloques a la vez | ✅ |
 | 3 | Seguridad: usuarios y login con token de sesión; cada contenedor monta solo sus secretos | ✅ |
-| 3 | Seguridad: permisos por archivo y autorización de las operaciones sobre bloques | ⬜ |
+| 3 | Seguridad: permisos por archivo y autorización de las operaciones sobre bloques | ✅ |
 | Final | Despliegue en AWS, informe, video | ⬜ |
 
 Detalle de cada parte, decisiones y límites conocidos: [ESTADO_PROYECTO.md](ESTADO_PROYECTO.md).
@@ -49,7 +50,7 @@ docker compose run --rm inspect mapa      # dónde quedó cada bloque
 docker compose down                       # apagar
 ```
 
-La contraseña inicial del usuario `admin` queda en `secrets/admin.password`.
+La contraseña inicial del usuario `admin` queda en `secrets/admin.password`. Cada archivo y directorio tiene dueño, grupo y modo `rwx`, como en Unix: en la shell, `ls -l` los muestra y `chmod 640 <ruta>` o `chown <usuario>[:<grupo>] <ruta>` los cambian. Los DataNodes solo atienden a quien trae una capability firmada por el ControlNode para ese bloque y esa operación.
 
 Guía completa (comandos de la shell, inspector, prueba de cada funcionalidad, configuración): **[docs/GUIA.md](docs/GUIA.md)**.
 

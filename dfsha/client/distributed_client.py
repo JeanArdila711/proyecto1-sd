@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import grpc
 
+from dfsha.common.block_token import capability_kwargs
 from dfsha.common.exceptions import (
     AccessDeniedError,
     AuthError,
@@ -415,6 +416,17 @@ class DistributedDFShaClient:
     def remove(self, path: str) -> None:
         self._call("Remove", control_node_pb2.RemoveRequest(path=path, op_id=_new_op_id()))
 
+    def chmod(self, path: str, mode: int) -> None:
+        """C3: solo el dueño o un admin. `mode` es el entero (0o640), no el texto octal."""
+        self._call("Chmod", control_node_pb2.ChmodRequest(path=path, mode=mode, op_id=_new_op_id()))
+
+    def chown(self, path: str, owner: str = "", group: str = "") -> None:
+        """C3: vacío = no cambia. El dueño lo cambia solo un admin; el grupo, el dueño si
+        pertenece al grupo nuevo, o un admin."""
+        self._call(
+            "Chown", control_node_pb2.ChownRequest(path=path, owner=owner, group=group, op_id=_new_op_id())
+        )
+
     def lock(self, path: str, mode: str) -> LeaseLock:
         if mode not in {"r", "w"}:
             raise InvalidPathError(f"modo de lock inválido: {mode!r}")
@@ -719,6 +731,7 @@ class DistributedDFShaClient:
                     block_id=slot.new_block_id,
                     datanode_addresses=list(slot.new_addresses),
                     size_bytes=slot.new_size,
+                    capability=slot.new_capability,
                 )
                 # el bloque nuevo viaja por el pipeline de siempre, con su checksum
                 checksum, bytes_written = self._write_block(new_block, io.BytesIO(content))
@@ -773,6 +786,7 @@ class DistributedDFShaClient:
                 block_id=slot.old_block_id,
                 datanode_addresses=list(slot.old_addresses),
                 size_bytes=slot.old_size,
+                capability=slot.old_capability,
             )
             old = io.BytesIO()
             self._read_block_with_failover(old_block, old)
@@ -798,6 +812,9 @@ class DistributedDFShaClient:
                 call = self._datanode_stub(address).ReadBlock(
                     request,
                     timeout=self._block_transfer_timeout(length or getattr(block, "size_bytes", 0)),
+                    # C3: la misma capability vale en cualquier réplica. getattr: los bloques
+                    # de un ControlNode sin clave, o los de prueba, no la traen.
+                    **capability_kwargs(getattr(block, "capability", "")),
                 )
                 for chunk in call:
                     if stop is not None and stop.is_set():
@@ -843,6 +860,9 @@ class DistributedDFShaClient:
         # se encargan de encadenar las réplicas restantes
         stub = self._datanode_stub(block.datanode_addresses[0])
         response = stub.WriteBlock(
-            chunks(), timeout=self._block_transfer_timeout(block.size_bytes)
+            chunks(),
+            timeout=self._block_transfer_timeout(block.size_bytes),
+            # C3: la cabeza la verifica y la reenvía tal cual a cada salto del pipeline
+            **capability_kwargs(getattr(block, "capability", "")),
         )
         return response.checksum, response.bytes_written

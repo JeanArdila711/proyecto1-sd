@@ -18,6 +18,13 @@ from dfsha.common.auth import (
     verify_password,
     verify_token,
 )
+from dfsha.common.block_token import (
+    DEFAULT_CAPABILITY_TTL_S,
+    INTERNAL_TTL_S,
+    capability_kwargs,
+    issue_block,
+    issue_internal,
+)
 from dfsha.common.exceptions import (
     AccessDeniedError,
     AuthError,
@@ -30,8 +37,9 @@ from dfsha.common.exceptions import (
     PathNotFoundError,
 )
 from dfsha.control_node.datanode_monitor import DataNodeMonitor
+from dfsha.control_node.garbage_collector import DEFAULT_GC_RPC_TIMEOUT_S
 from dfsha.control_node.replicated_tree import ReplicatedTree
-from dfsha.control_node.tree import plan_write_slots
+from dfsha.control_node.tree import Caller, plan_write_slots
 from dfsha.generated import control_node_pb2, control_node_pb2_grpc, data_node_pb2, data_node_pb2_grpc
 
 DEFAULT_REPLICATION_FACTOR = 3
@@ -106,10 +114,14 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         channel_factory: Callable[[str], grpc.Channel] = grpc.insecure_channel,
         jwt_secret: bytes | None = None,
         token_ttl_s: float = DEFAULT_TOKEN_TTL_S,
+        capability_key: bytes | None = None,
+        capability_ttl_s: float = DEFAULT_CAPABILITY_TTL_S,
     ) -> None:
         if not math.isfinite(token_ttl_s) or token_ttl_s <= 0:
             # nan e inf no son "<= 0": sin isfinite pasarían, y cada Login reventaría
             raise ValueError(f"token_ttl_s debe ser un número finito mayor que cero, no {token_ttl_s}")
+        if not math.isfinite(capability_ttl_s) or capability_ttl_s <= 0:
+            raise ValueError(f"capability_ttl_s debe ser un número finito mayor que cero, no {capability_ttl_s}")
         if not datanode_addresses:
             raise ValueError("hace falta al menos un DataNode")
         if replication_factor < 1:
@@ -141,6 +153,10 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         # None = sin autenticación (desarrollo y tests): ningún RPC exige token.
         self._jwt_secret = jwt_secret
         self._token_ttl_s = token_ttl_s
+        # C3. None = no emite capabilities: los campos `capability` de las respuestas van
+        # vacíos y las llamadas a los DataNodes salen sin metadata.
+        self._capability_key = capability_key
+        self._capability_ttl_s = capability_ttl_s
 
     def close(self) -> None:
         for channel in self._channels.values():
@@ -170,6 +186,26 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         except AuthError as exc:
             _abort_on_domain_error(context, exc)
             raise  # abort() ya lanzó; esto cubre un contexto de prueba que no lance
+
+    @staticmethod
+    def _caller(principal: Principal | None) -> Caller | None:
+        """Quien llama, como viaja en el comando replicado (C3): una tupla plana, no el
+        Principal, para que el journal no dependa de ninguna clase. None sin autenticación:
+        el árbol no chequea nada. Toda mutación que llegue a un RPC lo recibe al final
+        (tests/test_permissions_tree.py vigila las firmas)."""
+        return None if principal is None else (principal.username, tuple(principal.groups), principal.is_admin)
+
+    def _block_capability(self, block_id: str, op: str, ttl_s: float | None = None) -> str:
+        """"" si este nodo no tiene clave de capabilities.
+
+        Se firma al armar la respuesta, fuera de apply() y con la hora real: el DataNode
+        compara el vencimiento contra su propio reloj. Sin ttl_s, la duración de las que
+        recibe el cliente (--capability-ttl-s)."""
+        if self._capability_key is None:
+            return ""
+        return issue_block(
+            self._capability_key, block_id, op, self._capability_ttl_s if ttl_s is None else ttl_s, time.time()
+        )
 
     def _require_leader(self, context: grpc.ServicerContext) -> None:
         # Lecturas y escrituras solo en el líder: un follower puede tener el log
@@ -221,7 +257,18 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             # mkdir recibiría la respuesta del primero. Se rechaza, nunca se inventa.
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "falta op_id")
         self._require_leader(context)
-        outcome = self._commit_raw(op_id, method, *args)
+        # C3: el op_id se ata a quien llama. El log deduplica devolviendo el resultado
+        # guardado SIN volver a ejecutar, y por lo tanto sin volver a mirar permisos: con la
+        # clave cruda, repetir el op_id de otro usuario devolvía su resultado (los bloques de
+        # su subida, con una capability de escritura recién firmada). Con el prefijo, el
+        # op_id de otro usuario es otra operación y se ejecuta con sus propios permisos.
+        # Un nombre de usuario no lleva ':' y las claves internas (bootstrap-admin, las del
+        # re-replicador) no llevan prefijo, así que un cliente no puede fabricar una.
+        # ponytail: verifica el token por segunda vez (microsegundos) en vez de pasar el
+        # principal por los 19 llamadores; cambiar si alguna vez pesa.
+        principal = self._authenticate(context)
+        key = op_id if principal is None else f"{principal.username}:{op_id}"
+        outcome = self._commit_raw(key, method, *args)
         if outcome[0] in {"unknown", "unavailable"}:
             context.abort(
                 grpc.StatusCode.UNAVAILABLE,
@@ -249,41 +296,53 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         return [alive[(start + i) % len(alive)] for i in range(count)]
 
     def ListDir(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         self._read_barrier(context)
         try:
-            entries = self._replicated.tree.list_dir(request.path)
-        except (PathNotFoundError, NotADirectoryError, InvalidPathError) as exc:
+            # C3: el permiso se mira después de la barrera, bajo el lock del árbol
+            entries = self._replicated.tree.list_dir(request.path, self._caller(principal))
+        except (PathNotFoundError, NotADirectoryError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.ListDirResponse()
         return control_node_pb2.ListDirResponse(
             entries=[
-                control_node_pb2.DirEntry(name=e.name, is_dir=e.is_dir, size_bytes=e.size_bytes)
+                control_node_pb2.DirEntry(
+                    name=e.name, is_dir=e.is_dir, size_bytes=e.size_bytes, owner=e.owner, group=e.group, mode=e.mode
+                )
                 for e in entries
             ]
         )
 
     def MakeDir(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         try:
-            self._commit(context, request.op_id, "make_dir", request.path)
-        except (PathExistsError, PathNotFoundError, NotADirectoryError, InvalidPathError) as exc:
+            self._commit(context, request.op_id, "make_dir", request.path, self._caller(principal))
+        except (PathExistsError, PathNotFoundError, NotADirectoryError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.MakeDirResponse()
 
     def RemoveDir(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         try:
-            self._commit(context, request.op_id, "remove_dir", request.path)
-        except (PathNotFoundError, NotADirectoryError, NotEmptyError, InvalidPathError) as exc:
+            self._commit(context, request.op_id, "remove_dir", request.path, self._caller(principal))
+        except (PathNotFoundError, NotADirectoryError, NotEmptyError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.RemoveDirResponse()
 
     def Remove(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         try:
-            blocks = self._commit(context, request.op_id, "remove_file", request.path, time.time())
-        except (PathNotFoundError, NotAFileError, NotADirectoryError, InvalidPathError, ConflictError) as exc:
+            blocks = self._commit(
+                context, request.op_id, "remove_file", request.path, time.time(), self._caller(principal)
+            )
+        except (
+            PathNotFoundError,
+            NotAFileError,
+            NotADirectoryError,
+            InvalidPathError,
+            ConflictError,
+            AccessDeniedError,
+        ) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.RemoveResponse()
         # Efecto secundario fuera de la máquina de estados, solo en el líder y
@@ -299,6 +358,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     self._datanode_stub(address).DeleteBlock(
                         data_node_pb2.DeleteBlockRequest(block_id=block.block_id),
                         timeout=DEFAULT_DATA_PLANE_TIMEOUT_S,
+                        **capability_kwargs(self._block_capability(block.block_id, "delete", INTERNAL_TTL_S)),
                     )
                 except grpc.RpcError:
                     # best-effort: la metadata ya se borró, un bloque físico que falle
@@ -306,7 +366,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     pass
 
     def BeginUpload(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         if request.size_bytes <= 0:
             _abort_on_domain_error(context, InvalidPathError("size_bytes debe ser mayor a 0"))
             return control_node_pb2.BeginUploadResponse()
@@ -330,8 +390,9 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 time.time(),  # lo decide el líder y viaja en el log: apply() no lee el reloj
                 self._upload_lease_s,
                 self._block_size_bytes,  # B3: el archivo recuerda con qué tamaño se partió
+                self._caller(principal),  # C3: va último, después de block_size
             )
-        except (PathExistsError, NotADirectoryError, InvalidPathError) as exc:
+        except (PathExistsError, NotADirectoryError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.BeginUploadResponse()
         # bloques de una subida abandonada cuyo nombre se acaba de reutilizar
@@ -346,13 +407,15 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     block_id=block_id,
                     datanode_addresses=addresses,
                     size_bytes=this_block_size,
+                    # C3: recién firmada también en un reintento del mismo op_id
+                    capability=self._block_capability(block_id, "write"),
                 )
             )
             remaining -= this_block_size
         return control_node_pb2.BeginUploadResponse(blocks=locations)
 
     def ConfirmBlock(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         try:
             self._commit(
                 context,
@@ -364,21 +427,22 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 request.size_bytes,
                 time.time(),
                 self._upload_lease_s,
+                self._caller(principal),
             )
-        except (PathNotFoundError, InvalidPathError) as exc:
+        except (PathNotFoundError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.ConfirmBlockResponse()
 
     def CompleteUpload(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         try:
-            self._commit(context, request.op_id, "complete_upload", request.path)
-        except (PathNotFoundError, InvalidPathError) as exc:
+            self._commit(context, request.op_id, "complete_upload", request.path, self._caller(principal))
+        except (PathNotFoundError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
         return control_node_pb2.CompleteUploadResponse()
 
     def AbortUpload(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         # Camino rápido: se leen los bloques de la subida ANTES del commit (con la barrera,
         # sobre el árbol al día) y se borran si el abort sale bien. abort_upload no los
         # devuelve para no cambiar el resultado que guarda el log (ver tree.abort_upload).
@@ -386,19 +450,21 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         self._read_barrier(context)
         blocks = self._replicated.tree.pending_blocks(request.path)
         try:
-            self._commit(context, request.op_id, "abort_upload", request.path)
-        except (PathNotFoundError, NotADirectoryError, InvalidPathError) as exc:
+            # C3: si la subida es de otro usuario, el commit se rechaza y no se borra nada
+            self._commit(context, request.op_id, "abort_upload", request.path, self._caller(principal))
+        except (PathNotFoundError, NotADirectoryError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.AbortUploadResponse()
         self._delete_blocks(blocks)
         return control_node_pb2.AbortUploadResponse()
 
     def ListBlocks(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         self._read_barrier(context)
         try:
-            blocks = self._replicated.tree.list_blocks(request.path)
-        except (PathNotFoundError, InvalidPathError) as exc:
+            # C3: sin `r` no hay ubicaciones; el permiso se mira después de la barrera
+            blocks = self._replicated.tree.list_blocks(request.path, self._caller(principal))
+        except (PathNotFoundError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.ListBlocksResponse()
         return control_node_pb2.ListBlocksResponse(
@@ -408,6 +474,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     datanode_addresses=b.datanode_addresses,
                     checksum=b.checksum,
                     size_bytes=b.size_bytes,
+                    capability=self._block_capability(b.block_id, "read"),
                 )
                 for b in blocks
             ]
@@ -428,8 +495,9 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 request.mode,
                 time.time(),
                 self._lock_lease_s,
+                self._caller(principal),
             )
-        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+        except (PathNotFoundError, InvalidPathError, ConflictError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.LockResponse()
         return control_node_pb2.LockResponse(lock_id=committed_lock_id, lease_s=self._lock_lease_s)
@@ -461,14 +529,19 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
     # --- RF3 write: copy-on-write (B3) ---------------------------------------------------
 
     def BeginWrite(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
+        caller = self._caller(principal)
         # La propuesta se arma leyendo el árbol: tiene que estar al día (misma regla
         # que toda lectura). begin_write la vuelve a validar dentro de apply().
         self._read_barrier(context)
         try:
-            version, block_size, sizes = self._replicated.tree.write_layout(request.path, self._block_size_bytes)
+            # C3: write_layout exige `w` antes de proponer bloques, así el rechazo no
+            # revela el tamaño del archivo; begin_write lo vuelve a exigir en apply().
+            version, block_size, sizes = self._replicated.tree.write_layout(
+                request.path, self._block_size_bytes, caller
+            )
             plan = plan_write_slots(sizes, block_size, request.offset, request.length)
-        except (PathNotFoundError, InvalidPathError) as exc:
+        except (PathNotFoundError, InvalidPathError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.BeginWriteResponse()
         try:
@@ -496,8 +569,9 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 # Renovar por bloque si llega a hacer falta.
                 self._upload_lease_s,
                 self._block_size_bytes,
+                caller,
             )
-        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+        except (PathNotFoundError, InvalidPathError, ConflictError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.BeginWriteResponse()
         return control_node_pb2.BeginWriteResponse(
@@ -514,13 +588,18 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     new_block_id=new_block_id,
                     new_addresses=new_addresses,
                     new_size=new_size,
+                    # ponytail: con `w` y sin `r`, la capability de lectura del bloque viejo
+                    # igual sale: copy-on-write necesita ese contenido para completar el
+                    # bloque nuevo. `w` sin `r` no oculta lo que la escritura toca.
+                    old_capability=self._block_capability(old_block_id, "read") if old_block_id else "",
+                    new_capability=self._block_capability(new_block_id, "write"),
                 )
                 for index, old_block_id, old_size, old_addresses, new_block_id, new_addresses, new_size in slots
             ],
         )
 
     def CommitWrite(self, request, context):
-        self._authenticate(context)
+        principal = self._authenticate(context)
         try:
             version, replaced = self._commit(
                 context,
@@ -532,8 +611,9 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                 request.base_version,
                 [(s.index, s.block_id, s.checksum, s.size_bytes) for s in request.slots],
                 time.time(),
+                self._caller(principal),
             )
-        except (PathNotFoundError, InvalidPathError, ConflictError) as exc:
+        except (PathNotFoundError, InvalidPathError, ConflictError, AccessDeniedError) as exc:
             _abort_on_domain_error(context, exc)
             return control_node_pb2.CommitWriteResponse()
         # Borrar la versión anterior es seguro recién ahora: el writer tiene el lock
@@ -676,3 +756,65 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             BOOTSTRAP_ADMIN_OP_ID, "create_user", ADMIN_USERNAME, password_hash, salt, [ADMIN_USERNAME], True
         )
         return outcome[0] in {"ok", "error"}
+
+    # --- Permisos (C3) -----------------------------------------------------------------------
+    #
+    # Mutaciones: el árbol decide quién puede dentro de apply(), con quien llama como último
+    # argumento del comando. Sin autenticación (caller None) no hay chequeo.
+
+    def Chmod(self, request, context):
+        principal = self._authenticate(context)
+        try:
+            self._commit(context, request.op_id, "chmod", request.path, request.mode, self._caller(principal))
+        except (PathNotFoundError, InvalidPathError, AccessDeniedError) as exc:
+            _abort_on_domain_error(context, exc)
+        return control_node_pb2.ChmodResponse()
+
+    def Chown(self, request, context):
+        principal = self._authenticate(context)
+        try:
+            self._commit(
+                context, request.op_id, "chown", request.path, request.owner, request.group, self._caller(principal)
+            )
+        except (PathNotFoundError, InvalidPathError, AccessDeniedError) as exc:
+            _abort_on_domain_error(context, exc)
+        return control_node_pb2.ChownResponse()
+
+    # --- Inventario de un DataNode (C3) ------------------------------------------------------
+
+    def DataNodeInventory(self, request, context):
+        """Inventario de un DataNode para `inspect huerfanos`, solo para admin.
+
+        El ControlNode hace de proxy con su capability interna de `list`, que así nunca sale
+        de los nodos. Solo acepta direcciones de --datanode-addresses: un admin no puede
+        hacer que el ControlNode le presente su capability a un host cualquiera. No lee el
+        árbol, así que no pasa por la barrera ni exige liderazgo."""
+        principal = self._authenticate(context)
+        try:
+            if principal is not None and not principal.is_admin:
+                raise AccessDeniedError("solo un admin puede ver el inventario de un DataNode")
+            if request.address not in self._datanode_addresses:
+                raise InvalidPathError(f"DataNode desconocido: {request.address!r}")
+        except (AccessDeniedError, InvalidPathError) as exc:
+            _abort_on_domain_error(context, exc)
+            return control_node_pb2.DataNodeInventoryResponse()
+        kwargs = {}
+        if self._capability_key is not None:
+            kwargs = capability_kwargs(issue_internal(self._capability_key, "list", INTERNAL_TTL_S, time.time()))
+        # la llamada al DataNode usa lo que le queda a la del inspector; sin deadline, el del recolector
+        remaining = context.time_remaining()
+        timeout = DEFAULT_GC_RPC_TIMEOUT_S if remaining is None else remaining
+        try:
+            # ponytail: el inventario entero va en un solo mensaje unario, y gRPC limita el
+            # tamaño de un mensaje (4 MiB por defecto según su documentación; no lo medí).
+            # Sobra para este proyecto; paginar si llega a hacer falta.
+            stored = [
+                control_node_pb2.StoredBlockInfo(block_id=b.block_id, size_bytes=b.size_bytes, age_s=b.age_s)
+                for b in self._datanode_stub(request.address).ListStoredBlocks(
+                    data_node_pb2.ListStoredBlocksRequest(), timeout=timeout, **kwargs
+                )
+            ]
+        except grpc.RpcError as exc:
+            context.abort(grpc.StatusCode.UNAVAILABLE, f"no se pudo listar {request.address}: {exc.details()}")
+            return control_node_pb2.DataNodeInventoryResponse()
+        return control_node_pb2.DataNodeInventoryResponse(blocks=stored)

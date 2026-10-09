@@ -1,6 +1,6 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-10-03, tras agregar TLS, Raft cifrado y transferencia paralela de bloques (Hito 3, C1).
+Última actualización: 2026-10-08, tras agregar permisos por archivo y capabilities de bloque (Hito 3, C3).
 
 Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
@@ -29,17 +29,14 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | C1 — TLS en los enlaces gRPC y canal Raft cifrado | ✅ |
 | 3 | Transferencia paralela de bloques en `send`/`receive` | ✅ |
 | 3 | C2 — usuarios, login y token de sesión | ✅ |
-| 3 | C3 — permisos por archivo y autorización de operaciones internas | ⬜ |
+| 3 | C3 — permisos por archivo y autorización de operaciones internas | ✅ |
 | Final | Despliegue en AWS, informe, video de 10–15 min | ⬜ |
 
-569 tests en verde en macOS y dentro de la imagen de Docker (ahí, 3 se saltan porque leen `docker-compose.yml`, que no se copia a la imagen). Los tests de C2 todavía no se corrieron en Windows.
+854 tests en verde en macOS; dentro de la imagen de Docker, 849 en verde y 5 que se saltan porque leen `docker-compose.yml`, que no se copia a la imagen. Los tests de C2 y C3 todavía no se corrieron en Windows.
 
 ## Qué falta
 
-1. **Permisos (Hito 3).**
-   - **C3 — permisos:** dueño y ACL por ruta, y capability por bloque firmada por el ControlNode, para que un cliente solo lea o escriba los bloques que se le autorizaron y que las operaciones internas del DataNode (`ReplicateBlock`, `DeleteBlock`, `ListStoredBlocks`) solo las pida un ControlNode. Hoy TLS cifra todo, pero cualquiera que tenga `ca.crt` y llegue a la red puede llamarlas.
-2. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada), informe técnico y video.
-3. **Documentación:** actualizar la especificación de comunicaciones cuando entre C3.
+1. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada, relojes sincronizados entre ControlNodes y DataNodes, dueños y permisos de `secrets/` en Linux), informe técnico y video.
 
 ## Qué está implementado
 
@@ -256,8 +253,41 @@ Revisión de las diez entregas de Jean (P0, S2, A1, B1, A2, B2, B3, A3, S1, C4) 
   - Quien tenga `jwt.secret` fabrica tokens de cualquier usuario, también de uno que no existe. Por eso ese archivo solo está en la vista `control`.
   - Hashes y sales quedan en el journal y en los snapshots de Raft, que no van cifrados en disco.
   - `Login` no tiene límite de intentos.
-  - C2 protege la metadata, no los datos: hasta C3, quien tenga `ca.crt` y llegue a la red puede pedirle bloques directamente a un DataNode.
+  - C2 protegía la metadata, no los datos: quien tuviera `ca.crt` y llegara a la red podía pedirle bloques directamente a un DataNode. Desde C3 los DataNodes exigen una capability firmada por el ControlNode (sección siguiente).
   - Una subida que dure más que lo que le queda al token falla a mitad.
+
+### Hito 3 — C3: permisos por archivo y capabilities de bloque
+
+- **Dueño, grupo y modo `rwx`** en `DirNode` y `FileNode` (`dfsha/control_node/tree.py`), como campos de dataclass con default simple: un nodo de un snapshot anterior queda de `admin`, con `0o755` si es directorio y `0o644` si es archivo. La raíz es `admin`/`0o777`; como nunca pasa por un comando replicado, se fija en `__init__` y, para un snapshot viejo, en `__setstate__`. Probado sobre el fixture de `9985c6d` y sobre un árbol de C2 armado a mano.
+- **Reglas:** `r` sobre el directorio para `ls`; `w` sobre el padre para crear o borrar; `r` sobre el archivo para leer y para el lock compartido; `w` para escribir y para el lock exclusivo. Clases excluyentes como en Unix: si quien llama es el dueño, valen solo los bits del dueño, aunque su grupo tenga más. El admin se salta los chequeos. No se exige `x`. Todo rechazo es `AccessDeniedError` (`PERMISSION_DENIED`), con mensajes fijos como `permiso denegado: falta w en /docs`.
+- **Dónde se chequea:** las mutaciones, dentro del árbol, con quien llama como último argumento opcional del comando replicado: una tupla plana `(usuario, grupos, es_admin)`, no el `Principal`, para que el journal no dependa de una clase. Las lecturas (`list_dir`, `list_blocks`, `write_layout`) reciben a quien llama y chequean bajo el mismo lock con el que leen, después de la barrera. `caller=None` (autenticación apagada, journal anterior a C3 o un hilo interno) no chequea nada y lo que crea queda de `admin`: un journal de C2 se reproduce con los mismos outcomes.
+- **Lo que se crea:** de quien lo crea, con su primer grupo (o su nombre si no tiene grupos), `0o755` los directorios y `0o644` los archivos. `send` crea los directorios intermedios que falten y pide `w` en el último que ya existía. Una subida pendiente es de quien la empezó: solo él o un admin la confirma, la completa o la aborta. `renew_lock`, `release_lock` y `abort_write` no chequean: alcanza con el `lock_id`.
+- **`chmod` y `chown`**, dos mutaciones nuevas (la lista blanca pasa a 18). `chmod`: el dueño o un admin, modo entre `0` y `0o777`. `chown`: el dueño lo cambia solo un admin, y tiene que existir; el grupo lo cambia el dueño si pertenece al grupo nuevo, o un admin.
+- **Capabilities de bloque** (`dfsha/common/block_token.py`): texto ASCII firmado con HMAC-SHA256 (`b:<op>:<block_id>:<exp>.<hmac>` para un bloque, `i:<op>:<exp>.<hmac>` para las internas). Una de bloque autoriza una operación (`read`, `write`, `delete`) sobre ese bloque en cualquier DataNode; no nombra al DataNode. Las internas (`list`, `replicate`) solo las firma el ControlNode. Se verifican con `hmac.compare_digest` y el vencimiento se mira cuando la llamada llega, no durante el stream.
+- **Qué exige el DataNode:** con la clave activa, `ReadBlock`, `WriteBlock` y `DeleteBlock` piden la capability de esa operación y ese bloque en la metadata `dfsha-capability`; `ListStoredBlocks` y `ReplicateBlock`, la interna, y `ReplicateBlock` además la de escritura del destino en `dfsha-target-capability`. `Ping` queda abierto. El pipeline reenvía la capability tal cual. Un rechazo es `PERMISSION_DENIED` y no hace failover a otra réplica. `proto/data_node.proto` no cambió.
+- **Quién las emite:** el ControlNode, fuera de `apply()` y con la hora real, al armar las respuestas de `BeginUpload` (escritura), `ListBlocks` (lectura) y `BeginWrite` (lectura del bloque viejo y escritura del nuevo); duran `--capability-ttl-s` (3600 s, `DFSHA_CAPABILITY_TTL_S`). Para lo que usa él mismo (borrados, re-replicador, recolector, inventario) firma en el momento con 300 s fijos. El re-replicador y el recolector reciben la clave por su constructor y firman con `time.time()`, no con el reloj inyectable del recolector.
+- **RPC nuevos del ControlNode** (pasa de 18 a 21): `Chmod`, `Chown` y `DataNodeInventory`. El último es solo para admin, unario, acepta solo direcciones de `--datanode-addresses` y hace de proxy con la capability interna de `list`: así `inspect huerfanos` funciona sin que la capability interna salga de los nodos. `inspect bloques` verifica cada réplica con la capability de lectura que le da `ListBlocks`.
+- **Secreto:** `secrets/capability.key`, creado por `generate_auth_secrets()` y presente solo en las vistas `dn1`, `dn2`, `dn3` y `control`; la shell y el inspector no lo ven. Un clúster que viene de C2 lo recibe solo con `docker compose up -d --build`, porque `init` crea lo que falta.
+- **Opcional, como TLS y la autenticación:** sin `--capability-key-file` el ControlNode no emite capabilities y el DataNode no las exige, con un `AVISO` en el arranque. Compose pasa siempre los flags. La línea de arranque de cada nodo dice `capabilities=True|False`.
+- **Shell:** `ls -l [ruta]`, `chmod <modo octal> <ruta>` y `chown <usuario>[:<grupo>] <ruta>` (o `chown :<grupo> <ruta>`).
+- **Tests:** 285 nuevos: 284 en `tests/test_permissions_*.py`, `tests/test_block_token.py`, `tests/test_capability_*.py` y `tests/test_inspect_capabilities.py`, y uno de upgrade al final de `tests/test_raft_upgrade.py`. Un test recorre `MUTATIONS` y falla si una mutación no recibe `caller` y no está en la lista de exentas. Ningún test existente cambió, salvo las cinco constantes de inventario de `tests/test_secrets_layout.py` (`AUTH_SECRETS` y cuatro vistas), autorizadas por Jean.
+- **Verificado en Docker** (proyecto aparte, `-p dfsha-c3`): un clúster de C2 con un usuario, `/viejo` y un archivo se actualizó con `up -d --build` sin `down`; los seis nodos `healthy` con `capabilities=True` y sin `AVISO`; lo viejo quedó `drwxr-xr-x admin admin` y `-rw-r--r-- admin admin`, legible y no escribible para un usuario común; `ls /secrets` da 5 archivos en `dn1`, 7 en `cn0`, solo `ca.crt` en la shell y `ca.crt` y `admin.password` en el inspector; `chmod 600` corta lectura, borrado, `chmod` y `write` a otro usuario, y `chown` del admin le da acceso al nuevo dueño; contra un DataNode, la capability de lectura de un bloque sirve para leerlo y para nada más (otro bloque, escribir, borrar, inventario y sin capability dan `PERMISSION_DENIED`); `inspect bloques` sobre un archivo `0o600` ve todas las réplicas `ok` y `inspect huerfanos` funciona por el ControlNode; con factor 2, la re-replicación repuso la copia de un DataNode detenido y el recolector borró la sobrante al volver; tras matar al líder, `receive` siguió funcionando; con `DFSHA_CAPABILITY_TTL_S=2` y bloques de 1 MB, un `send` de 300 MB falló con `send: capability vencida: repite la operación`; la suite pasó dentro de la imagen; y ninguna capability apareció en los logs.
+- **El `op_id` queda atado a quien llama** (`ControlNodeServicer._commit`): con autenticación, la clave de deduplicación es `<usuario>:<op_id>`. El log deduplica devolviendo el resultado guardado sin volver a ejecutar, y por lo tanto sin volver a mirar permisos; con la clave cruda, quien repitiera el `op_id` de otro usuario recibía su resultado (por ejemplo, los bloques de una subida ajena con una capability de escritura recién firmada). Lo encontró la revisión final. No era explotable en la práctica, porque un `op_id` son 122 bits al azar que solo viajan por TLS, pero ahora el `op_id` de otro usuario es otra operación y se ejecuta con sus propios permisos. Sin autenticación la clave sigue siendo el `op_id` solo.
+- **Revisión final** (otra sesión, sin haber escrito el código): lectura completa del diff, siete mutaciones del código que los tests detectaron, una prueba adversarial de 36 casos con un usuario común contra los archivos de otro (todos como se esperaba) y una repetición en Docker de permisos y capabilities cruzadas.
+- **Límites declarados:**
+  - La raíz es `0o777` sin sticky bit: cualquier usuario puede borrar un archivo ajeno que esté directamente en `/`, o un directorio ajeno vacío. La guía recomienda `chmod 755 /` cuando el admin ya creó la carpeta de cada usuario.
+  - Sin `x`, una carpeta privada no protege lo que tiene adentro: un archivo `0o644` dentro de una carpeta `0o700` se lee si se conoce su ruta.
+  - Una capability de escritura sirve hasta que vence, también después de confirmado el archivo o de quitado el permiso: quien subió un bloque puede reescribir una réplica durante una hora. El cliente no compara lo que baja contra el checksum de la metadata; `inspect bloques` sí.
+  - Sin revocación: un `chmod` o un `chown` no cortan las capabilities ya emitidas, y los grupos y el flag de admin que se usan son los del token, con hasta 30 minutos de atraso.
+  - `w` sin `r` no oculta el contenido: `BeginWrite` entrega la capability de lectura de los bloques viejos que toca, porque copy-on-write los necesita.
+  - El cliente elige su pipeline: la lista `downstream` no está firmada, así que puede escribir menos réplicas de las que dice la metadata.
+  - El vencimiento se evalúa con el reloj del DataNode contra la hora del ControlNode. Con un desfase mayor a 300 s dejan de funcionar el borrado, la re-replicación y el recolector. En Docker todos comparten reloj; en AWS hay que confirmarlo.
+  - Los nodos que comparten `capability.key` son un solo dominio de confianza: un DataNode comprometido firma cualquier capability, también las internas.
+  - Los seis nodos se actualizan juntos. Un ControlNode de C2 que reciba un comando con `caller` lo registra como error y diverge, y un DataNode con clave frente a un ControlNode sin ella rechaza todo. Una subida en curso durante la actualización puede fallar al confirmar, porque su reserva quedó de `admin`.
+  - Cada bloque suma unos 116 bytes a `ListBlocks` y a `BeginUpload`, y `DataNodeInventory` devuelve el inventario entero en un mensaje unario.
+  - Una descarga que dure más que la capability falla a mitad y hay que repetirla; el cliente no pide capabilities nuevas.
+  - Un rechazo de capability aguas abajo del pipeline sigue saliendo como `UNAVAILABLE` (solo pasa con claves distintas entre DataNodes o relojes desfasados), y con las claves desalineadas el re-replicador reintenta en cada ciclo.
+  - Los dueños y permisos de `secrets/` en Linux no se pudieron probar en macOS (Docker Desktop no los aplica); queda para el despliegue.
 
 ## Cosas a tener en cuenta si vas a seguir sobre este código
 
@@ -266,6 +296,10 @@ Cosas que costó descubrir y que no vale la pena redescubrir:
 - **Todo RPC nuevo del ControlNode empieza con `self._authenticate(context)`.** `tests/test_auth_servicer.py` recorre los RPC del `.proto` y falla si uno responde sin token. Los únicos públicos están en `PUBLIC_RPCS`, en ese mismo test; agregar uno ahí es una decisión de seguridad.
 - **Después de bajar cambios que tocan dependencias o un `.proto`:** `pip install -r requirements.txt` y `python scripts/generate_proto.py`. Sin lo primero, toda la suite falla al importar `jwt`; sin lo segundo, con `AttributeError` sobre los mensajes nuevos.
 - **Un secreto nuevo se agrega en dos lugares de `scripts/generate_secrets.py`:** donde se crea y en `MOUNT_VIEWS`, que dice qué rol lo ve. Si no está en una vista, ningún contenedor lo recibe.
+- **La deduplicación por `op_id` no vuelve a mirar permisos.** Devuelve el resultado guardado tal cual. Por eso `_commit` le pone delante el usuario a la clave: cualquier mecanismo nuevo que cachee resultados de una operación autorizada tiene que incluir a quien llama en la clave.
+- **Toda mutación que llegue a un RPC recibe a quien llama (`caller`) como último argumento opcional, con default `None`.** `tests/test_permissions_tree.py::test_every_mutation_receives_the_caller_or_is_explicitly_exempt` recorre `MUTATIONS` y falla si una no lo tiene y no está en la lista de exentas del test; agregar una ahí es una decisión de seguridad, con el motivo escrito.
+- **Toda llamada a un DataNode pasa por `capability_kwargs()`** (`dfsha/common/block_token.py`), que devuelve `{}` sin capability. Con la clave activa, una llamada sin capability se rechaza; y pasar `metadata` siempre, aunque esté vacía, rompería los stubs falsos de los tests, que no la aceptan. Las capabilities se firman fuera de `apply()`, con `time.time()`, y nunca van a un log ni a un mensaje de error.
+- **Los defaults de dueño y modo (`admin`, `0o755`, `0o644`) son formato persistido.** Los nodos anteriores a C3 no tienen esos campos en su `__dict__` y los toman de la clase: cambiar `DIR_MODE` o `FILE_MODE` en `tree.py` cambia los permisos de todos ellos.
 
 - **Un identificador "opaco" sigue siendo una ruta si se une con `/`.** El DataNode valida `block_id` contra el formato exacto que genera el ControlNode (`uuid4().hex`, 32 hex minúsculas) antes de tocar el filesystem, en `dfsha/data_node/block_store.py::_block_path`. Esto no era así originalmente — se pensaba que un `block_id` "no es una ruta" y no necesitaba protección, hasta que una revisión encontró que sí se unía a una con `Path(root) / block_id`, y el operador `/` de `pathlib` descarta el lado izquierdo si el derecho es una ruta absoluta. Cualquier RPC nuevo que reciba un identificador de la red y lo use para armar una ruta en disco necesita la misma validación.
 - **`ControlTree` tiene un lock global** (`dfsha/control_node/tree.py`) porque corre detrás de un `ThreadPoolExecutor` con varios workers gRPC simultáneos, y sin lock hay una condición de carrera real y reproducible en operaciones como `begin_upload`. Es un lock único y grueso sobre todo el árbol (a propósito — las operaciones son en memoria, del orden de microsegundos). Si en algún momento se vuelve un cuello de botella real, pasar a locks por subárbol, no antes.
@@ -308,7 +342,7 @@ dfsha/
     distributed_shell_main.py
   control_node/
     tree.py                 árbol, bloques, subidas, locks y escrituras COW (lógica pura, determinista)
-    replicated_tree.py      máquina de estados Raft (pysyncobj), lista blanca de 16 mutaciones
+    replicated_tree.py      máquina de estados Raft (pysyncobj), lista blanca de 18 mutaciones
     servicer.py             RPC del ControlNode; solo el líder atiende
     datanode_monitor.py     A1 — Ping a cada DataNode, vista local de vivos
     rereplicator.py         A2 — repone copias de bloques sub-replicados
@@ -322,6 +356,7 @@ dfsha/
     exceptions.py           excepciones de dominio, compartidas por todo
     tls.py                  TLS: carga de certificados, canales, puertos, generación de la CA
     auth.py                 C2 — hash de contraseñas (scrypt) y tokens de sesión (JWT)
+    block_token.py          C3 — capabilities de bloque e internas (HMAC-SHA256)
   generated/         código gRPC generado (no se versiona, se regenera con scripts/generate_proto.py)
 proto/               definiciones .proto (dfsha, control_node, data_node)
 scripts/
@@ -330,7 +365,7 @@ scripts/
   healthcheck.py            healthcheck de Docker con TLS
   inspect_cluster.py        servicio inspect: estado, líder, árbol, mapa, bloques, huérfanos
   spikes/                   spikes S1 (mTLS) y S2 (Raft cifrado, fixture legacy)
-tests/               569 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
+tests/               854 tests, un archivo por componente; fixtures/ con el journal legacy de 9985c6d
 docs/                GUIA.md, especificacion-comunicaciones.md, arquitectura-y-flujos.excalidraw
 Dockerfile           imagen única para todos los roles
 docker-compose.yml   init (secretos) + clúster completo + shell + inspect + tests

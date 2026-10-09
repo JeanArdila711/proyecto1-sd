@@ -30,6 +30,8 @@ MUTATIONS = frozenset(
         "abort_write",
         "create_user",
         "change_password",
+        "chmod",
+        "chown",
     }
 )
 

@@ -9,7 +9,9 @@ Corre dentro de la red de Docker:
     docker compose run --rm inspect mapa
     docker compose run --rm inspect huerfanos
 
-Solo usa RPC de ControlNodes y DataNodes; no lee los volúmenes de los DataNodes.
+Solo usa RPC de ControlNodes y DataNodes; no lee los volúmenes de los DataNodes. El
+inventario de cada DataNode (huerfanos) se pide a través del ControlNode, que es el único
+que tiene la capability para listarlo (C3).
 
 Si el clúster tiene autenticación, entra como --username (admin por defecto) con la
 contraseña de --password-file. Si el archivo falta o esa contraseña ya no sirve (la
@@ -151,15 +153,19 @@ def blocks_of(stub, path: str):
     return list(stub.ListBlocks(request, timeout=5, metadata=_auth_metadata).blocks)
 
 
-def replica_status(address: str, block_id: str, expected_checksum: str) -> str:
-    """Pide el bloque al DataNode por gRPC y recalcula el SHA-256 del lado del inspector."""
+def replica_status(address: str, block_id: str, expected_checksum: str, capability: str = "") -> str:
+    """Pide el bloque al DataNode por gRPC y recalcula el SHA-256 del lado del inspector.
+
+    `capability` es la de lectura que entregó ListBlocks (C3); vacía si el clúster no tiene."""
     import grpc
+    from dfsha.common.block_token import capability_kwargs
     from dfsha.generated import data_node_pb2, data_node_pb2_grpc
 
     stub = data_node_pb2_grpc.DataNodeServiceStub(_channel(address))
     hasher = hashlib.sha256()
     try:
-        for chunk in stub.ReadBlock(data_node_pb2.ReadBlockRequest(block_id=block_id), timeout=30):
+        request = data_node_pb2.ReadBlockRequest(block_id=block_id)
+        for chunk in stub.ReadBlock(request, timeout=30, **capability_kwargs(capability)):
             hasher.update(chunk.data)
     except grpc.RpcError as exc:
         return {
@@ -237,7 +243,7 @@ def cmd_bloques(args):
         cells = []
         statuses = []
         for pos, address in enumerate(b.datanode_addresses):
-            status = replica_status(address, b.block_id, b.checksum) if not args.sin_verificar else "?"
+            status = replica_status(address, b.block_id, b.checksum, b.capability) if not args.sin_verificar else "?"
             statuses.append(status)
             role = "cabeza" if pos == 0 else f"réplica {pos + 1}"
             cells.append(f"{short(address)}[{role}]={status}")
@@ -282,7 +288,7 @@ def cmd_huerfanos(args):
     Solo ve archivos visibles: un bloque de una subida o una escritura en curso aparece
     como "sin uso visible", pero el recolector (que sí ve subidas y reservas) no lo borra."""
     import grpc
-    from dfsha.generated import data_node_pb2, data_node_pb2_grpc
+    from dfsha.generated import control_node_pb2
 
     cns, dns = _split(args.control_nodes), _split(args.datanodes)
     _, stub = leader_stub(cns)
@@ -294,9 +300,13 @@ def cmd_huerfanos(args):
     print(f"\nBloques en uso por archivos visibles: {len(assigned)}   (gracia del recolector: {args.gracia_s:.0f} s)\n")
     total_candidates = 0
     for address in dns:
-        dn = data_node_pb2_grpc.DataNodeServiceStub(_channel(address))
         try:
-            stored = list(dn.ListStoredBlocks(data_node_pb2.ListStoredBlocksRequest(), timeout=30))
+            # C3: el líder lo pide al DataNode con su capability interna, que no sale de los nodos
+            stored = list(
+                stub.DataNodeInventory(
+                    control_node_pb2.DataNodeInventoryRequest(address=address), timeout=30, metadata=_auth_metadata
+                ).blocks
+            )
         except grpc.RpcError as exc:
             print(f"  {short(address):<8} no responde ({exc.code().name})")
             continue

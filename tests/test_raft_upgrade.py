@@ -418,3 +418,50 @@ def test_legacy_fixture_starts_without_users_and_accepts_new_ones(tmp_path):
 def assert_legacy_users(replica) -> None:
     assert replica.tree._users == {}
     assert not replica.tree.has_users()
+
+
+def test_legacy_fixture_gets_default_permissions_and_accepts_callers(tmp_path):
+    """C3 sobre estado real de 9985c6d: los nodos no traen dueño, grupo ni modo y toman
+    los defaults (la raíz, 0o777); un usuario común lee y no escribe; un comando con
+    caller converge en las tres réplicas, también cuando se rechaza."""
+    manifest = _fixture_manifest()
+    nodes, leader_index = _start_restored_cluster(tmp_path)
+    try:
+        replicas = [replicated for _, replicated in nodes]
+        expected_op_ids = {operation["op_id"] for operation in manifest["legacy_operations"]}
+        assert wait_for(lambda: all(expected_op_ids <= set(replica.applied_ops) for replica in replicas))
+        assert_legacy_upgrade(replicas, manifest, extension_checks=(assert_legacy_permissions,))
+        assert [_canonical_legacy_projection(replica) for replica in replicas] == [
+            EXPECTED_LEGACY_PROJECTION
+        ] * len(replicas)
+
+        alice = ("alice", ("alice",), False)
+        leader = replicas[leader_index()]
+        denied = leader.apply("c3-upgrade-denied", "make_dir", ("/snapshot/x", alice), sync=True, timeout=1.0)
+        assert denied == ("error", "AccessDeniedError", "permiso denegado: falta w en /snapshot")
+        assert leader.apply(
+            "c3-upgrade-mkdir", "make_dir", ("/alice", alice), sync=True, timeout=1.0
+        ) == ("ok", None)
+
+        c3_ops = {"c3-upgrade-denied", "c3-upgrade-mkdir"}
+        assert wait_for(lambda: all(c3_ops <= set(replica.applied_ops) for replica in replicas))
+        for replica in replicas:
+            assert replica.applied_ops["c3-upgrade-denied"] == denied
+            assert "x" not in replica.tree._root.children["snapshot"].children
+            created = replica.tree._root.children["alice"]
+            assert (created.owner, created.group, created.mode) == ("alice", "alice", 0o755)
+    finally:
+        _stop_cluster(nodes)
+
+
+def assert_legacy_permissions(replica) -> None:
+    tree = replica.tree
+    root = tree._root
+    snapshot_dir = root.children["snapshot"]
+    snapshot_file = snapshot_dir.children["file.bin"]
+    assert (root.owner, root.group, root.mode) == ("admin", "admin", 0o777)
+    assert (snapshot_dir.owner, snapshot_dir.group, snapshot_dir.mode) == ("admin", "admin", 0o755)
+    assert (snapshot_file.owner, snapshot_file.group, snapshot_file.mode) == ("admin", "admin", 0o644)
+    bob = ("bob", ("bob",), False)
+    assert [entry.name for entry in tree.list_dir("/snapshot", bob)] == ["file.bin"]
+    assert [block.block_id for block in tree.list_blocks("/snapshot/file.bin", bob)] == [_SNAPSHOT_BLOCK_ID]
