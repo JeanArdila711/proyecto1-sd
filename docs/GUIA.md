@@ -358,6 +358,25 @@ docker compose --env-file .env --env-file .env.escala run --rm inspect mapa     
 
 `.env.escala` activa `dn4` y `dn5` y les pasa la lista de 5 a los ControlNodes, que se reinician. Los datos y las llaves que ya había se conservan. Los bloques viejos no se mueven a los nodos nuevos. Mientras uses 5 DataNodes, todos los comandos de Compose llevan los dos `--env-file`; volver a 3 no está probado. Qué se midió y hasta dónde llega: `docs/escalabilidad.md`.
 
+### Entrar desde otra máquina
+
+La shell de `docker compose run --rm shell` corre dentro de la red del clúster. Para que entre un cliente de fuera, el clúster tiene que publicar sus puertos y decirle a ese cliente por dónde llegar a cada DataNode. Eso hace `docker-compose.publico.yml`. Se puede probar en una sola máquina, con los valores de `.env.publico`:
+
+```bash
+docker compose --env-file .env --env-file .env.publico -f docker-compose.yml -f docker-compose.publico.yml up -d --build
+docker compose --env-file .env --env-file .env.publico run --rm cliente
+# en esa shell: login admin
+# en esa shell: send /intercambio/tesis.pdf /docs/desde-fuera.pdf
+# en esa shell: receive /docs/tesis.pdf /intercambio/copia-desde-fuera.pdf
+docker compose --env-file .env --env-file .env.publico -f docker-compose.yml -f docker-compose.publico.yml run --rm inspect mapa
+```
+
+El servicio `cliente` no está en la red del clúster: no resuelve `dn1` ni `cn0`, y llega a los nodos solo por los puertos publicados. El ControlNode le entrega la dirección pública de cada DataNode. La shell normal y el inspector siguen dentro de la red y reciben las internas, así que todo lo demás de esta guía funciona igual. Entre ellos, los nodos se siguen hablando por los nombres internos.
+
+Para volver al clúster sin puertos publicados: `docker compose up -d`. Los datos se conservan.
+
+En un servidor de verdad, `DFSHA_PUBLIC_HOST` es su IP o su DNS público. El paso a paso en AWS, con lo que se comprobó, está en `deploy/aws/README.md`.
+
 ### Apagar todo y volver a levantar
 
 ```bash
@@ -392,5 +411,6 @@ docker compose run --rm tests
 - `docs/arquitectura-y-flujos.excalidraw` — arquitectura y cada flujo paso a paso (abrir en [excalidraw.com](https://excalidraw.com) o con la extensión de VS Code)
 - `docs/especificacion-comunicaciones.md` — protocolos, mensajes y errores entre componentes
 - `docs/escalabilidad.md` — clúster de 5 DataNodes, mediciones y límites del diseño
+- `deploy/aws/README.md` — cómo levantarlo en AWS y entrar por Internet
 - `ESTADO_PROYECTO.md` — qué está hecho, qué falta y detalles de implementación
 - `docker compose logs -f cn0` — salida de un nodo

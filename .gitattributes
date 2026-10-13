@@ -1,0 +1,8 @@
+# Finales de línea LF en todos los checkouts, también en Windows con core.autocrlf: lo que
+# se copia a la imagen de Docker es idéntico para todo el equipo.
+* text=auto eol=lf
+
+# Datos y binarios: se guardan tal como están.
+*.csv -text
+*.pdf binary
+tests/fixtures/raft_legacy_9985c6d/** binary

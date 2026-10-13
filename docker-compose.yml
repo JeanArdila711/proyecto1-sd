@@ -6,9 +6,10 @@
 # su vista (./secrets/mounts/<rol>), con los archivos que usa; la carpeta entera, donde
 # está la llave de la CA, solo la ve init.
 #
-# Por qué la shell y el inspector corren dentro de la red: el ControlNode entrega las
-# direcciones de los DataNodes tal como las conoce (dn1:50061), y esos nombres solo
-# resuelven dentro de esta red.
+# La shell y el inspector de este archivo corren dentro de la red del clúster y usan las
+# direcciones internas de los DataNodes (dn1:50061), que solo resuelven ahí. Para entrar
+# desde otra máquina: docker-compose.publico.yml en el clúster y el servicio `cliente` en
+# la máquina de quien se conecta (docs/GUIA.md, "Entrar desde otra máquina").
 
 # Una sola imagen para todo. La construye solo init: si cada servicio tuviera `build`,
 # Compose construiría la misma imagen 8 veces en paralelo y chocarían entre sí.
@@ -216,9 +217,31 @@ services:
     stdin_open: true
     tty: true
     working_dir: /intercambio
+    # --internal-addresses: esta shell está dentro de la red, marca a los DataNodes por su
+    # nombre interno aunque el clúster también se anuncie hacia afuera.
     command: [python, -m, dfsha.client.distributed_shell_main, --control-nodes, "cn0:50051,cn1:50051,cn2:50051",
-              --tls-ca-file, /secrets/ca.crt, --parallel-transfers, "${DFSHA_PARALLEL_TRANSFERS:-4}"]
+              --tls-ca-file, /secrets/ca.crt, --parallel-transfers, "${DFSHA_PARALLEL_TRANSFERS:-4}",
+              --internal-addresses]
     volumes: [./intercambio:/intercambio, ./secrets/mounts/client:/secrets:ro]
+
+  # Shell desde OTRA máquina, contra un clúster levantado con docker-compose.publico.yml.
+  # No arranca ni necesita un clúster local, y no entra a la red interna:
+  #   DFSHA_CONTROL_NODES=<host>:50051,<host>:50052,<host>:50053 docker compose run --rm cliente
+  # Necesita el ca.crt de ese clúster en la carpeta DFSHA_CLIENT_SECRETS (por defecto, la
+  # del clúster local). Con otro clúster local en la misma máquina, usa una carpeta aparte.
+  cliente:
+    image: dfsha:local
+    build: .
+    profiles: [externo]
+    init: true
+    stdin_open: true
+    tty: true
+    working_dir: /intercambio
+    command: [python, -m, dfsha.client.distributed_shell_main, --control-nodes, "${DFSHA_CONTROL_NODES:-}",
+              --tls-ca-file, /secrets/ca.crt, --parallel-transfers, "${DFSHA_PARALLEL_TRANSFERS:-4}"]
+    volumes: [./intercambio:/intercambio, "${DFSHA_CLIENT_SECRETS:-./secrets/mounts/client}:/secrets:ro"]
+    # Para probar en la misma máquina del clúster: host.docker.internal es el host.
+    extra_hosts: ["host.docker.internal:host-gateway"]
 
   # docker compose run --rm inspect estado|lider|arbol|mapa|huerfanos|bloques <ruta>
   inspect:

@@ -63,6 +63,8 @@ Se evaluaron REST/HTTP, gRPC, sockets TCP y un MOM (RabbitMQ/Kafka).
 
 **Servicio:** `dfsha.control_node.ControlNodeService` (21 RPC, todos unarios). Con la autenticación activa, todos salvo `Login` exigen el token de sesión en la metadata de la llamada: `authorization: Bearer <jwt>` (§10). Los que tocan un archivo o un directorio chequean además los permisos de quien llama (§10).
 
+**Direcciones de DataNodes en las respuestas.** `BeginUpload`, `ListBlocks` y `BeginWrite` devuelven direcciones de DataNodes. Si el clúster tiene un mapeo de direcciones públicas (§9), quien llama recibe la pública de cada réplica que va a marcar él mismo. Con la metadata `dfsha-address-view: internal` recibe siempre las internas; la mandan la shell de Compose y el inspector, que corren dentro de la red.
+
 | RPC | Muta | Descripción |
 |---|:---:|---|
 | `ListDir(path)` | — | Hijos de un directorio, con dueño, grupo y modo. Solo archivos `committed`. |
@@ -381,10 +383,22 @@ sequenceDiagram
 | Entorno | Resolución de nombres | Qué se publica |
 |---|---|---|
 | **Docker Compose** | Red bridge `dfsha`: `cn0..cn2`, `dn1..dn3` | Nada. El cliente corre dentro de la red (`docker compose run shell`) |
+| **Docker Compose con `docker-compose.publico.yml`** | La misma red entre nodos | Un puerto por nodo en el host: 50051 a 50053 los ControlNodes, 50061 a 50063 los DataNodes. El de Raft no |
 | **Procesos locales** | `localhost` con puertos distintos por nodo | — |
-| **AWS** | IPs o DNS privados de la VPC | Solo lo que usen los clientes; nunca el puerto de Raft |
+| **AWS, una instancia** | La red de Docker dentro de la instancia | Los mismos seis puertos, abiertos en el security group solo a las IP de los clientes (`deploy/aws/README.md`) |
 
-**Dirección anunciada.** El ControlNode entrega al cliente las direcciones de los DataNodes **tal como están configuradas** en `--datanode-addresses`. Deben ser resolubles y alcanzables **desde el cliente**. Es la razón por la que, en Docker, la shell corre dentro de la red: `dn1:50061` no resuelve desde el host. Las mismas direcciones usa el ControlNode para `Ping`, re-replicación y recolector, así que también deben ser alcanzables desde los ControlNodes.
+**Dirección interna y dirección pública.** La dirección de `--datanode-addresses` (`dn1:50061`) es la identidad del DataNode: es la que queda en la metadata y la que usan los nodos entre sí para `Ping`, el pipeline, la re-replicación y el recolector. Solo resuelve dentro de la red del clúster.
+
+Para clientes de fuera, el ControlNode recibe un mapeo explícito `interna=pública` en `--datanode-public-addresses` (o en la variable `DFSHA_DATANODE_PUBLIC_ADDRESSES`), por ejemplo `dn1:50061=203.0.113.7:50061,dn2:50061=203.0.113.7:50062,dn3:50061=203.0.113.7:50063`. Al arrancar valida que cada par tenga esa forma, que cubra exactamente los DataNodes configurados y que no haya dos con la misma dirección pública; si algo falla, el nodo no arranca.
+
+Con el mapeo, el ControlNode traduce solo lo que el cliente va a marcar:
+
+| Respuesta | Qué se traduce |
+|---|---|
+| `ListBlocks`, y `old_addresses` de `BeginWrite` | Todas las réplicas: el cliente puede leer de cualquiera |
+| `BeginUpload`, y `new_addresses` de `BeginWrite` | Solo la primera, la cabeza del pipeline. El resto de la lista viaja como `downstream` y la usan los DataNodes entre sí, así que se queda con las direcciones internas |
+
+La metadata guardada no cambia, y un cliente que manda `dfsha-address-view: internal` recibe las direcciones sin traducir. Los ControlNodes no se traducen: el cliente ya los conoce por la dirección con la que se conectó, y sigue al líder probando esa lista. TLS no depende de la dirección, porque todos los nodos presentan el certificado `dfsha-node` y el cliente lo verifica contra ese nombre (§10).
 
 ---
 

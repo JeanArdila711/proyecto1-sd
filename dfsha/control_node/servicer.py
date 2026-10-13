@@ -4,12 +4,14 @@ import math
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Callable
 
 import grpc
 from pysyncobj import SyncObj, SyncObjException
 
 from dfsha.common import exceptions
+from dfsha.common.addresses import ADDRESS_VIEW_METADATA_KEY, INTERNAL_VIEW
 from dfsha.common.auth import (
     DEFAULT_TOKEN_TTL_S,
     Principal,
@@ -116,6 +118,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         token_ttl_s: float = DEFAULT_TOKEN_TTL_S,
         capability_key: bytes | None = None,
         capability_ttl_s: float = DEFAULT_CAPABILITY_TTL_S,
+        public_addresses: Mapping[str, str] | None = None,
     ) -> None:
         if not math.isfinite(token_ttl_s) or token_ttl_s <= 0:
             # nan e inf no son "<= 0": sin isfinite pasarían, y cada Login reventaría
@@ -157,6 +160,29 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
         # vacíos y las llamadas a los DataNodes salen sin metadata.
         self._capability_key = capability_key
         self._capability_ttl_s = capability_ttl_s
+        # D-P11. Dirección interna -> dirección por la que llega un cliente de fuera de la
+        # red del clúster. Vacío = las direcciones salen tal como están guardadas. Quien
+        # arranca el nodo ya lo validó (dfsha.common.addresses.validate_public_addresses).
+        self._public_addresses = dict(public_addresses or {})
+
+    def _for_client(self, context: grpc.ServicerContext, addresses, *, pipeline: bool = False) -> list[str]:
+        """Las direcciones de un bloque tal como las tiene que marcar quien llama (D-P11).
+
+        La metadata guarda siempre la dirección interna, que es la identidad del DataNode.
+        Con un mapeo configurado, un cliente recibe la pública de cada réplica que va a
+        marcar él mismo: todas en una lectura, y solo la cabeza en una escritura
+        (`pipeline=True`), porque el resto de la lista viaja como `downstream` y la usan
+        los DataNodes entre sí. Un cliente dentro de la red pide la vista interna con la
+        metadata `dfsha-address-view: internal`."""
+        addresses = list(addresses)
+        if not self._public_addresses:
+            return addresses
+        if dict(context.invocation_metadata()).get(ADDRESS_VIEW_METADATA_KEY) == INTERNAL_VIEW:
+            return addresses
+        # Una réplica que ya no está en la configuración sale sin traducir: el cliente no
+        # la alcanza y pasa a la siguiente, igual que con un DataNode caído.
+        translated = [self._public_addresses.get(address, address) for address in addresses]
+        return translated[:1] + addresses[1:] if pipeline else translated
 
     def close(self) -> None:
         for channel in self._channels.values():
@@ -405,7 +431,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             locations.append(
                 control_node_pb2.BlockLocation(
                     block_id=block_id,
-                    datanode_addresses=addresses,
+                    datanode_addresses=self._for_client(context, addresses, pipeline=True),
                     size_bytes=this_block_size,
                     # C3: recién firmada también en un reintento del mismo op_id
                     capability=self._block_capability(block_id, "write"),
@@ -471,7 +497,7 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
             blocks=[
                 control_node_pb2.BlockInfo(
                     block_id=b.block_id,
-                    datanode_addresses=b.datanode_addresses,
+                    datanode_addresses=self._for_client(context, b.datanode_addresses),
                     checksum=b.checksum,
                     size_bytes=b.size_bytes,
                     capability=self._block_capability(b.block_id, "read"),
@@ -584,9 +610,9 @@ class ControlNodeServicer(control_node_pb2_grpc.ControlNodeServiceServicer):
                     index=index,
                     old_block_id=old_block_id,
                     old_size=old_size,
-                    old_addresses=old_addresses,
+                    old_addresses=self._for_client(context, old_addresses),
                     new_block_id=new_block_id,
-                    new_addresses=new_addresses,
+                    new_addresses=self._for_client(context, new_addresses, pipeline=True),
                     new_size=new_size,
                     # ponytail: con `w` y sin `r`, la capability de lectura del bloque viejo
                     # igual sale: copy-on-write necesita ese contenido para completar el

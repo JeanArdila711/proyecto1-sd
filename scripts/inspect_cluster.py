@@ -148,10 +148,14 @@ def walk(stub, path: str = "/"):
 
 
 def blocks_of(stub, path: str):
+    from dfsha.common.addresses import INTERNAL_VIEW_METADATA
     from dfsha.generated import control_node_pb2
 
     request = control_node_pb2.ListBlocksRequest(path=path)
-    return list(stub.ListBlocks(request, timeout=5, metadata=_auth_metadata).blocks)
+    # D-P11: el inspector compara las réplicas contra la lista interna de DataNodes y las
+    # marca desde dentro de la red, así que pide siempre las direcciones internas.
+    metadata = (_auth_metadata or ()) + INTERNAL_VIEW_METADATA
+    return list(stub.ListBlocks(request, timeout=5, metadata=metadata).blocks)
 
 
 def replica_status(address: str, block_id: str, expected_checksum: str, capability: str = "") -> str:

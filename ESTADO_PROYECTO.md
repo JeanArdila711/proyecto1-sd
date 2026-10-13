@@ -1,6 +1,6 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-10-12, tras agregar la evidencia de escalabilidad (Hito 3, X1).
+Última actualización: 2026-10-13, tras agregar el acceso desde fuera de la red del clúster y el primer despliegue en AWS (Hito 3, D1).
 
 Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
@@ -31,13 +31,15 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | C2 — usuarios, login y token de sesión | ✅ |
 | 3 | C3 — permisos por archivo y autorización de operaciones internas | ✅ |
 | 3 | X1 — evidencia de escalabilidad: 5 DataNodes y costo de la metadata | ✅ (`docs/escalabilidad.md`) |
-| Final | Despliegue en AWS, informe, video de 10–15 min | ⬜ |
+| 3 | D1 — direcciones públicas de DataNodes y despliegue en AWS en una instancia | ✅ (`deploy/aws/README.md`) |
+| Final | AWS en tres instancias, informe, video de 10–15 min | ⬜ |
 
-874 tests en verde en macOS; dentro de la imagen de Docker, 866 en verde y 8 que se saltan porque leen `docker-compose.yml` o `.env.escala`, que no se copian a la imagen. Los tests de C2, C3 y X1 todavía no se corrieron en Windows.
+906 tests en verde en macOS; dentro de la imagen de Docker, 895 en verde y 11 que se saltan porque leen los archivos de Compose o `.env.*`, que no se copian a la imagen. Los tests de C2, C3, X1 y D1 todavía no se corrieron en Windows.
 
 ## Qué falta
 
-1. **Entrega final:** despliegue en AWS Academy (direcciones anunciadas resolubles desde el cliente, puerto de Raft solo en la red privada, relojes sincronizados entre ControlNodes y DataNodes, dueños y permisos de `secrets/` en Linux), informe técnico y video.
+1. **AWS en más de una máquina.** El clúster corre en AWS en una sola instancia, con las seis piezas en contenedores. Falta repartirlas en tres instancias, que es lo que mostraría la caída de una máquina entera, y probar el arranque en una sesión nueva del laboratorio, cuando la IP pública cambia.
+2. **Entrega final:** informe técnico y video.
 
 ## Qué está implementado
 
@@ -303,10 +305,31 @@ No cambia el comportamiento del sistema. Agrega la forma de levantar más DataNo
   - `pysyncobj` serializa con el protocolo 2 de `pickle`, unas tres veces más lento que el protocolo por defecto de Python. Cualquier estimación del snapshot hecha con `pickle.dumps` a secas queda corta.
 - **Límites que quedan declarados, sin arreglar:** la lista de DataNodes es estática (agregar uno exige editar la configuración y reiniciar los ControlNodes); no hay rebalanceo; el re-replicador elige el primer nodo vivo que no tenga el bloque, sin mirar la carga; un nodo que vuelve después de la reparación queda vacío; achicar el clúster de 5 a 3 no está probado.
 
+### Hito 3 — D1: direcciones públicas de DataNodes y AWS en una instancia
+
+- **El problema.** El ControlNode le entregaba al cliente las direcciones de los DataNodes tal como las tiene configuradas (`dn1:50061`), y ese nombre solo resuelve dentro de la red de Docker. Un cliente en otra máquina podía hacer `ls` y `mkdir`, pero no `send` ni `receive`.
+- **La dirección interna sigue siendo la identidad** del DataNode: es la que guarda la metadata y la que usan los nodos entre sí. No hay migración de datos. Lo nuevo es un mapeo explícito `interna=pública` que recibe el ControlNode (`--datanode-public-addresses`, o la variable `DFSHA_DATANODE_PUBLIC_ADDRESSES`). Al arrancar valida la forma de cada par, que cubra exactamente los DataNodes configurados y que no haya dos con la misma dirección pública; si algo falla, no arranca (`dfsha/common/addresses.py`).
+- **Qué se traduce.** Solo lo que el cliente va a marcar él mismo (`ControlNodeServicer._for_client`): todas las réplicas en una lectura, y solo la cabeza del pipeline en una escritura. El resto de la lista de una escritura viaja como `downstream` y la usan los DataNodes entre sí, así que conserva las direcciones internas. El cliente no cambió: ya marcaba solo al primero de la lista.
+- **Quien está dentro de la red pide la vista interna** con la metadata `dfsha-address-view: internal`. La mandan la shell de Compose (`--internal-addresses`) y el inspector, que compara las réplicas contra la lista interna de DataNodes. Sin esa metadata, un clúster con mapeo entrega las públicas: un cliente de fuera no tiene que configurar nada.
+- **Los ControlNodes no se traducen.** El cliente los conoce por la dirección con la que se conectó y sigue al líder probando esa lista. TLS tampoco cambia: todos los nodos presentan el certificado `dfsha-node` y se verifica contra ese nombre, no contra la dirección.
+- **Docker.** `docker-compose.publico.yml` publica un puerto por nodo y arma el mapeo con `DFSHA_PUBLIC_HOST`; los dos viven en el mismo archivo porque tienen que coincidir. El puerto de Raft no se publica. El servicio `cliente` (perfil `externo`) es una shell que no entra a la red del clúster. `.env.publico` trae los valores para probarlo todo en una sola máquina.
+- **Versiones fijas.** `requirements.txt` fija `grpcio`, `grpcio-tools`, `protobuf` y `pytest`. Estaban sin versión, y el entorno local y la imagen ya habían quedado distintos (`grpcio` 1.83.1 contra 1.84.0). Las versiones elegidas tienen binarios para macOS, Windows y Linux en Python 3.12 a 3.14.
+- **`.gitattributes`** deja los finales de línea en LF en todos los checkouts, también en Windows, para que lo que se copia a la imagen sea igual para todo el equipo.
+- **Probado en local**, con un clúster que publica sus puertos y un cliente en un contenedor fuera de su red (no resuelve `dn1` ni `cn0`): bajó lo que había subido la shell interna, subió, escribió en el medio de un archivo y lo bajó idéntico. El mismo cliente pidiendo la vista interna falla al resolver `dn2:50061`. Con `dn2` y el líder apagados siguió leyendo y escribiendo.
+- **Probado en AWS** (2026-10-13, una `t3.medium` con Ubuntu 24.04, cliente en un Mac por Internet): los seis servicios `healthy`; `login`, `send`, `ls -l` y `receive` con el archivo idéntico; el inspector dentro de la instancia muestra las tres réplicas `ok`; con `dn2` y el líder apagados el cliente siguió leyendo y escribiendo; el puerto de Raft no responde desde fuera; `secrets/` quedó con dueño `1000:1000`, que en macOS no se podía comprobar; el reloj estaba sincronizado por NTP.
+- **Límites conocidos:**
+  - Una sola instancia: tolera la caída de un nodo, no la de la máquina.
+  - La IP pública cambia cuando la instancia se apaga y se enciende. Hay que volver a levantar los ControlNodes con la IP nueva, y eso no se probó todavía.
+  - Los contenedores no tienen política de reinicio.
+  - `docker-compose.publico.yml` es para 3 DataNodes: no se combina con `.env.escala`.
+  - El mapeo no se puede cambiar sin reiniciar los ControlNodes.
+  - Una réplica cuya dirección ya no está en la configuración sale sin traducir, y el cliente de fuera la salta como si estuviera caída.
+
 ## Cosas a tener en cuenta si vas a seguir sobre este código
 
 Cosas que costó descubrir y que no vale la pena redescubrir:
 
+- **Toda respuesta nueva del ControlNode que lleve direcciones de DataNodes pasa por `self._for_client(context, ...)`.** Si no, un cliente de fuera de la red recibe un nombre que no resuelve. Con `pipeline=True` solo se traduce la primera dirección.
 - **Todo RPC nuevo del ControlNode empieza con `self._authenticate(context)`.** `tests/test_auth_servicer.py` recorre los RPC del `.proto` y falla si uno responde sin token. Los únicos públicos están en `PUBLIC_RPCS`, en ese mismo test; agregar uno ahí es una decisión de seguridad.
 - **Después de bajar cambios que tocan dependencias o un `.proto`:** `pip install -r requirements.txt` y `python scripts/generate_proto.py`. Sin lo primero, toda la suite falla al importar `jwt`; sin lo segundo, con `AttributeError` sobre los mensajes nuevos.
 - **Un secreto nuevo se agrega en dos lugares de `scripts/generate_secrets.py`:** donde se crea y en `mount_views()`, que dice qué rol lo ve. Si no está en una vista, ningún contenedor lo recibe.

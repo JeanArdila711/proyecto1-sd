@@ -11,8 +11,11 @@ def build_client(
     control_node_addresses: list[str],
     tls: TlsConfig | None = None,
     parallel_transfers: int = DEFAULT_PARALLEL_TRANSFERS,
+    internal_addresses: bool = False,
 ) -> DistributedDFShaClient:
-    return DistributedDFShaClient(control_node_addresses, tls=tls, parallel_transfers=parallel_transfers)
+    return DistributedDFShaClient(
+        control_node_addresses, tls=tls, parallel_transfers=parallel_transfers, internal_addresses=internal_addresses
+    )
 
 
 def main() -> None:
@@ -29,6 +32,13 @@ def main() -> None:
         default=DEFAULT_PARALLEL_TRANSFERS,
         help="bloques que send y receive transfieren a la vez",
     )
+    parser.add_argument(
+        "--internal-addresses",
+        action="store_true",
+        help="pide las direcciones internas de los DataNodes: para una shell que corre dentro "
+        "de la red del clúster. Sin esta opción, un clúster que se anuncia hacia afuera "
+        "entrega las públicas",
+    )
     add_tls_arguments(parser, server=False)
     args = parser.parse_args()
 
@@ -37,7 +47,9 @@ def main() -> None:
         raise SystemExit("--control-nodes no puede quedar vacío")
     if args.parallel_transfers < 1:
         raise SystemExit("--parallel-transfers debe ser >= 1")
-    client = build_client(addresses, tls_from_args(args, server=False), args.parallel_transfers)
+    client = build_client(
+        addresses, tls_from_args(args, server=False), args.parallel_transfers, args.internal_addresses
+    )
     try:
         run_repl(client)
     finally:

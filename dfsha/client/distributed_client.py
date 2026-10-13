@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import grpc
 
+from dfsha.common.addresses import INTERNAL_VIEW_METADATA
 from dfsha.common.block_token import capability_kwargs
 from dfsha.common.exceptions import (
     AccessDeniedError,
@@ -231,6 +232,7 @@ class DistributedDFShaClient:
         minimum_transfer_throughput_bytes_per_s: float = DEFAULT_MIN_TRANSFER_THROUGHPUT_BYTES_PER_S,
         tls: TlsConfig | None = None,
         parallel_transfers: int = DEFAULT_PARALLEL_TRANSFERS,
+        internal_addresses: bool = False,
     ) -> None:
         if isinstance(control_node_addresses, str):
             # un str se iteraría letra por letra como si fueran direcciones
@@ -264,6 +266,9 @@ class DistributedDFShaClient:
         # Sesión (C2). El token vive solo en memoria y la contraseña no se guarda: cuando
         # el token vence, hay que volver a llamar login(). None = sin sesión.
         self._auth_metadata: tuple[tuple[str, str], ...] | None = None
+        # D-P11. Un cliente dentro de la red del clúster pide las direcciones internas de
+        # los DataNodes; uno de fuera recibe las públicas sin pedir nada.
+        self._view_metadata = INTERNAL_VIEW_METADATA if internal_addresses else ()
         self.username: str | None = None
         self.groups: tuple[str, ...] = ()
         self.is_admin = False
@@ -301,7 +306,9 @@ class DistributedDFShaClient:
                     # y el que renueva locks. Un UNAUTHENTICATED no es reintentable: los tres
                     # nodos comparten el secreto, probar otro no cambia nada.
                     response = getattr(stub, rpc_name)(
-                        request, timeout=self._rpc_timeout_s, metadata=self._auth_metadata
+                        request,
+                        timeout=self._rpc_timeout_s,
+                        metadata=(self._auth_metadata or ()) + self._view_metadata or None,
                     )
                 except grpc.RpcError as exc:
                     if exc.code() not in _RETRYABLE_CODES:

@@ -3,13 +3,16 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import threading
+from collections.abc import Mapping
 from concurrent import futures
 from pathlib import Path
 
 import grpc
 from pysyncobj import SyncObj, SyncObjConf
 
+from dfsha.common.addresses import parse_public_addresses, validate_public_addresses
 from dfsha.common.auth import DEFAULT_TOKEN_TTL_S, MIN_JWT_SECRET_BYTES, hash_password
 from dfsha.common.block_token import DEFAULT_CAPABILITY_TTL_S, load_capability_key
 from dfsha.common.tls import TlsConfig, add_port, add_tls_arguments, channel_factory, tls_from_args
@@ -138,6 +141,7 @@ def serve(
     token_ttl_s: float = DEFAULT_TOKEN_TTL_S,
     capability_key: bytes | None = None,
     capability_ttl_s: float = DEFAULT_CAPABILITY_TTL_S,
+    public_addresses: Mapping[str, str] | None = None,
 ) -> tuple[grpc.Server, int, SyncObj]:
     """Arranca un ControlNode: su nodo Raft, su servidor gRPC y el monitor local de
     DataNodes, que se detiene junto con el servidor.
@@ -152,8 +156,14 @@ def serve(
 
     capability_key=None deja el nodo sin capabilities (tests y desarrollo): las respuestas
     no las traen y las llamadas a los DataNodes salen sin metadata.
+
+    public_addresses (D-P11) es el mapeo dirección interna -> dirección pública de cada
+    DataNode. Con él, un cliente recibe la pública de las réplicas que marca él mismo; el
+    tráfico entre nodos sigue usando las internas. Vacío = el clúster no se anuncia hacia
+    afuera y todo sale con la dirección interna.
     """
     validate_datanode_configuration(datanode_addresses, replication_factor, min_write_replicas)
+    validate_public_addresses(public_addresses or {}, datanode_addresses)
     replicated = ReplicatedTree()
     raft = SyncObj(
         raft_self,
@@ -187,6 +197,7 @@ def serve(
         token_ttl_s=token_ttl_s,
         capability_key=capability_key,
         capability_ttl_s=capability_ttl_s,
+        public_addresses=public_addresses,
     )
     control_node_pb2_grpc.add_ControlNodeServiceServicer_to_server(servicer, server)
     rereplicator = ReReplicator(
@@ -267,6 +278,13 @@ def main() -> None:
     parser.add_argument("--raft-cluster", required=True)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--datanode-addresses", required=True)
+    parser.add_argument(
+        "--datanode-public-addresses",
+        default=os.environ.get("DFSHA_DATANODE_PUBLIC_ADDRESSES", ""),
+        help="mapeo interna=pública de cada DataNode, separado por comas, para clientes de "
+        "fuera de la red del clúster (ej. dn1:50061=203.0.113.7:50061). Por defecto, la "
+        "variable DFSHA_DATANODE_PUBLIC_ADDRESSES; vacío = no se anuncia hacia afuera",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--block-size-mb", type=int, default=128)
@@ -378,6 +396,8 @@ def main() -> None:
         raise SystemExit("--raft-cluster tiene direcciones repetidas")
     try:
         validate_datanode_configuration(addresses, args.replication_factor, args.min_write_replicas)
+        public_addresses = parse_public_addresses(args.datanode_public_addresses)
+        validate_public_addresses(public_addresses, addresses)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -409,6 +429,7 @@ def main() -> None:
         token_ttl_s=args.token_ttl_s,
         capability_key=capability_key,
         capability_ttl_s=args.capability_ttl_s,
+        public_addresses=public_addresses,
     )
     if bound_port == 0:
         raise RuntimeError(f"no se pudo abrir el puerto {args.port} en {args.host} (¿ya está en uso?)")
@@ -417,7 +438,8 @@ def main() -> None:
         f"Raft={raft_self} peers={raft_peers}, DataNodes={addresses}, "
         f"factor={args.replication_factor}, mínimo escritura={args.min_write_replicas}, "
         f"TLS={tls is not None}, Raft cifrado={raft_password is not None}, "
-        f"autenticación={jwt_secret is not None}, capabilities={capability_key is not None}"
+        f"autenticación={jwt_secret is not None}, capabilities={capability_key is not None}, "
+        f"direcciones públicas={public_addresses or 'no'}"
     )
     try:
         server.wait_for_termination()

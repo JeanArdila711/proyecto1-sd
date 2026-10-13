@@ -1,6 +1,9 @@
+# Versiones fijas: todo el equipo y la imagen de Docker instalan exactamente lo mismo.
+# Al subir una, correr la suite completa en local y dentro de la imagen.
 cryptography==50.0.1
-grpcio
-grpcio-tools
+grpcio==1.84.0
+grpcio-tools==1.84.0
+protobuf==7.36.2
 PyJWT==2.15.1
 pysyncobj==0.3.17
-pytest
+pytest==9.1.1

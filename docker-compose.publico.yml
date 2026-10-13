@@ -1,0 +1,39 @@
+# Abre el clúster a clientes de fuera de la red de Docker: otra máquina o Internet.
+#
+#   DFSHA_PUBLIC_HOST=<IP o DNS por el que los clientes llegan a esta máquina> \
+#     docker compose -f docker-compose.yml -f docker-compose.publico.yml up -d --build
+#
+# Hace dos cosas que tienen que coincidir, y por eso viven en el mismo archivo:
+#   1. publica en el host un puerto por nodo;
+#   2. les pasa a los ControlNodes el mapeo interna=pública de cada DataNode, para que le
+#      entreguen a un cliente de fuera la dirección por la que sí llega (D-P11).
+# Los nodos se siguen hablando entre sí por la red interna, con los nombres de siempre.
+#
+# El puerto de Raft (6000) no se publica: solo lo usan los ControlNodes entre ellos.
+# DFSHA_BIND_IP limita en qué interfaz del host se abren los puertos; para probar en tu
+# propia máquina sin exponer el clúster a la red local, usa 127.0.0.1.
+#
+# Solo para el clúster de 3 DataNodes: no se combina con .env.escala.
+
+x-mapeo: &mapeo
+  DFSHA_DATANODE_PUBLIC_ADDRESSES: >-
+    dn1:50061=${DFSHA_PUBLIC_HOST:?falta DFSHA_PUBLIC_HOST, la IP o el DNS por el que los clientes llegan a esta máquina}:50061,
+    dn2:50061=${DFSHA_PUBLIC_HOST}:50062,
+    dn3:50061=${DFSHA_PUBLIC_HOST}:50063
+
+services:
+  cn0:
+    ports: ["${DFSHA_BIND_IP:-0.0.0.0}:50051:50051"]
+    environment: *mapeo
+  cn1:
+    ports: ["${DFSHA_BIND_IP:-0.0.0.0}:50052:50051"]
+    environment: *mapeo
+  cn2:
+    ports: ["${DFSHA_BIND_IP:-0.0.0.0}:50053:50051"]
+    environment: *mapeo
+  dn1:
+    ports: ["${DFSHA_BIND_IP:-0.0.0.0}:50061:50061"]
+  dn2:
+    ports: ["${DFSHA_BIND_IP:-0.0.0.0}:50062:50061"]
+  dn3:
+    ports: ["${DFSHA_BIND_IP:-0.0.0.0}:50063:50061"]
