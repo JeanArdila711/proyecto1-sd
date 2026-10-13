@@ -345,6 +345,19 @@ docker compose run --rm inspect huerfanos
 
 Muestra, por DataNode, los bloques en uso, los que no tienen uso pero son recientes, y los que el recolector va a borrar en su próximo ciclo.
 
+### Más DataNodes
+
+```bash
+docker compose --env-file .env --env-file .env.escala up -d
+docker compose --env-file .env --env-file .env.escala ps                        # 8 servicios: se suman dn4 y dn5
+# en la shell: send /intercambio/tesis.pdf /docs/con-cinco.pdf
+docker compose --env-file .env --env-file .env.escala run --rm inspect mapa     # los bloques nuevos caen en los 5
+docker compose --env-file .env --env-file .env.escala stop dn5
+docker compose --env-file .env --env-file .env.escala run --rm inspect mapa     # las copias de dn5 reaparecen en otro nodo
+```
+
+`.env.escala` activa `dn4` y `dn5` y les pasa la lista de 5 a los ControlNodes, que se reinician. Los datos y las llaves que ya había se conservan. Los bloques viejos no se mueven a los nodos nuevos. Mientras uses 5 DataNodes, todos los comandos de Compose llevan los dos `--env-file`; volver a 3 no está probado. Qué se midió y hasta dónde llega: `docs/escalabilidad.md`.
+
 ### Apagar todo y volver a levantar
 
 ```bash
@@ -378,5 +391,6 @@ docker compose run --rm tests
 
 - `docs/arquitectura-y-flujos.excalidraw` — arquitectura y cada flujo paso a paso (abrir en [excalidraw.com](https://excalidraw.com) o con la extensión de VS Code)
 - `docs/especificacion-comunicaciones.md` — protocolos, mensajes y errores entre componentes
+- `docs/escalabilidad.md` — clúster de 5 DataNodes, mediciones y límites del diseño
 - `ESTADO_PROYECTO.md` — qué está hecho, qué falta y detalles de implementación
 - `docker compose logs -f cn0` — salida de un nodo

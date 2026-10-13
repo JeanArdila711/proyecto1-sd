@@ -1,6 +1,6 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-10-08, tras agregar permisos por archivo y capabilities de bloque (Hito 3, C3).
+Última actualización: 2026-10-12, tras agregar la evidencia de escalabilidad (Hito 3, X1).
 
 Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
@@ -30,9 +30,10 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | Transferencia paralela de bloques en `send`/`receive` | ✅ |
 | 3 | C2 — usuarios, login y token de sesión | ✅ |
 | 3 | C3 — permisos por archivo y autorización de operaciones internas | ✅ |
+| 3 | X1 — evidencia de escalabilidad: 5 DataNodes y costo de la metadata | ✅ (`docs/escalabilidad.md`) |
 | Final | Despliegue en AWS, informe, video de 10–15 min | ⬜ |
 
-854 tests en verde en macOS; dentro de la imagen de Docker, 849 en verde y 5 que se saltan porque leen `docker-compose.yml`, que no se copia a la imagen. Los tests de C2 y C3 todavía no se corrieron en Windows.
+874 tests en verde en macOS; dentro de la imagen de Docker, 866 en verde y 8 que se saltan porque leen `docker-compose.yml` o `.env.escala`, que no se copian a la imagen. Los tests de C2, C3 y X1 todavía no se corrieron en Windows.
 
 ## Qué falta
 
@@ -289,13 +290,26 @@ Revisión de las diez entregas de Jean (P0, S2, A1, B1, A2, B2, B3, A3, S1, C4) 
   - Un rechazo de capability aguas abajo del pipeline sigue saliendo como `UNAVAILABLE` (solo pasa con claves distintas entre DataNodes o relojes desfasados), y con las claves desalineadas el re-replicador reintenta en cada ciclo.
   - Los dueños y permisos de `secrets/` en Linux no se pudieron probar en macOS (Docker Desktop no los aplica); queda para el despliegue.
 
+### Hito 3 — X1: evidencia de escalabilidad
+
+No cambia el comportamiento del sistema. Agrega la forma de levantar más DataNodes y dos scripts de medición. Resultados, tablas y análisis: `docs/escalabilidad.md`.
+
+- **Clúster de 5 DataNodes.** `dn4` y `dn5` están en `docker-compose.yml` bajo el perfil `escala`. `.env.escala` activa el perfil y define `DFSHA_DATANODE_COUNT` y `DFSHA_DATANODES`, que leen `init`, los tres ControlNodes y el inspector. Sin ese archivo todo queda como antes, con 3. `scripts/generate_secrets.py --datanodes N` crea las llaves y vistas que falten y no toca las que existen.
+- **`scripts/medir_escalabilidad.py`** arma un `ControlTree` real con N archivos sintéticos (semilla fija) y mide memoria, `iter_blocks`, `referenced_blocks`, un ciclo del re-replicador y el snapshot como lo escribe `pysyncobj`. **`scripts/medir_snapshot_raft.py`** levanta tres nodos Raft reales y cuenta las elecciones que provoca el snapshot del líder.
+- **Probado en Docker** (proyecto aparte, bloques de 1 MB): un clúster de 3 con datos crece a 5 sin perder datos ni llaves; las subidas nuevas se reparten entre los 5; al apagar `dn5`, sus 24 copias reaparecen en otros nodos en 13 s con los tiempos de demo y los archivos bajan idénticos.
+- **Lo que encontró la medición:**
+  - La metadata ocupa unos 430 bytes por bloque. Los recorridos completos son lineales, pero el recolector de basura de Python los vuelve más caros a medida que crece el árbol: con 200.000 archivos, `iter_blocks` tarda 0,41 s, y tres cuartas partes son del recolector.
+  - **El snapshot de Raft corre en el hilo que manda los heartbeats** (`useFork=False`) y tarda 0,4 s con 25.000 archivos y 3,2 s con 200.000. Desde 50.000 archivos, la mitad o más de los snapshots del líder terminan en elección. No se pierden datos; el clúster cambia de líder cada pocos minutos. Medido con Raft solo, no con el clúster completo.
+  - `pysyncobj` serializa con el protocolo 2 de `pickle`, unas tres veces más lento que el protocolo por defecto de Python. Cualquier estimación del snapshot hecha con `pickle.dumps` a secas queda corta.
+- **Límites que quedan declarados, sin arreglar:** la lista de DataNodes es estática (agregar uno exige editar la configuración y reiniciar los ControlNodes); no hay rebalanceo; el re-replicador elige el primer nodo vivo que no tenga el bloque, sin mirar la carga; un nodo que vuelve después de la reparación queda vacío; achicar el clúster de 5 a 3 no está probado.
+
 ## Cosas a tener en cuenta si vas a seguir sobre este código
 
 Cosas que costó descubrir y que no vale la pena redescubrir:
 
 - **Todo RPC nuevo del ControlNode empieza con `self._authenticate(context)`.** `tests/test_auth_servicer.py` recorre los RPC del `.proto` y falla si uno responde sin token. Los únicos públicos están en `PUBLIC_RPCS`, en ese mismo test; agregar uno ahí es una decisión de seguridad.
 - **Después de bajar cambios que tocan dependencias o un `.proto`:** `pip install -r requirements.txt` y `python scripts/generate_proto.py`. Sin lo primero, toda la suite falla al importar `jwt`; sin lo segundo, con `AttributeError` sobre los mensajes nuevos.
-- **Un secreto nuevo se agrega en dos lugares de `scripts/generate_secrets.py`:** donde se crea y en `MOUNT_VIEWS`, que dice qué rol lo ve. Si no está en una vista, ningún contenedor lo recibe.
+- **Un secreto nuevo se agrega en dos lugares de `scripts/generate_secrets.py`:** donde se crea y en `mount_views()`, que dice qué rol lo ve. Si no está en una vista, ningún contenedor lo recibe.
 - **La deduplicación por `op_id` no vuelve a mirar permisos.** Devuelve el resultado guardado tal cual. Por eso `_commit` le pone delante el usuario a la clave: cualquier mecanismo nuevo que cachee resultados de una operación autorizada tiene que incluir a quien llama en la clave.
 - **Toda mutación que llegue a un RPC recibe a quien llama (`caller`) como último argumento opcional, con default `None`.** `tests/test_permissions_tree.py::test_every_mutation_receives_the_caller_or_is_explicitly_exempt` recorre `MUTATIONS` y falla si una no lo tiene y no está en la lista de exentas del test; agregar una ahí es una decisión de seguridad, con el motivo escrito.
 - **Toda llamada a un DataNode pasa por `capability_kwargs()`** (`dfsha/common/block_token.py`), que devuelve `{}` sin capability. Con la clave activa, una llamada sin capability se rechaza; y pasar `metadata` siempre, aunque esté vacía, rompería los stubs falsos de los tests, que no la aceptan. Las capabilities se firman fuera de `apply()`, con `time.time()`, y nunca van a un log ni a un mensaje de error.

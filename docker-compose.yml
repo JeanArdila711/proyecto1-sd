@@ -61,7 +61,8 @@ services:
     build: .
     pull_policy: build
     user: "0:0"
-    command: [python, scripts/generate_secrets.py, --dir, /secrets, --owner, "1000:1000", --writable-dir, /intercambio]
+    command: [python, scripts/generate_secrets.py, --dir, /secrets, --owner, "1000:1000", --writable-dir, /intercambio,
+              --datanodes, "${DFSHA_DATANODE_COUNT:-3}"]
     volumes: [./secrets:/secrets, ./intercambio:/intercambio]
 
   dn1:
@@ -86,6 +87,27 @@ services:
               --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
     volumes: [dn3-data:/data, ./secrets/mounts/dn3:/secrets:ro]
 
+  # Dos DataNodes más, solo con el perfil `escala` (evidencia de escalabilidad, docs/escalabilidad.md).
+  # La lista de DataNodes es estática: para que los ControlNodes los usen hay que pasarles
+  # la lista nueva (DFSHA_DATANODES) y reiniciarlos. Todo eso lo trae .env.escala:
+  #   docker compose --env-file .env --env-file .env.escala up -d
+  dn4:
+    <<: *datanode
+    profiles: [escala]
+    hostname: dn4
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn4.key,
+              --capability-key-file, /secrets/capability.key,
+              --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
+    volumes: [dn4-data:/data, ./secrets/mounts/dn4:/secrets:ro]
+  dn5:
+    <<: *datanode
+    profiles: [escala]
+    hostname: dn5
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061", --encryption-key-file, /secrets/dn5.key,
+              --capability-key-file, /secrets/capability.key,
+              --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
+    volumes: [dn5-data:/data, ./secrets/mounts/dn5:/secrets:ro]
+
   cn0:
     <<: *controlnode
     hostname: cn0
@@ -97,7 +119,7 @@ services:
       - --port=50051
       - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
       - --data-dir=/raft
-      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --datanode-addresses=${DFSHA_DATANODES:-dn1:50061,dn2:50061,dn3:50061}
       - --block-size-mb=${DFSHA_BLOCK_MB:-128}
       - --replication-factor=${DFSHA_REPLICATION:-3}
       - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
@@ -130,7 +152,7 @@ services:
       - --port=50051
       - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
       - --data-dir=/raft
-      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --datanode-addresses=${DFSHA_DATANODES:-dn1:50061,dn2:50061,dn3:50061}
       - --block-size-mb=${DFSHA_BLOCK_MB:-128}
       - --replication-factor=${DFSHA_REPLICATION:-3}
       - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
@@ -163,7 +185,7 @@ services:
       - --port=50051
       - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
       - --data-dir=/raft
-      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --datanode-addresses=${DFSHA_DATANODES:-dn1:50061,dn2:50061,dn3:50061}
       - --block-size-mb=${DFSHA_BLOCK_MB:-128}
       - --replication-factor=${DFSHA_REPLICATION:-3}
       - --min-write-replicas=${DFSHA_MIN_WRITE_REPLICAS:-2}
@@ -209,6 +231,7 @@ services:
     volumes: [./secrets/mounts/inspect:/secrets:ro]
     environment:
       DFSHA_GC_GRACE_S: ${DFSHA_GC_GRACE_S:-1200}   # para que `huerfanos` use la misma gracia que el recolector
+      DFSHA_DATANODES: ${DFSHA_DATANODES:-}         # la misma lista de DataNodes que los ControlNodes
 
   tests:
     <<: *dfsha
@@ -222,6 +245,8 @@ volumes:
   dn1-data:
   dn2-data:
   dn3-data:
+  dn4-data:
+  dn5-data:
   cn0-raft:
   cn1-raft:
   cn2-raft:

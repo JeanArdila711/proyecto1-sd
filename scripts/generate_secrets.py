@@ -35,20 +35,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dfsha.common.tls import generate_ca, issue_node_cert  # noqa: E402
 
-_DATANODE_KEYS = ("dn1.key", "dn2.key", "dn3.key")
+DEFAULT_DATANODES = 3
 _AUTH_SECRETS = ("jwt.secret", "admin.password", "capability.key")
 _NODE_TLS = ("ca.crt", "node.crt", "node.key")
 
-# Qué archivos de secrets/ ve cada rol. ca.key no está en ninguna vista: solo hace falta
-# para emitir certificados, y eso lo hace este script.
-MOUNT_VIEWS = {
-    "dn1": (*_NODE_TLS, "dn1.key", "capability.key"),
-    "dn2": (*_NODE_TLS, "dn2.key", "capability.key"),
-    "dn3": (*_NODE_TLS, "dn3.key", "capability.key"),
-    "control": (*_NODE_TLS, "raft.password", *_AUTH_SECRETS),
-    "client": ("ca.crt",),
-    "inspect": ("ca.crt", "admin.password"),
-}
+
+def mount_views(datanodes: int = DEFAULT_DATANODES) -> dict[str, tuple[str, ...]]:
+    """Qué archivos de secrets/ ve cada rol, con `datanodes` DataNodes (dn1, dn2, ...).
+    ca.key no está en ninguna vista: solo hace falta para emitir certificados, y eso lo
+    hace este script."""
+    views = {f"dn{i}": (*_NODE_TLS, f"dn{i}.key", "capability.key") for i in range(1, datanodes + 1)}
+    views["control"] = (*_NODE_TLS, "raft.password", *_AUTH_SECRETS)
+    views["client"] = ("ca.crt",)
+    views["inspect"] = ("ca.crt", "admin.password")
+    return views
+
+
+# Las vistas del clúster por defecto, con 3 DataNodes.
+MOUNT_VIEWS = mount_views()
 
 
 def _write(path: Path, content: bytes, mode: int, force: bool) -> bool:
@@ -80,15 +84,20 @@ def _chown(path: Path, owner: tuple[int, int] | None) -> None:
         print(f"  aviso: no se pudo cambiar el dueño de {path}: {exc}")
 
 
-def generate(secrets_dir: Path, force: bool = False, owner: tuple[int, int] | None = None) -> None:
+def generate(
+    secrets_dir: Path,
+    force: bool = False,
+    owner: tuple[int, int] | None = None,
+    datanodes: int = DEFAULT_DATANODES,
+) -> None:
     secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         secrets_dir.chmod(0o700)  # si Docker la creó antes, quedó 0755
     except OSError:
         pass
 
-    for name in _DATANODE_KEYS:
-        _write(secrets_dir / name, os.urandom(32), 0o600, force)
+    for i in range(1, datanodes + 1):
+        _write(secrets_dir / f"dn{i}.key", os.urandom(32), 0o600, force)
 
     _write(secrets_dir / "raft.password", secrets.token_hex(32).encode(), 0o600, force)
 
@@ -125,18 +134,21 @@ def generate_auth_secrets(
         _chown(secrets_dir / name, owner)
 
 
-def sync_mount_views(secrets_dir: Path, owner: tuple[int, int] | None = None) -> None:
+def sync_mount_views(
+    secrets_dir: Path, owner: tuple[int, int] | None = None, datanodes: int = DEFAULT_DATANODES
+) -> None:
     """Deja en secrets/mounts/<vista>/ una copia de lo que usa cada rol.
 
     Se montan carpetas y no archivos sueltos: si Docker tiene que crear el origen de un
     montaje que todavía no existe, crea una carpeta, y acá eso es justo lo correcto. Por
     lo mismo, la carpeta de una vista nunca se borra ni se recrea: un contenedor que ya
     la tiene montada seguiría viendo la vieja."""
-    missing = sorted({name for names in MOUNT_VIEWS.values() for name in names if not (secrets_dir / name).is_file()})
+    views = mount_views(datanodes)
+    missing = sorted({name for names in views.values() for name in names if not (secrets_dir / name).is_file()})
     if missing:
         raise FileNotFoundError(f"faltan secretos en {secrets_dir}: {', '.join(missing)}")
     mounts = secrets_dir / "mounts"
-    for view, names in MOUNT_VIEWS.items():
+    for view, names in views.items():
         view_dir = mounts / view
         view_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         for name in names:
@@ -175,12 +187,18 @@ def main() -> None:
         "--writable-dir", action="append", default=[], type=Path,
         help="carpeta montada que el contenedor tiene que poder escribir",
     )
+    parser.add_argument(
+        "--datanodes", type=int, default=DEFAULT_DATANODES,
+        help="cuántos DataNodes tiene el clúster: crea dn1.key ... dnN.key y sus vistas",
+    )
     args = parser.parse_args()
+    if args.datanodes < 1:
+        raise SystemExit("--datanodes debe ser >= 1")
 
     print(f"Secretos en {args.dir}:")
-    generate(Path(args.dir), args.force, args.owner)
+    generate(Path(args.dir), args.force, args.owner, args.datanodes)
     generate_auth_secrets(Path(args.dir), args.force, args.owner)
-    sync_mount_views(Path(args.dir), args.owner)
+    sync_mount_views(Path(args.dir), args.owner, args.datanodes)
     for path in args.writable_dir:
         _prepare_writable_dir(path, args.owner)
     print("  listo")

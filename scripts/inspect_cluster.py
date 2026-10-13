@@ -27,7 +27,8 @@ import sys
 from pathlib import Path
 
 DEFAULT_CN = "cn0:50051,cn1:50051,cn2:50051"
-DEFAULT_DN = "dn1:50061,dn2:50061,dn3:50061"
+# DFSHA_DATANODES: la misma lista que reciben los ControlNodes (ver .env.escala)
+DEFAULT_DN = os.environ.get("DFSHA_DATANODES") or "dn1:50061,dn2:50061,dn3:50061"
 
 
 def _load_repo(repo: Path):
