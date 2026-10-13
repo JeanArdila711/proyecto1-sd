@@ -25,3 +25,5 @@ nul
 .idea/
 # Carpeta compartida con la shell de Docker (docker compose run shell)
 intercambio/
+# Configuración de cada instancia de AWS: la escribe deploy/aws/levantar.sh
+deploy/aws/.env

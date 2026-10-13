@@ -386,6 +386,7 @@ sequenceDiagram
 | **Docker Compose con `docker-compose.publico.yml`** | La misma red entre nodos | Un puerto por nodo en el host: 50051 a 50053 los ControlNodes, 50061 a 50063 los DataNodes. El de Raft no |
 | **Procesos locales** | `localhost` con puertos distintos por nodo | — |
 | **AWS, una instancia** | La red de Docker dentro de la instancia | Los mismos seis puertos, abiertos en el security group solo a las IP de los clientes (`deploy/aws/README.md`) |
+| **AWS, tres instancias** | Los mismos nombres, resueltos en cada contenedor a la IP privada de la instancia de cada nodo (`extra_hosts`, con la red de la instancia) | 50051 y 50061 de cada instancia a las IP de los clientes. El 6000 de Raft, solo entre las instancias |
 
 **Dirección interna y dirección pública.** La dirección de `--datanode-addresses` (`dn1:50061`) es la identidad del DataNode: es la que queda en la metadata y la que usan los nodos entre sí para `Ping`, el pipeline, la re-replicación y el recolector. Solo resuelve dentro de la red del clúster.
 

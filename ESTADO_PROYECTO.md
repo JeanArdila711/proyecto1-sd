@@ -1,6 +1,6 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-10-13, tras agregar el acceso desde fuera de la red del clúster y el primer despliegue en AWS (Hito 3, D1).
+Última actualización: 2026-10-13, tras agregar el acceso desde fuera de la red del clúster y el despliegue en AWS en tres instancias (Hito 3, D1).
 
 Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
@@ -31,14 +31,14 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | C2 — usuarios, login y token de sesión | ✅ |
 | 3 | C3 — permisos por archivo y autorización de operaciones internas | ✅ |
 | 3 | X1 — evidencia de escalabilidad: 5 DataNodes y costo de la metadata | ✅ (`docs/escalabilidad.md`) |
-| 3 | D1 — direcciones públicas de DataNodes y despliegue en AWS en una instancia | ✅ (`deploy/aws/README.md`) |
-| Final | AWS en tres instancias, informe, video de 10–15 min | ⬜ |
+| 3 | D1 — direcciones públicas de DataNodes y despliegue en AWS en tres instancias | ✅ (`deploy/aws/README.md`) |
+| Final | Informe, video de 10–15 min | ⬜ |
 
-906 tests en verde en macOS; dentro de la imagen de Docker, 895 en verde y 11 que se saltan porque leen los archivos de Compose o `.env.*`, que no se copian a la imagen. Los tests de C2, C3, X1 y D1 todavía no se corrieron en Windows.
+918 tests en verde en macOS; dentro de la imagen de Docker, 895 en verde y 23 que se saltan porque leen los archivos de Compose, `.env.*` o `deploy/`, que no se copian a la imagen. Los tests de C2, C3, X1 y D1 todavía no se corrieron en Windows.
 
 ## Qué falta
 
-1. **AWS en más de una máquina.** El clúster corre en AWS en una sola instancia, con las seis piezas en contenedores. Falta repartirlas en tres instancias, que es lo que mostraría la caída de una máquina entera, y probar el arranque en una sesión nueva del laboratorio, cuando la IP pública cambia.
+1. **Dos pruebas de AWS.** El clúster corre en tres instancias. Falta apagar una instancia entera desde AWS (la caída de una máquina se probó deteniendo sus dos contenedores) y probar el arranque en una sesión nueva del laboratorio, cuando las IP públicas cambian.
 2. **Entrega final:** informe técnico y video.
 
 ## Qué está implementado
@@ -305,7 +305,7 @@ No cambia el comportamiento del sistema. Agrega la forma de levantar más DataNo
   - `pysyncobj` serializa con el protocolo 2 de `pickle`, unas tres veces más lento que el protocolo por defecto de Python. Cualquier estimación del snapshot hecha con `pickle.dumps` a secas queda corta.
 - **Límites que quedan declarados, sin arreglar:** la lista de DataNodes es estática (agregar uno exige editar la configuración y reiniciar los ControlNodes); no hay rebalanceo; el re-replicador elige el primer nodo vivo que no tenga el bloque, sin mirar la carga; un nodo que vuelve después de la reparación queda vacío; achicar el clúster de 5 a 3 no está probado.
 
-### Hito 3 — D1: direcciones públicas de DataNodes y AWS en una instancia
+### Hito 3 — D1: direcciones públicas de DataNodes y AWS en tres instancias
 
 - **El problema.** El ControlNode le entregaba al cliente las direcciones de los DataNodes tal como las tiene configuradas (`dn1:50061`), y ese nombre solo resuelve dentro de la red de Docker. Un cliente en otra máquina podía hacer `ls` y `mkdir`, pero no `send` ni `receive`.
 - **La dirección interna sigue siendo la identidad** del DataNode: es la que guarda la metadata y la que usan los nodos entre sí. No hay migración de datos. Lo nuevo es un mapeo explícito `interna=pública` que recibe el ControlNode (`--datanode-public-addresses`, o la variable `DFSHA_DATANODE_PUBLIC_ADDRESSES`). Al arrancar valida la forma de cada par, que cubra exactamente los DataNodes configurados y que no haya dos con la misma dirección pública; si algo falla, no arranca (`dfsha/common/addresses.py`).
@@ -316,11 +316,14 @@ No cambia el comportamiento del sistema. Agrega la forma de levantar más DataNo
 - **Versiones fijas.** `requirements.txt` fija `grpcio`, `grpcio-tools`, `protobuf` y `pytest`. Estaban sin versión, y el entorno local y la imagen ya habían quedado distintos (`grpcio` 1.83.1 contra 1.84.0). Las versiones elegidas tienen binarios para macOS, Windows y Linux en Python 3.12 a 3.14.
 - **`.gitattributes`** deja los finales de línea en LF en todos los checkouts, también en Windows, para que lo que se copia a la imagen sea igual para todo el equipo.
 - **Probado en local**, con un clúster que publica sus puertos y un cliente en un contenedor fuera de su red (no resuelve `dn1` ni `cn0`): bajó lo que había subido la shell interna, subió, escribió en el medio de un archivo y lo bajó idéntico. El mismo cliente pidiendo la vista interna falla al resolver `dn2:50061`. Con `dn2` y el líder apagados siguió leyendo y escribiendo.
-- **Probado en AWS** (2026-10-13, una `t3.medium` con Ubuntu 24.04, cliente en un Mac por Internet): los seis servicios `healthy`; `login`, `send`, `ls -l` y `receive` con el archivo idéntico; el inspector dentro de la instancia muestra las tres réplicas `ok`; con `dn2` y el líder apagados el cliente siguió leyendo y escribiendo; el puerto de Raft no responde desde fuera; `secrets/` quedó con dueño `1000:1000`, que en macOS no se podía comprobar; el reloj estaba sincronizado por NTP.
+- **AWS en tres instancias** (`deploy/aws/`). Cada instancia corre un ControlNode y un DataNode (`deploy/aws/docker-compose.yml`). Los contenedores usan la red de la instancia, y `extra_hosts` resuelve los nombres de siempre (`cn0`, `dn1`, ...) a la IP privada de la máquina donde vive cada nodo: la identidad de los nodos no cambia, y Raft, el pipeline y la re-replicación van por la red privada. Hacia afuera, cada ControlNode anuncia la IP pública de cada DataNode. El security group deja pasar Raft solo entre las instancias.
+- **`deploy/aws/levantar.sh`** se corre desde la máquina de quien despliega, la primera vez y en cada sesión nueva: busca las tres instancias por nombre, enciende las apagadas, deja el repo al día y construye la imagen en cada una, crea los secretos en el nodo 0 y copia a los otros dos solo las vistas que montan los contenedores, escribe el `.env` de cada instancia, arranca, espera a que los seis nodos estén sanos y deja en `~/dfsha-aws/` lo que necesita el cliente. Es idempotente. `tests/test_aws_deploy.py` lo ejecuta de verdad con `aws` y `ssh` falsos.
+- **Probado en AWS** (2026-10-13, cliente en un Mac por Internet). Primero en una instancia, con `docker-compose.publico.yml`. Después en tres (una `t3.medium` y dos `t3.small`, Ubuntu 24.04): los seis nodos sanos con el líder en una máquina y los seguidores en las otras dos; un archivo de 3,5 MB subido y bajado idéntico, con cada bloque replicado en las tres máquinas y la cabeza del pipeline rotando entre ellas; el puerto de Raft cerrado desde fuera en las tres. Con el ControlNode líder y el DataNode de una máquina apagados, otro ControlNode tomó el liderazgo y el cliente siguió leyendo y escribiendo; al encenderlos, el archivo escrito mientras tanto recuperó su tercera réplica. `secrets/` quedó con dueño `1000:1000`, que en macOS no se podía comprobar, y el reloj estaba sincronizado por NTP.
 - **Límites conocidos:**
-  - Una sola instancia: tolera la caída de un nodo, no la de la máquina.
-  - La IP pública cambia cuando la instancia se apaga y se enciende. Hay que volver a levantar los ControlNodes con la IP nueva, y eso no se probó todavía.
-  - Los contenedores no tienen política de reinicio.
+  - No se apagó una instancia entera desde AWS: la caída de una máquina se probó deteniendo sus dos contenedores. Una instancia apagada no responde, en vez de rechazar la conexión, y el cliente puede tardar más en pasar a otra réplica.
+  - Las IP públicas cambian cuando una instancia se apaga y se enciende. `levantar.sh` las actualiza, pero ese arranque no se probó todavía.
+  - Las tres instancias están en la misma zona de disponibilidad.
+  - En el clúster de una instancia, los contenedores no tienen política de reinicio; en el de tres sí.
   - `docker-compose.publico.yml` es para 3 DataNodes: no se combina con `.env.escala`.
   - El mapeo no se puede cambiar sin reiniciar los ControlNodes.
   - Una réplica cuya dirección ya no está en la configuración sale sin traducir, y el cliente de fuera la salta como si estuviera caída.

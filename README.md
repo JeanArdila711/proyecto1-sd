@@ -38,8 +38,8 @@ Todo el transporte es gRPC. Diagrama completo con cada flujo: [docs/arquitectura
 | 3 | Seguridad: usuarios y login con token de sesión; cada contenedor monta solo sus secretos | ✅ |
 | 3 | Seguridad: permisos por archivo y autorización de las operaciones sobre bloques | ✅ |
 | 3 | Escalabilidad: clúster de 5 DataNodes y medición del costo de la metadata, con sus límites | ✅ |
-| Final | Acceso desde fuera de la red del clúster y despliegue en AWS en una instancia | ✅ |
-| Final | AWS en tres instancias, informe, video | ⬜ |
+| Final | Acceso desde fuera de la red del clúster y despliegue en AWS en tres instancias | ✅ |
+| Final | Informe, video | ⬜ |
 
 Detalle de cada parte, decisiones y límites conocidos: [ESTADO_PROYECTO.md](ESTADO_PROYECTO.md).
 

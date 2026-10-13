@@ -1,0 +1,117 @@
+# DFSha en AWS, tres instancias: lo que corre en CADA una. Un ControlNode y un DataNode.
+#
+# No se usa a mano: deploy/aws/levantar.sh escribe el .env de cada instancia y lo arranca.
+#   instancia dfsha-nodo-0 -> cn0 y dn1      DFSHA_NODE=0  DFSHA_DN=1
+#   instancia dfsha-nodo-1 -> cn1 y dn2      DFSHA_NODE=1  DFSHA_DN=2
+#   instancia dfsha-nodo-2 -> cn2 y dn3      DFSHA_NODE=2  DFSHA_DN=3
+#
+# Red: los contenedores usan la red de la instancia (network_mode: host). Los nombres de
+# siempre (cn0, dn1, ...) siguen siendo la identidad de cada nodo, y extra_hosts los resuelve
+# a la IP PRIVADA de la instancia donde vive cada uno. Raft escucha en esa IP privada. El
+# security group decide quién llega a qué: Raft solo entre las instancias del clúster.
+#
+# Hacia afuera, cada ControlNode anuncia la IP PÚBLICA de cada DataNode (D-P11).
+#
+# restart: al encender la instancia los nodos vuelven solos, con las IP públicas del último
+# .env. Si esas IP cambiaron, hay que volver a correr levantar.sh.
+
+name: dfsha
+
+x-nodo: &nodo
+  image: dfsha:local
+  pull_policy: never
+  network_mode: host
+  init: true
+  restart: unless-stopped
+  extra_hosts:
+    - "cn0:${DFSHA_IP_0:?falta el .env de esta instancia, lo escribe deploy/aws/levantar.sh}"
+    - "dn1:${DFSHA_IP_0}"
+    - "cn1:${DFSHA_IP_1}"
+    - "dn2:${DFSHA_IP_1}"
+    - "cn2:${DFSHA_IP_2}"
+    - "dn3:${DFSHA_IP_2}"
+
+services:
+  datanode:
+    <<: *nodo
+    build: ../..   # levantar.sh ya construye dfsha:local; esto es para quien lo arranque a mano
+    command: [python, -m, dfsha.data_node.main, --root, /data, --port, "50061",
+              --encryption-key-file, "/secrets/dn${DFSHA_DN}.key",
+              --capability-key-file, /secrets/capability.key,
+              --tls-ca-file, /secrets/ca.crt, --tls-cert-file, /secrets/node.crt, --tls-key-file, /secrets/node.key]
+    volumes: [dn-data:/data, "../../secrets/mounts/dn${DFSHA_DN}:/secrets:ro"]
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py", "localhost:50061", "--tls-ca-file", "/secrets/ca.crt"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  controlnode:
+    <<: *nodo
+    depends_on:
+      datanode: { condition: service_healthy }
+    command:
+      - python
+      - -m
+      - dfsha.control_node.main
+      - --node-id=${DFSHA_NODE}
+      - --port=50051
+      - --raft-cluster=cn0:6000,cn1:6000,cn2:6000
+      - --data-dir=/raft
+      - --datanode-addresses=dn1:50061,dn2:50061,dn3:50061
+      - --block-size-mb=${DFSHA_BLOCK_MB:-128}
+      - --replication-factor=3
+      - --min-write-replicas=2
+      - --heartbeat-interval-s=${DFSHA_HEARTBEAT_INTERVAL_S:-2}
+      - --datanode-dead-after-s=${DFSHA_DATANODE_DEAD_AFTER_S:-6}
+      - --rereplication-interval-s=${DFSHA_REREPLICATION_INTERVAL_S:-10}
+      - --rereplication-delay-s=${DFSHA_REREPLICATION_DELAY_S:-30}
+      - --gc-interval-s=${DFSHA_GC_INTERVAL_S:-60}
+      - --gc-grace-s=${DFSHA_GC_GRACE_S:-1200}
+      - --raft-password-file=/secrets/raft.password
+      - --jwt-secret-file=/secrets/jwt.secret
+      - --admin-password-file=/secrets/admin.password
+      - --capability-key-file=/secrets/capability.key
+      - --tls-ca-file=/secrets/ca.crt
+      - --tls-cert-file=/secrets/node.crt
+      - --tls-key-file=/secrets/node.key
+    environment:
+      DFSHA_DATANODE_PUBLIC_ADDRESSES: >-
+        dn1:50061=${DFSHA_PUBLIC_0}:50061,
+        dn2:50061=${DFSHA_PUBLIC_1}:50061,
+        dn3:50061=${DFSHA_PUBLIC_2}:50061
+    volumes: [cn-raft:/raft, ../../secrets/mounts/control:/secrets:ro]
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py", "localhost:50051", "--tls-ca-file", "/secrets/ca.crt"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # Herramientas, desde cualquiera de las tres instancias:
+  #   docker compose run --rm inspect mapa
+  #   docker compose run --rm shell
+  shell:
+    <<: *nodo
+    restart: "no"
+    profiles: [cliente]
+    stdin_open: true
+    tty: true
+    working_dir: /intercambio
+    command: [python, -m, dfsha.client.distributed_shell_main, --control-nodes, "cn0:50051,cn1:50051,cn2:50051",
+              --tls-ca-file, /secrets/ca.crt, --internal-addresses]
+    volumes: [../../intercambio:/intercambio, ../../secrets/mounts/client:/secrets:ro]
+
+  inspect:
+    <<: *nodo
+    restart: "no"
+    profiles: [herramientas]
+    entrypoint: [python, scripts/inspect_cluster.py, --tls-ca-file, /secrets/ca.crt,
+                 --password-file, /secrets/admin.password]
+    command: [estado]
+    volumes: [../../secrets/mounts/inspect:/secrets:ro]
+    environment:
+      DFSHA_GC_GRACE_S: ${DFSHA_GC_GRACE_S:-1200}
+
+volumes:
+  dn-data:
+  cn-raft:
