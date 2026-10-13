@@ -1,6 +1,6 @@
 # Estado del proyecto — DFSha
 
-Última actualización: 2026-10-13, tras agregar el acceso desde fuera de la red del clúster y el despliegue en AWS en tres instancias (Hito 3, D1).
+Última actualización: 2026-10-13, tras agregar la demo guiada (`scripts/demo.py`).
 
 Este documento es para que cualquiera del equipo pueda entrar al repo, entender qué hay construido, qué falta y por qué se tomó cada decisión, sin tener que reconstruir el contexto desde cero. Cómo levantarlo y probarlo está en `docs/GUIA.md`; los protocolos entre componentes, en `docs/especificacion-comunicaciones.md`.
 
@@ -34,7 +34,7 @@ Hitos según el enunciado (`1_DFSha_Proyecto1.md`): Hito 1 monolítico (semana 8
 | 3 | D1 — direcciones públicas de DataNodes y despliegue en AWS en tres instancias | ✅ (`deploy/aws/README.md`) |
 | Final | Informe, video de 10–15 min | ⬜ |
 
-918 tests en verde en macOS; dentro de la imagen de Docker, 895 en verde y 23 que se saltan porque leen los archivos de Compose, `.env.*` o `deploy/`, que no se copian a la imagen. Los tests de C2, C3, X1 y D1 todavía no se corrieron en Windows.
+933 tests en verde en macOS; dentro de la imagen de Docker, 910 en verde y 23 que se saltan porque leen los archivos de Compose, `.env.*` o `deploy/`, que no se copian a la imagen. Los tests de C2, C3, X1 y D1 todavía no se corrieron en Windows.
 
 ## Qué falta
 
@@ -328,6 +328,15 @@ No cambia el comportamiento del sistema. Agrega la forma de levantar más DataNo
   - El mapeo no se puede cambiar sin reiniciar los ControlNodes.
   - Una réplica cuya dirección ya no está en la configuración sale sin traducir, y el cliente de fuera la salta como si estuviera caída.
 
+### Demo guiada (`scripts/demo.py`)
+
+- **Qué es.** Un script que recorre el sistema completo en 12 pasos, con comandos reales, su salida y una comprobación por paso: usuarios y sesión; directorios y archivos; particionamiento y replicación; cifrado y acceso directo a un DataNode; permisos; rangos; locks; un bloque dañado en disco; caída de un DataNode con re-replicación y recolector; caída del líder; pérdida de la mayoría. Con pausas sirve para mostrarlo o grabarlo; con `--sin-pausas` tarda poco más de un minuto y es una prueba de punta a punta: sale con código 1 si alguna de sus 34 comprobaciones no se cumple.
+- **No toca el clúster de quien lo corre.** Todo comando de Docker pasa por una sola función que fija el proyecto de Compose `dfsha-demo`. Ese clúster tiene 5 DataNodes y los valores de demo, que se pasan como variables de entorno sin editar `.env`, y se borra al terminar. Comparte `secrets/` con el clúster local (el generador no cambia lo que existe) y usa `intercambio/demo/`, que también borra.
+- **Solo Python de la biblioteca estándar**, del lado de quien lo corre. Los archivos de la demo se crean, comparan y borran dentro de un contenedor, con el usuario de la imagen, para no depender de los permisos ni de las rutas de cada sistema.
+- **Cómo lee la shell.** Le escribe los comandos por la entrada estándar y separa la salida por el prompt (`dfsha:/…$ `), que la shell imprime antes de leer cada línea. Las contraseñas las pide la shell por otro canal y nunca aparecen en la salida; las de los usuarios de la demo se inventan en cada corrida.
+- **Probado:** tres corridas completas seguidas en macOS, con y sin pausas, con las 34 comprobaciones cumplidas y sin dejar contenedores, volúmenes ni archivos. `tests/test_demo.py` cubre cómo interpreta la salida de la shell y del inspector, con salidas reales.
+- **Límites:** no se probó en Windows ni en Linux; es para el clúster local, no para el de AWS; y no se puede empezar desde un paso intermedio, porque cada paso usa lo que dejaron los anteriores.
+
 ## Cosas a tener en cuenta si vas a seguir sobre este código
 
 Cosas que costó descubrir y que no vale la pena redescubrir:
@@ -419,4 +428,5 @@ Ver `docs/GUIA.md`. Para correr todos los tests:
 ```bash
 docker compose run --rm tests        # dentro de la imagen
 python -m pytest tests/ -q           # con el venv local
+python scripts/demo.py --sin-pausas  # el sistema completo en Docker, de punta a punta
 ```

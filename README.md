@@ -50,6 +50,8 @@ docker compose up -d --build              # 3 DataNodes + 3 ControlNodes (la 1.�
 docker compose run --rm shell             # shell distribuida; primero: login admin
 docker compose run --rm inspect mapa      # dónde quedó cada bloque
 docker compose down                       # apagar
+
+python scripts/demo.py                    # demo guiada de todo el sistema, en un clúster aparte
 ```
 
 La contraseña inicial del usuario `admin` queda en `secrets/admin.password`. Cada archivo y directorio tiene dueño, grupo y modo `rwx`, como en Unix: en la shell, `ls -l` los muestra y `chmod 640 <ruta>` o `chown <usuario>[:<grupo>] <ruta>` los cambian. Los DataNodes solo atienden a quien trae una capability firmada por el ControlNode para ese bloque y esa operación.

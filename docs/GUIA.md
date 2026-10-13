@@ -129,7 +129,18 @@ DFSHA_UPLOAD_LEASE_S=15
 
 ## 5. Probar cada funcionalidad
 
-Con los valores de demo del paso 4. Deja una shell abierta en otra terminal, con la sesión iniciada (`login admin`), para los pasos que dicen *en la shell*.
+### Demo guiada: todo de una vez
+
+```bash
+python scripts/demo.py                # paso a paso: Enter para pasar al siguiente
+python scripts/demo.py --sin-pausas   # de corrido, en poco más de un minuto
+```
+
+Recorre 12 pasos con comandos reales y muestra la salida de cada uno: usuarios y sesión, directorios y archivos, particionamiento y replicación, cifrado y acceso directo a un DataNode, permisos, lectura y escritura por rangos, locks, un bloque dañado en disco, la caída de un DataNode con su re-replicación, la caída del líder y la pérdida de la mayoría. Cada paso termina con una comprobación (✔ o ✘). Si alguna no se cumple, el script termina con código 1, así que de corrido sirve como prueba de punta a punta.
+
+Necesita Docker y Python 3.10 o más nuevo, nada más. Usa un clúster propio (el proyecto de Compose `dfsha-demo`, con 5 DataNodes y los valores de demo), así que no toca el que tengas levantado ni hay que editar `.env`. Al terminar lo borra; con `--conservar` lo deja encendido para seguir probando a mano con `docker compose -p dfsha-demo ...`.
+
+El resto de esta sección son los mismos pasos, uno por uno y a mano. Con los valores de demo del paso 4. Deja una shell abierta en otra terminal, con la sesión iniciada (`login admin`), para los pasos que dicen *en la shell*.
 
 ### Particionamiento y replicación
 
